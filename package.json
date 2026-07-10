@@ -1,0 +1,16 @@
+{
+  "name": "oh-ai-car-web",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local web control console for the OH AI car TCP protocol.",
+  "engines": { "node": ">=22" },
+  "workspaces": ["shared", "gateway", "frontend"],
+  "scripts": {
+    "build": "npm run build --workspace=@oh-ai-car-web/shared && npm run build --workspace=@oh-ai-car-web/frontend && npm run build --workspace=@oh-ai-car-web/gateway",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run build --workspace=@oh-ai-car-web/shared && npm run typecheck --workspaces --if-present",
+    "dev:gateway": "npm run build --workspace=@oh-ai-car-web/shared && npm run dev --workspace=@oh-ai-car-web/gateway",
+    "dev:frontend": "npm run dev --workspace=@oh-ai-car-web/frontend",
+    "start": "npm run build && npm run start --workspace=@oh-ai-car-web/gateway"
+  }
+}
