@@ -5,6 +5,13 @@ import { createFakeCarTcpServer } from './helpers/fake-car-tcp-server.js';
 
 const servers: ControlServer[] = [];
 afterEach(async () => { await Promise.all(servers.splice(0).map((server) => server.close())); });
+const ORIGIN = 'http://127.0.0.1:8787';
+const ALLOWED_ORIGINS = [
+  'http://127.0.0.1:8787',
+  'http://localhost:8787',
+  'http://127.0.0.1:5173',
+  'http://localhost:5173',
+];
 
 function request(ws: WebSocket, message: Record<string, unknown>): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
@@ -17,14 +24,32 @@ function request(ws: WebSocket, message: Record<string, unknown>): Promise<Recor
   });
 }
 
+async function open(port: number, origin = ORIGIN): Promise<WebSocket> {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/control`, { origin });
+  await new Promise<void>((resolve) => ws.once('open', resolve));
+  return ws;
+}
+
+async function connect(ws: WebSocket, tcpPort: number, requestId = 'connect'): Promise<Record<string, unknown>> {
+  return request(ws, { type: 'command', requestId, command: 'connect', payload: { host: '127.0.0.1', tcpPort, videoPort: 6500 } });
+}
+
+function receivedStates(ws: WebSocket): Record<string, unknown>[] {
+  const states: Record<string, unknown>[] = [];
+  ws.on('message', (data: RawData) => {
+    const message = JSON.parse(data.toString()) as Record<string, unknown>;
+    if (message.type === 'state') states.push(message);
+  });
+  return states;
+}
+
 describe('localhost control gateway', () => {
   it('writes high-level commands to TCP and rejects raw command passthrough', async () => {
     const fake = await createFakeCarTcpServer();
     const server = new ControlServer({ port: 0 }); servers.push(server);
     const port = await server.listen();
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/control`);
-    await new Promise<void>((resolve) => ws.once('open', resolve));
-    expect((await request(ws, { type: 'command', requestId: 'connect', command: 'connect', payload: { host: '127.0.0.1', tcpPort: fake.port, videoPort: 6500 } })).type).toBe('result');
+    const ws = await open(port);
+    expect((await connect(ws, fake.port)).type).toBe('result');
     expect((await request(ws, { type: 'command', requestId: 'move', command: 'button', payload: { direction: 'Front' } })).encoded).toBe('$011504011B#');
     expect((await request(ws, { type: 'command', requestId: 'photo', command: 'photo', payload: {} })).encoded).toMatch(/^\$016002[0-9A-F]{2}#$/);
     expect((await request(ws, { type: 'command', requestId: 'tracking', command: 'tracking', payload: { enabled: true } })).encoded).toMatch(/^\$016302[0-9A-F]{2}#$/);
@@ -44,10 +69,110 @@ describe('localhost control gateway', () => {
   it('rejects all movement while the car TCP socket is disconnected', async () => {
     const server = new ControlServer({ port: 0 }); servers.push(server);
     const port = await server.listen();
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/control`);
-    await new Promise<void>((resolve) => ws.once('open', resolve));
+    const ws = await open(port);
     const response = await request(ws, { type: 'command', requestId: 'blocked', command: 'rocker', payload: { x: 0, y: 20 } });
     expect(response).toMatchObject({ type: 'error', code: 'NOT_CONNECTED', requestId: 'blocked' });
     ws.close();
+  });
+
+  it('rejects WebSocket upgrades from an untrusted browser origin', async () => {
+    const server = new ControlServer({ port: 0 }); servers.push(server);
+    const port = await server.listen();
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/control`, { origin: 'https://example.invalid' });
+    ws.on('error', () => undefined);
+    const status = await new Promise<number | undefined>((resolve) => ws.once('unexpected-response', (_request, response) => {
+      response.resume();
+      resolve(response.statusCode);
+    }));
+    expect(status).toBe(403);
+  });
+
+  it('rejects WebSocket upgrades without an Origin header', async () => {
+    const server = new ControlServer({ port: 0 }); servers.push(server);
+    const port = await server.listen();
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/control`);
+    ws.on('error', () => undefined);
+    const status = await new Promise<number | undefined>((resolve) => ws.once('unexpected-response', (_request, response) => {
+      response.resume();
+      resolve(response.statusCode);
+    }));
+    expect(status).toBe(403);
+  });
+
+  it.each(ALLOWED_ORIGINS)('accepts documented local Origin %s', async (origin) => {
+    const server = new ControlServer({ port: 0 }); servers.push(server);
+    const port = await server.listen();
+    const ws = await open(port, origin);
+    ws.close();
+  });
+
+  it('rejects a listen failure instead of leaving startup pending', async () => {
+    const first = new ControlServer({ port: 0 }); servers.push(first);
+    const occupiedPort = await first.listen();
+    const second = new ControlServer({ port: occupiedPort }); servers.push(second);
+
+    await expect(second.listen()).rejects.toMatchObject({ code: 'EADDRINUSE' });
+  });
+
+  it('sends each browser its own controller state and releases control after disconnect', async () => {
+    const firstCar = await createFakeCarTcpServer();
+    const secondCar = await createFakeCarTcpServer();
+    const server = new ControlServer({ port: 0 }); servers.push(server);
+    const port = await server.listen();
+    const controller = await open(port);
+    const observer = await open(port);
+    const controllerStates = receivedStates(controller);
+    const observerStates = receivedStates(observer);
+    expect((await connect(controller, firstCar.port)).type).toBe('result');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(controllerStates.at(-1)).toMatchObject({ connected: true, ownsControl: true, controlAvailable: true });
+    expect(observerStates.at(-1)).toMatchObject({ connected: true, ownsControl: false, controlAvailable: false });
+    expect(await request(observer, { type: 'command', requestId: 'other-connect', command: 'connect', payload: { host: '127.0.0.1', tcpPort: secondCar.port, videoPort: 6500 } })).toMatchObject({ type: 'error', code: 'CONTROLLER_BUSY' });
+    expect((await connect(controller, secondCar.port, 'reconnect')).type).toBe('result');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(firstCar.messages).toContain('$011504001A#');
+    expect(await request(controller, { type: 'command', requestId: 'disconnect', command: 'disconnect', payload: {} })).toMatchObject({ type: 'result', encoded: '$011504001A#' });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(observerStates.at(-1)).toMatchObject({ connected: false, ownsControl: false, controlAvailable: true });
+    expect((await connect(observer, secondCar.port, 'take-control')).type).toBe('result');
+    await server.close();
+    servers.splice(servers.indexOf(server), 1);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(secondCar.messages.filter((message) => message === '$011504001A#').length).toBeGreaterThanOrEqual(2);
+    controller.close(); observer.close();
+    await firstCar.close(); await secondCar.close();
+  });
+
+  it('reports STOP_FAILED while still closing the TCP connection', async () => {
+    const fake = await createFakeCarTcpServer();
+    const server = new ControlServer({ port: 0 }); servers.push(server);
+    const port = await server.listen();
+    const ws = await open(port);
+    await connect(ws, fake.port);
+    server.client.write = async () => { throw new Error('simulated stop failure'); };
+    expect(await request(ws, { type: 'command', requestId: 'disconnect', command: 'disconnect', payload: {} })).toMatchObject({ type: 'error', code: 'STOP_FAILED' });
+    expect(server.client.isConnected).toBe(false);
+    ws.close();
+    await fake.close();
+  });
+
+  it('does not connect a new target when the old target Stop write fails during reconnect', async () => {
+    const firstCar = await createFakeCarTcpServer();
+    const secondCar = await createFakeCarTcpServer();
+    const server = new ControlServer({ port: 0 }); servers.push(server);
+    const port = await server.listen();
+    const ws = await open(port);
+    await connect(ws, firstCar.port);
+    server.client.write = async () => { throw new Error('simulated stop failure'); };
+
+    expect(await connect(ws, secondCar.port, 'reconnect-failure')).toMatchObject({ type: 'error', code: 'STOP_FAILED' });
+    expect(server.client.isConnected).toBe(false);
+    expect(secondCar.connections()).toBe(0);
+
+    ws.close();
+    await server.close();
+    servers.splice(servers.indexOf(server), 1);
+    await firstCar.close();
+    await secondCar.close();
   });
 });

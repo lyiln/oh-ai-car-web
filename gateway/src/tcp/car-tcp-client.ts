@@ -28,6 +28,7 @@ export class CarTcpClient {
         socket.destroy();
         if (this.socket === socket) this.socket = null;
         this.connected = false;
+        this.target = null;
         this.emit(error.message);
         reject(error);
       };
@@ -56,6 +57,7 @@ export class CarTcpClient {
     if (this.socket !== socket) return;
     this.socket = null;
     this.connected = false;
+    this.target = null;
     this.emit();
   }
 
@@ -70,6 +72,7 @@ export class CarTcpClient {
     const socket = this.socket;
     this.socket = null;
     this.connected = false;
+    this.target = null;
     if (socket) socket.destroy();
     this.emit();
   }

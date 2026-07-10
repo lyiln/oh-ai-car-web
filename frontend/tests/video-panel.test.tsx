@@ -10,4 +10,11 @@ describe('video panel', () => {
     fireEvent.error(frame);
     expect(await screen.findByText(/浏览器无法加载视频服务/)).toBeInTheDocument();
   });
+
+  it('does not treat an iframe load event as confirmed video-stream health', () => {
+    render(<VideoPanel host="192.168.1.11" port={6500} />);
+    const frame = screen.getByTitle('小车视频预览');
+    fireEvent.load(frame);
+    expect(screen.getByText('视频页面已加载，视频流状态仍需人工确认')).toBeInTheDocument();
+  });
 });

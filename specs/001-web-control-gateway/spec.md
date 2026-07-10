@@ -79,19 +79,25 @@ As an operator, I want to update four independent wheel speeds so that the Web a
 - **FR-002**: The gateway must open and manage TCP connections to the configured smart car target.
 - **FR-003**: The browser must communicate with the gateway over WebSocket for control commands and connection state.
 - **FR-003a**: In v1, the gateway must bind to localhost only and must not expose the WebSocket control API to other LAN devices.
+- **FR-003b**: The gateway must reject WebSocket upgrades whose browser Origin is not one of the documented local UI origins.
+- **FR-003c**: Only one browser session may own a car TCP connection; competing sessions must be rejected without changing the existing target.
+- **FR-003d**: Gateway state events must distinguish TCP connectivity from the receiving browser's control ownership and availability.
 - **FR-004**: The gateway must encode commands using the existing protocol format: `$` + vehicle type `01` + command code + length + payload + checksum + `#`.
 - **FR-005**: The system must support command codes `10`, `15`, `21`, `60`, `61`, `62`, `63`, and `64`.
 - **FR-006**: Negative speed values must be rounded and converted by adding `256` before hex encoding.
 - **FR-007**: Button release, joystick release, browser blur, and gateway disconnect must stop movement.
 - **FR-007a**: Rocker movement commands must be throttled to a maximum of `10 Hz`, excluding immediate stop commands on release/cancel/blur.
-- **FR-008**: The Web UI must display connection state and disable movement controls when disconnected.
+- **FR-007b**: Explicit disconnect, reconnect, controlling-browser closure, and gateway shutdown must attempt Stop before closing the active TCP socket.
+- **FR-008**: The Web UI must display connection state and disable movement controls when disconnected or when another browser owns control.
 - **FR-009**: The Web UI must expose video preview by directly loading the existing car video endpoint `http://<ip>:<videoPort>/index2`.
 - **FR-009a**: If direct video loading fails, v1 must show an error state and must not require gateway video proxying or car-side changes.
 - **FR-010**: The gateway must expose structured command results or connection errors to the browser.
 - **FR-010a**: In v1, a command result must mean the gateway successfully wrote the encoded command to the TCP socket; it must not imply the car acknowledged or executed the command.
+- **FR-010b**: Media and tracking UI state must change only after the gateway returns a successful command result.
 - **FR-011**: Protocol encoding must be unit tested independently from real hardware.
 - **FR-012**: Real-car testing must be documented separately and must not be assumed complete by unit tests.
 - **FR-013**: In v1, the browser UI and public gateway API must not expose raw encoded command input or arbitrary TCP command passthrough.
+- **FR-014**: Direct iframe video loading may report native browser errors, but it must not be represented as verified stream health without manual validation.
 
 ## Non-Goals
 - Do not modify the existing OpenHarmony/ArkTS app in v1.

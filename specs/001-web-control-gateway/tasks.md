@@ -14,9 +14,13 @@ standalone repository.
 - [x] Shared command types and encoder for commands `10`, `15`, `21`, and
   `60` through `64`.
 - [x] Localhost-only WebSocket gateway, TCP client, high-level command
-  validation, and fake TCP integration coverage.
+  validation, local-Origin validation, personalized single-controller
+  ownership state, and fake TCP integration coverage.
 - [x] Connection setup, button/rocker safety behavior, video panel, media,
-  tracking, and wheel-speed controls.
+  tracking, and wheel-speed controls with gateway-result confirmation for
+  media and tracking state.
+- [x] Stop-before-close behavior for explicit disconnect, reconnect,
+  controller closure, and gateway shutdown.
 - [x] Protocol, gateway, and frontend automated tests; see
   `tasks/change-report-web-control-v1.md`.
 

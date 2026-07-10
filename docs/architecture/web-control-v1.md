@@ -21,11 +21,16 @@ Browser UI
 
 `frontend/` provides the React control console, `gateway/` owns the local TCP
 socket and WebSocket validation, and `shared/` owns the command types and
-packet encoder. The gateway accepts only documented high-level commands and
-binds to localhost.
+packet encoder. The gateway accepts only documented high-level commands,
+binds to localhost, verifies approved local browser Origins, and permits one
+controlling browser session at a time. Every TCP lifecycle close attempts Stop
+before the socket is destroyed. Gateway state events are personalized: TCP
+connectivity is global, while control ownership and availability are specific
+to the receiving browser session.
 
 ## Validation State
 
 The shared encoder, fake TCP gateway behavior, and frontend interaction tests
 are automated. Real-car validation is manual and tracked in
-`docs/flows/web-control-real-car-validation.md`.
+`docs/flows/web-control-real-car-validation.md`. An iframe load event proves
+only that the browser loaded a page; it does not prove video-stream health.

@@ -1,23 +1,36 @@
 import { createReadStream, existsSync } from 'node:fs';
-import { createServer, type Server } from 'node:http';
+import { createServer, type IncomingMessage, type Server } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
-import type { GatewayEnvelope, StateEnvelope } from '@oh-ai-car-web/shared';
+import type { GatewayEnvelope } from '@oh-ai-car-web/shared';
 import { CarTcpClient } from '../tcp/car-tcp-client.js';
-import { CommandError, dispatch, stopCommand } from './command-dispatcher.js';
+import { CommandError, dispatch, parseCommand, parseConnectionConfig, stopCommand, type ParsedCommand } from './command-dispatcher.js';
 
-export interface ControlServerOptions { port?: number; staticDir?: string; }
+const DEFAULT_ALLOWED_ORIGINS = [
+  'http://127.0.0.1:8787',
+  'http://localhost:8787',
+  'http://127.0.0.1:5173',
+  'http://localhost:5173',
+];
+const STOP_TIMEOUT_MS = 500;
+
+export interface ControlServerOptions { port?: number; staticDir?: string; allowedOrigins?: readonly string[]; }
 
 export class ControlServer {
   readonly client = new CarTcpClient();
   private readonly http: Server;
   private readonly sockets = new Set<WebSocket>();
   private readonly wss = new WebSocketServer({ noServer: true });
+  private readonly allowedOrigins: Set<string>;
+  private controller: WebSocket | null = null;
+  private lifecycle: Promise<void> = Promise.resolve();
+  private closing: Promise<void> | null = null;
   private port = 0;
 
   constructor(options: ControlServerOptions = {}) {
     const staticDir = options.staticDir ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../frontend/dist');
+    this.allowedOrigins = new Set(options.allowedOrigins ?? DEFAULT_ALLOWED_ORIGINS);
     this.http = createServer((request, response) => {
       const requested = request.url === '/' ? 'index.html' : request.url?.replace(/^\//, '') ?? 'index.html';
       const file = path.resolve(staticDir, requested);
@@ -29,16 +42,26 @@ export class ControlServer {
       createReadStream(file).pipe(response);
     });
     this.http.on('upgrade', (request, socket, head) => {
-      if (request.url !== '/control') { socket.destroy(); return; }
+      if (request.url !== '/control' || !this.isAllowedOrigin(request)) { this.rejectUpgrade(socket); return; }
       this.wss.handleUpgrade(request, socket, head, (ws) => this.wss.emit('connection', ws));
     });
     this.wss.on('connection', (ws) => this.attach(ws));
-    this.client.onState((connected, target, lastError) => this.broadcast({ type: 'state', connected, target, lastError: lastError ?? null }));
+    this.client.onState((_connected, _target, lastError) => this.broadcastState(lastError ?? null));
     if (options.port !== undefined) this.port = options.port;
   }
 
   async listen(): Promise<number> {
-    await new Promise<void>((resolve) => this.http.listen(this.port, '127.0.0.1', resolve));
+    await new Promise<void>((resolve, reject) => {
+      const onListening = () => { cleanup(); resolve(); };
+      const onError = (error: Error) => { cleanup(); reject(error); };
+      const cleanup = () => {
+        this.http.removeListener('listening', onListening);
+        this.http.removeListener('error', onError);
+      };
+      this.http.once('listening', onListening);
+      this.http.once('error', onError);
+      this.http.listen(this.port, '127.0.0.1');
+    });
     const address = this.http.address();
     if (!address || typeof address === 'string') throw new Error('Gateway did not bind a TCP port');
     this.port = address.port;
@@ -46,34 +69,142 @@ export class ControlServer {
   }
 
   async close(): Promise<void> {
-    this.client.disconnect();
+    if (this.closing) return this.closing;
+    this.closing = this.closeInternal();
+    return this.closing;
+  }
+
+  private async closeInternal(): Promise<void> {
+    await this.enqueue(async () => {
+      try { await this.safeDisconnect(); }
+      catch (error) { console.error('Gateway Stop failed during shutdown', error); }
+    });
     for (const ws of this.sockets) ws.close();
-    await new Promise<void>((resolve, reject) => this.http.close((error) => error ? reject(error) : resolve()));
+    await new Promise<void>((resolve, reject) => this.http.close((error) => {
+      if (!error || (error as NodeJS.ErrnoException).code === 'ERR_SERVER_NOT_RUNNING') resolve();
+      else reject(error);
+    }));
+  }
+
+  private isAllowedOrigin(request: IncomingMessage): boolean {
+    const origin = request.headers.origin;
+    return typeof origin === 'string' && this.allowedOrigins.has(origin);
+  }
+
+  private rejectUpgrade(socket: import('node:stream').Duplex): void {
+    socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    socket.destroy();
   }
 
   private attach(ws: WebSocket): void {
     this.sockets.add(ws);
-    this.send(ws, { type: 'state', connected: this.client.isConnected, target: this.client.currentTarget, lastError: null });
-    ws.on('message', async (input) => {
-      let parsed: unknown;
-      try { parsed = JSON.parse(input.toString()); }
-      catch { this.send(ws, { type: 'error', requestId: '', code: 'INVALID_JSON', message: 'Message must be valid JSON' }); return; }
-      try {
-        const result = await dispatch(this.client, parsed);
-        this.send(ws, { type: 'result', requestId: result.requestId, ok: true, ...(result.encoded ? { encoded: result.encoded } : {}) });
-      } catch (error) {
-        const known = error instanceof CommandError;
-        this.send(ws, { type: 'error', requestId: typeof (parsed as { requestId?: unknown }).requestId === 'string' ? (parsed as { requestId: string }).requestId : '', code: known ? error.code : 'TCP_ERROR', message: error instanceof Error ? error.message : 'Command failed' });
-      }
-    });
-    ws.on('close', async () => {
+    this.sendState(ws, null);
+    ws.on('message', (input) => { void this.enqueue(() => this.handleMessage(ws, input.toString())); });
+    ws.on('close', () => {
       this.sockets.delete(ws);
-      if (this.client.isConnected) {
-        try { await dispatch(this.client, stopCommand); } catch { /* best effort stop */ }
-      }
+      if (this.controller === ws) void this.enqueue(async () => {
+        if (this.controller !== ws) return;
+        try { await this.safeDisconnect(); }
+        catch (error) { console.error('Gateway Stop failed after controller disconnect', error); }
+      });
     });
   }
 
+  private async handleMessage(ws: WebSocket, input: string): Promise<void> {
+    let parsed: unknown;
+    try { parsed = JSON.parse(input); }
+    catch { this.send(ws, { type: 'error', requestId: '', code: 'INVALID_JSON', message: 'Message must be valid JSON' }); return; }
+    let command: ParsedCommand;
+    try { command = parseCommand(parsed); }
+    catch (error) { this.sendError(ws, typeof (parsed as { requestId?: unknown }).requestId === 'string' ? (parsed as { requestId: string }).requestId : '', error); return; }
+
+    try {
+      const result = await this.handleCommand(ws, command);
+      this.send(ws, { type: 'result', requestId: result.requestId, ok: true, ...(result.encoded ? { encoded: result.encoded } : {}) });
+    } catch (error) {
+      this.sendError(ws, command.requestId, error);
+    }
+  }
+
+  private async handleCommand(ws: WebSocket, command: ParsedCommand): Promise<{ requestId: string; encoded?: string }> {
+    if (command.command === 'connect') {
+      if (this.controller && this.controller !== ws) throw new CommandError('CONTROLLER_BUSY', 'Another local browser session controls the car');
+      try {
+        if (this.client.isConnected) await this.safeDisconnect();
+        this.controller = ws;
+        this.broadcastState(null);
+        await this.client.connect(parseConnectionConfig(command.payload));
+        return { requestId: command.requestId };
+      } catch (error) {
+        if (this.controller === ws) {
+          this.controller = null;
+          this.broadcastState(error instanceof Error ? error.message : 'TCP connection failed');
+        }
+        throw error;
+      }
+    }
+
+    this.requireController(ws);
+    if (command.command === 'disconnect') {
+      const encoded = await this.safeDisconnect();
+      return { requestId: command.requestId, encoded };
+    }
+    return dispatch(this.client, command);
+  }
+
+  private requireController(ws: WebSocket): void {
+    if (this.controller === ws) return;
+    if (this.controller) throw new CommandError('CONTROLLER_BUSY', 'Another local browser session controls the car');
+    throw new CommandError('NOT_CONNECTED', 'TCP socket is not connected');
+  }
+
+  private async safeDisconnect(): Promise<string | undefined> {
+    let encoded: string | undefined;
+    let failure: unknown;
+    try {
+      if (this.client.isConnected) encoded = (await this.withTimeout(dispatch(this.client, stopCommand), STOP_TIMEOUT_MS)).encoded;
+    } catch (error) {
+      failure = error;
+    } finally {
+      this.controller = null;
+      this.client.disconnect();
+    }
+    if (failure) throw new CommandError('STOP_FAILED', failure instanceof Error ? `Stop write failed: ${failure.message}` : 'Stop write failed');
+    return encoded;
+  }
+
+  private withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`Stop write timed out after ${timeoutMs}ms`)), timeoutMs);
+      operation.then((result) => { clearTimeout(timer); resolve(result); }, (error) => { clearTimeout(timer); reject(error); });
+    });
+  }
+
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const next = this.lifecycle.then(operation, operation);
+    this.lifecycle = next.then(() => undefined, () => undefined);
+    return next;
+  }
+
+  private sendError(ws: WebSocket, requestId: string, error: unknown): void {
+    const known = error instanceof CommandError;
+    this.send(ws, { type: 'error', requestId, code: known ? error.code : 'TCP_ERROR', message: error instanceof Error ? error.message : 'Command failed' });
+  }
+
   private send(ws: WebSocket, message: GatewayEnvelope): void { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message)); }
-  private broadcast(message: StateEnvelope): void { for (const ws of this.sockets) this.send(ws, message); }
+  private sendState(ws: WebSocket, lastError: string | null): void {
+    const ownsControl = this.controller === ws;
+    this.send(ws, {
+      type: 'state',
+      connected: this.client.isConnected,
+      target: this.client.currentTarget,
+      ownsControl,
+      controlAvailable: !this.controller || ownsControl,
+      lastError,
+    });
+  }
+
+  private broadcastState(lastError: string | null): void {
+    for (const ws of this.sockets) this.sendState(ws, lastError);
+  }
 }

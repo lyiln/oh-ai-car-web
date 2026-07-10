@@ -30,6 +30,10 @@ export interface StateEnvelope {
   type: 'state';
   connected: boolean;
   target: ConnectionConfig | null;
+  /** True only for the browser session that may issue car commands. */
+  ownsControl: boolean;
+  /** True when this browser may connect and claim the controller session. */
+  controlAvailable: boolean;
   lastError?: string | null;
 }
 export type GatewayEnvelope = ResultEnvelope | ErrorEnvelope | StateEnvelope;

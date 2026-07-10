@@ -1,18 +1,18 @@
 # Quickstart: Web Control Gateway Validation
 
-This guide validates the planned Web control gateway feature after implementation. It does not assume real-car access for unit and fake TCP checks.
+This guide validates the implemented Web control gateway. Unit and fake TCP
+checks do not assume or prove real-car access.
 
 ## Prerequisites
 
 - Operator machine on the same LAN as the smart car.
 - Browser available on the operator machine.
-- Future implementation under `web/`.
 - Existing smart car TCP service reachable at `<car-ip>:6000` for manual validation.
 - Existing video endpoint reachable at `http://<car-ip>:6500/index2` for manual validation.
 
 ## 1. Protocol Unit Validation
 
-Run the future protocol test suite.
+Run `npm test`.
 
 Expected outcomes:
 - Button commands encode command `15`.
@@ -28,11 +28,19 @@ Start a fake TCP server on a local test port, then connect the gateway to that f
 
 Expected outcomes:
 - Gateway binds its browser-facing WebSocket endpoint to localhost only.
+- Gateway accepts only the four documented local UI Origins, rejects all other
+  upgrades with HTTP `403`, and permits only one controlling browser session.
+- State events distinguish a connected controller from a connected observer;
+  observers cannot issue commands or disconnect the controller's car session.
 - Browser command messages are accepted only through high-level commands.
 - Fake TCP server receives encoded command strings.
 - Gateway result means TCP write success, not car-side ACK.
 - Gateway rejects movement commands when disconnected.
 - WebSocket disconnect triggers best-effort Stop if TCP is connected.
+- Explicit disconnect, reconnect, and gateway shutdown attempt Stop before
+  closing TCP; a Stop write failure is reported as `STOP_FAILED`.
+- A failed Stop during reconnect closes the old TCP connection and does not
+  connect the new target.
 
 ## 3. Frontend Interaction Validation
 
@@ -42,12 +50,16 @@ Expected outcomes:
 - Defaults show `192.168.1.11`, `6000`, and `6500`.
 - Movement controls are disabled before connection.
 - Connect failure leaves movement controls disabled and shows an error.
+- An unexpected gateway close disables controls and clears local media and
+  tracking state.
 - Button press sends direction; release sends Stop.
 - Rocker movement is throttled to at most `10 Hz`.
 - Rocker release/cancel/blur sends immediate stop.
 - Raw encoded command input is not present.
 - Video preview uses `http://<ip>:<videoPort>/index2`.
 - Video load failure shows an error state without requiring car-side changes.
+- An iframe load event proves only that the browser loaded a page, not that the
+  car video stream is healthy.
 
 ## 4. Manual Real-Car Validation
 

@@ -12,15 +12,23 @@ export class ControlClient {
     if (this.socket?.readyState === WebSocket.OPEN) return;
     const socket = new WebSocket('ws://127.0.0.1:8787/control');
     this.socket = socket;
-    await new Promise<void>((resolve, reject) => {
-      socket.addEventListener('open', () => resolve(), { once: true });
-      socket.addEventListener('error', () => reject(new Error('无法连接本地网关，请先启动 gateway')), { once: true });
-    });
     socket.addEventListener('message', (event) => this.receive(event.data));
     socket.addEventListener('close', () => {
+      if (this.socket === socket) this.socket = null;
       for (const pending of this.pending.values()) pending.reject(new Error('网关连接已关闭'));
       this.pending.clear();
+      this.publish({ type: 'state', connected: false, target: null, ownsControl: false, controlAvailable: false, lastError: '本地网关连接已关闭' });
     });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        socket.addEventListener('open', () => resolve(), { once: true });
+        socket.addEventListener('error', () => reject(new Error('无法连接本地网关，请先启动 gateway')), { once: true });
+      });
+    } catch (error) {
+      if (this.socket === socket) this.socket = null;
+      socket.close();
+      throw error;
+    }
   }
 
   onState(listener: StateListener): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
@@ -38,11 +46,15 @@ export class ControlClient {
 
   private receive(raw: unknown): void {
     const message = JSON.parse(String(raw)) as GatewayEnvelope;
-    if (message.type === 'state') { for (const listener of this.listeners) listener(message); return; }
+    if (message.type === 'state') { this.publish(message); return; }
     const pending = this.pending.get(message.requestId);
     if (!pending) return;
     this.pending.delete(message.requestId);
     if (message.type === 'result') pending.resolve(message.encoded);
     else pending.reject(new Error(message.message));
+  }
+
+  private publish(state: StateEnvelope): void {
+    for (const listener of this.listeners) listener(state);
   }
 }
