@@ -5,6 +5,9 @@ Browser control console and localhost-only TCP gateway for the OH AI car.
 > **Protocol warning:** The real-car packet format has not been confirmed.
 > Read [PROTOCOL_STATUS.md](PROTOCOL_STATUS.md) before connecting a vehicle.
 
+For agent-assisted work, start with [AGENTS.md](AGENTS.md) and
+[AI_CONTEXT.md](AI_CONTEXT.md).
+
 ## Development
 
 ```sh
