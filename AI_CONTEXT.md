@@ -5,8 +5,13 @@
 - `oh-ai-car-web` is an independent npm workspace for browser-based smart-car
   control. The original OpenHarmony project is not required to clone, build,
   test, or run this repository.
-- v1 is implemented and has automated protocol, gateway, and frontend tests.
-  Controlled real-car validation is still pending.
+- v1 local control is implemented and has automated protocol, gateway, and
+  frontend tests. Controlled real-car validation is still pending.
+- The vehicle-management platform MVP adds a Fastify/PostgreSQL backend,
+  browser login and saved-vehicle UI, renewable control leases, ROS2 GPS
+  telemetry ingestion, trajectory display, and Docker Compose deployment
+  assets. Code validation is complete; deployment, a real AMap key, ROS2 GPS,
+  and vehicle validation remain pending.
 - The primary open risk is the unresolved button packet conflict documented in
   `PROTOCOL_STATUS.md`. Treat this as an operational safety constraint.
 - `课程状态.md` tracks the course-level evidence needed for the basic
@@ -17,11 +22,18 @@
 ```text
 Browser UI -> ws://127.0.0.1:8787/control -> local Node gateway -> car TCP :6000
 Browser UI -> direct car video HTTP :6500/index2
+
+Platform browser -> Nginx -> Fastify API -> PostgreSQL/PostGIS
+ROS2 /gps/fix -> Python edge agent -> HTTPS device telemetry API
+Platform browser -> lease -> local gateway -> car TCP :6000
 ```
 
 - `frontend/`: React/Vite operator interface.
 - `gateway/`: localhost WebSocket server and raw TCP client.
 - `shared/`: WebSocket types and car packet encoder.
+- `backend/`: Fastify API, SQL schema/migration, sessions, leases, telemetry,
+  audit, and retention cleanup.
+- `edge-agent/`: ROS2 `NavSatFix` to HTTPS telemetry bridge with SQLite outbox.
 - Network defaults: `192.168.1.11`, TCP `6000`, video `6500`.
 - The gateway accepts only the documented localhost production/Vite Origins and
   permits one controlling browser session at a time.
@@ -55,6 +67,9 @@ video-stream health.
   hardware test.
 - `docs/decisions/protocol-length-discrepancy.md`: detailed conflict evidence.
 - `tasks/change-report-*.md`: verified implementation and repository changes.
+- `docs/architecture/vehicle-platform-overview.md`: onboarding guide for the
+  platform, backend data flow, security boundaries, and local startup order.
+- `docs/deployment/vehicle-platform.md`: Docker and ROS2 edge-agent setup.
 
 ## Commands
 

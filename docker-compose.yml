@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-oh_ai_car}
+      POSTGRES_USER: ${POSTGRES_USER:-oh_ai_car}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  backend:
+    build: { context: ., dockerfile: Dockerfile.backend }
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-oh_ai_car}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-oh_ai_car}
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET}
+      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:?set BOOTSTRAP_ADMIN_USERNAME}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?set BOOTSTRAP_ADMIN_PASSWORD}
+      HOST: 0.0.0.0
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      PLATFORM_PUBLIC_ORIGIN: ${PLATFORM_PUBLIC_ORIGIN:?set PLATFORM_PUBLIC_ORIGIN}
+      PLATFORM_ALLOWED_ORIGINS: ${PLATFORM_ALLOWED_ORIGINS:-}
+    depends_on: { postgres: { condition: service_healthy } }
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        VITE_AMAP_KEY: "${VITE_AMAP_KEY:?set VITE_AMAP_KEY}"
+        VITE_PLATFORM_ENABLED: "true"
+    environment:
+      AMAP_SECURITY_JS_CODE: "${AMAP_SECURITY_JS_CODE:?set AMAP_SECURITY_JS_CODE}"
+    ports: ["${WEB_PORT:-8080}:80"]
+    depends_on: [backend]
+volumes:
+  postgres-data:

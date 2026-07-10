@@ -1,0 +1,34 @@
+# Feature Specification: Vehicle Fleet Platform MVP
+
+## Scope
+
+This feature adds a central management platform while retaining the existing
+localhost-only Web-to-TCP gateway. It introduces administrator-created users,
+vehicle records and grants, exclusive renewable control leases, device-authenticated
+GPS telemetry, live/historical tracks, audit logs, and a Docker Compose
+deployment.
+
+## Public contracts
+
+- Cookie-authenticated browser endpoints live under `/api` for sessions, users,
+  vehicles, memberships, device-credential rotation, control leases, tracks,
+  and audits.
+- `POST /device/v1/telemetry` accepts a bearer device credential and an ordered
+  `points` array containing `occurredAt`, WGS-84 `longitude`, WGS-84
+  `latitude`, and optional state fields.
+- `POST /internal/control-lease/verify` validates a short-lived lease token for
+  the localhost gateway. A missing or expired lease must prevent TCP control.
+- Live `/ws` subscribers may receive only the `vehicle.position` events for
+  vehicles they are authorised to view.
+
+## Safety requirements
+
+- The local gateway stays bound to loopback, validates local UI origins, and
+  accepts only high-level commands.
+- The backend accepts credentialed browser requests only from explicit trusted
+  origins. Cookie-authenticated state changes reject missing or untrusted
+  Origins; device and gateway internal endpoints use their own credentials.
+- A lease expiry or renewal failure causes the gateway to attempt Stop before
+  closing its car TCP connection.
+- The platform does not alter the unverified car TCP encoder or represent
+  automated tests as real-car validation.

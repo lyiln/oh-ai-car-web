@@ -12,6 +12,12 @@ Course-level delivery status and evidence requirements are tracked in
 [课程状态.md](课程状态.md); the group execution and taskbook mapping
 are indexed at [docs/course/课程文档索引.md](docs/course/课程文档索引.md).
 
+The repository contains the implemented vehicle management and trajectory
+platform MVP. Start with the Chinese [project and backend guide](docs/architecture/vehicle-platform-overview.md), then use the
+[deployment guide](docs/deployment/vehicle-platform.md). Its approved plan and
+change record remain in [tasks/vehicle-fleet-platform-mvp-plan.md](tasks/vehicle-fleet-platform-mvp-plan.md)
+and [tasks/change-report-vehicle-fleet-platform-mvp.md](tasks/change-report-vehicle-fleet-platform-mvp.md).
+
 ## Development
 
 ```sh

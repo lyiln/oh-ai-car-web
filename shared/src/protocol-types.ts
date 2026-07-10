@@ -16,6 +16,7 @@ export type Direction = (typeof DIRECTIONS)[number];
 
 export type ControlCommand =
   | { command: 'connect'; payload: ConnectionConfig }
+  | { command: 'leaseRefresh'; payload: ConnectionConfig & { vehicleId: string; leaseToken: string } }
   | { command: 'disconnect'; payload: Record<string, never> }
   | { command: 'button'; payload: { direction: Direction } }
   | { command: 'rocker'; payload: { x: number; y: number } }

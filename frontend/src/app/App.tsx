@@ -10,8 +10,12 @@ import { TrackingToggle } from '../controls/TrackingToggle.js';
 import { WheelSpeedControl } from '../controls/WheelSpeedControl.js';
 import { ControlClient } from '../services/controlClient.js';
 import { loadSettings, saveSettings } from '../services/settingsStorage.js';
+import { PlatformConsole } from './PlatformConsole.js';
 
 export default function App() {
+  const platformEnabled = import.meta.env.VITE_PLATFORM_ENABLED === 'true';
+  const [classicMode, setClassicMode] = useState(!platformEnabled);
+  if (!classicMode) return <PlatformConsole onClassic={() => setClassicMode(true)} />;
   const client = useMemo(() => new ControlClient(), []);
   const [config, setConfig] = useState<ConnectionConfig>(loadSettings);
   const [state, setState] = useState<StateEnvelope>({ type: 'state', connected: false, target: null, ownsControl: false, controlAvailable: true, lastError: null });

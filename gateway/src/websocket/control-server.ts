@@ -15,7 +15,9 @@ const DEFAULT_ALLOWED_ORIGINS = [
 ];
 const STOP_TIMEOUT_MS = 500;
 
-export interface ControlServerOptions { port?: number; staticDir?: string; allowedOrigins?: readonly string[]; }
+export interface LeaseVerification { vehicle: { host: string; tcpPort: number; videoPort: number }; expiresAt: string; }
+export interface LeaseVerifier { verify(token: string, vehicleId: string): Promise<LeaseVerification | null>; }
+export interface ControlServerOptions { port?: number; staticDir?: string; allowedOrigins?: readonly string[]; leaseVerifier?: LeaseVerifier; }
 
 export class ControlServer {
   readonly client = new CarTcpClient();
@@ -26,11 +28,14 @@ export class ControlServer {
   private controller: WebSocket | null = null;
   private lifecycle: Promise<void> = Promise.resolve();
   private closing: Promise<void> | null = null;
+  private readonly leaseVerifier: LeaseVerifier | undefined;
+  private leaseTimer: NodeJS.Timeout | null = null;
   private port = 0;
 
   constructor(options: ControlServerOptions = {}) {
     const staticDir = options.staticDir ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../frontend/dist');
     this.allowedOrigins = new Set(options.allowedOrigins ?? DEFAULT_ALLOWED_ORIGINS);
+    this.leaseVerifier = options.leaseVerifier;
     this.http = createServer((request, response) => {
       const requested = request.url === '/' ? 'index.html' : request.url?.replace(/^\//, '') ?? 'index.html';
       const file = path.resolve(staticDir, requested);
@@ -133,7 +138,8 @@ export class ControlServer {
         if (this.client.isConnected) await this.safeDisconnect();
         this.controller = ws;
         this.broadcastState(null);
-        await this.client.connect(parseConnectionConfig(command.payload));
+        const target = await this.authorizeConnection(command.payload);
+        await this.client.connect(target);
         return { requestId: command.requestId };
       } catch (error) {
         if (this.controller === ws) {
@@ -145,6 +151,10 @@ export class ControlServer {
     }
 
     this.requireController(ws);
+    if (command.command === 'leaseRefresh') {
+      await this.authorizeConnection(command.payload, true);
+      return { requestId: command.requestId };
+    }
     if (command.command === 'disconnect') {
       const encoded = await this.safeDisconnect();
       return { requestId: command.requestId, encoded };
@@ -166,12 +176,39 @@ export class ControlServer {
     } catch (error) {
       failure = error;
     } finally {
+      this.clearLeaseTimer();
       this.controller = null;
       this.client.disconnect();
     }
     if (failure) throw new CommandError('STOP_FAILED', failure instanceof Error ? `Stop write failed: ${failure.message}` : 'Stop write failed');
     return encoded;
   }
+
+  private async authorizeConnection(payload: unknown, refresh = false) {
+    const target = parseConnectionConfig(payload);
+    if (!this.leaseVerifier) return target;
+    const value = payload as { vehicleId?: unknown; leaseToken?: unknown };
+    if (typeof value.vehicleId !== 'string' || typeof value.leaseToken !== 'string') throw new CommandError('PLATFORM_AUTH_REQUIRED', 'A valid platform control lease is required');
+    const lease = await this.leaseVerifier.verify(value.leaseToken, value.vehicleId);
+    if (!lease) throw new CommandError('PLATFORM_AUTH_REQUIRED', 'Platform control lease is invalid or expired');
+    if (!refresh && (lease.vehicle.host !== target.host || lease.vehicle.tcpPort !== target.tcpPort || lease.vehicle.videoPort !== target.videoPort)) throw new CommandError('PLATFORM_AUTH_REQUIRED', 'Connection target does not match the approved vehicle');
+    if (refresh && (!this.client.currentTarget || lease.vehicle.host !== this.client.currentTarget.host || lease.vehicle.tcpPort !== this.client.currentTarget.tcpPort || lease.vehicle.videoPort !== this.client.currentTarget.videoPort)) throw new CommandError('PLATFORM_AUTH_REQUIRED', 'Lease refresh does not match the connected vehicle');
+    this.scheduleLeaseExpiry(lease.expiresAt);
+    return lease.vehicle;
+  }
+
+  private scheduleLeaseExpiry(expiresAt: string): void {
+    this.clearLeaseTimer();
+    const waitMs = Math.max(0, new Date(expiresAt).getTime() - Date.now());
+    this.leaseTimer = setTimeout(() => {
+      void this.enqueue(async () => {
+        try { await this.safeDisconnect(); }
+        catch (error) { console.error('Gateway Stop failed after platform lease expiry', error); }
+      });
+    }, waitMs);
+  }
+
+  private clearLeaseTimer(): void { if (this.leaseTimer) clearTimeout(this.leaseTimer); this.leaseTimer = null; }
 
   private withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
     return new Promise<T>((resolve, reject) => {
