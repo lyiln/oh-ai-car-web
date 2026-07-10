@@ -8,6 +8,9 @@ Browser control console and localhost-only TCP gateway for the OH AI car.
 For agent-assisted work, start with [AGENTS.md](AGENTS.md) and
 [AI_CONTEXT.md](AI_CONTEXT.md).
 
+Course-level delivery status and evidence requirements are tracked in
+[COURSE_STATUS.md](COURSE_STATUS.md).
+
 ## Development
 
 ```sh

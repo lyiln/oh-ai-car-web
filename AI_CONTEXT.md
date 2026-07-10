@@ -9,6 +9,8 @@
   Controlled real-car validation is still pending.
 - The primary open risk is the unresolved button packet conflict documented in
   `PROTOCOL_STATUS.md`. Treat this as an operational safety constraint.
+- `COURSE_STATUS.md` tracks the course-level evidence needed for the basic
+  score. This repository currently covers only the Web/APP control module.
 
 ## Runtime Architecture
 
@@ -21,6 +23,8 @@ Browser UI -> direct car video HTTP :6500/index2
 - `gateway/`: localhost WebSocket server and raw TCP client.
 - `shared/`: WebSocket types and car packet encoder.
 - Network defaults: `192.168.1.11`, TCP `6000`, video `6500`.
+- The gateway accepts only the documented localhost production/Vite Origins and
+  permits one controlling browser session at a time.
 
 ## Source of Truth
 
@@ -36,9 +40,14 @@ The original contract contains `$011503011A#`; source-derived evidence and the
 current encoder use `$011504011B#`. Neither is real-car confirmed. Do not
 resolve this discrepancy without a recorded controlled test.
 
+Gateway disconnect, reconnect, controller close, and process shutdown attempt
+Stop before closing TCP. A successful iframe page load still does not confirm
+video-stream health.
+
 ## Required Documentation
 
 - `AGENTS.md`: mandatory operating rules for agents.
+- `COURSE_STATUS.md`: course requirement status and evidence gate.
 - `PROTOCOL_STATUS.md`: conflict status and resolution gate.
 - `docs/flows/web-control-real-car-validation.md`: required record for any
   hardware test.

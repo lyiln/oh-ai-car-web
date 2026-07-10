@@ -5,9 +5,10 @@
 Before planning or editing, read these files in order:
 
 1. `AI_CONTEXT.md`
-2. `PROTOCOL_STATUS.md`
-3. `.specify/memory/constitution.md`
-4. The relevant file under `specs/001-web-control-gateway/`
+2. `COURSE_STATUS.md`
+3. `PROTOCOL_STATUS.md`
+4. `.specify/memory/constitution.md`
+5. The relevant file under `specs/001-web-control-gateway/`
 
 ## Repository Boundary
 
@@ -29,8 +30,9 @@ Before planning or editing, read these files in order:
 - Never claim fake TCP tests prove real-car compatibility. Record controlled
   hardware observations in `docs/flows/web-control-real-car-validation.md`.
 - Do not expose raw encoded TCP commands or arbitrary TCP passthrough to the
-  browser. Keep the gateway localhost-only unless a separately approved spec
-  changes the security model.
+  browser. Keep the gateway localhost-only, verify the documented local browser
+  Origins, and preserve the single-controller session rule unless a separately
+  approved spec changes the security model.
 
 ## Development Workflow
 
@@ -42,5 +44,9 @@ Before planning or editing, read these files in order:
 - For code changes, run `npm run typecheck`, `npm test`, and `npm run build`.
   Gateway tests use a fake local TCP server; do not substitute this for real-car
   validation.
+- Treat iframe page load as browser-page availability only, not proof that the
+  car video stream is working.
+- Do not mark any course requirement complete without the executable evidence
+  required by `COURSE_STATUS.md` and its `docs/course/` checklists.
 - Do not commit, push, reset, clean, or modify external source repositories
   unless the user explicitly requests it.
