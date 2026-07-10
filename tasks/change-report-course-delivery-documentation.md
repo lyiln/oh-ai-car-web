@@ -20,8 +20,11 @@
   final defense checks.
 - Renamed the human-facing course dashboard and course documents to Chinese
   filenames, then updated repository navigation and agent references.
-- Recorded the requirement for teacher confirmation before presenting Web as a
-  replacement for the OpenHarmony APP training deliverable.
+- Recorded the Web control console as an extra deliverable after the
+  OpenHarmony APP training task, with teacher confirmation required only when
+  it is proposed as an advanced system optimization.
+- Added an evidence-first final-acceptance plan that keeps all five basic
+  requirements at “待核验” until owners provide verifiable results.
 
 ## Preserved Boundaries
 
@@ -29,5 +32,5 @@
   changed.
 - Web fake-TCP tests remain offline evidence only; real-car status remains
   unverified.
-- The other four course requirements remain “开发中” until their owners provide
+- All five basic requirements remain “待核验” until their owners provide
   implementation and demonstration evidence.
