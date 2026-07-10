@@ -9,7 +9,7 @@
   Controlled real-car validation is still pending.
 - The primary open risk is the unresolved button packet conflict documented in
   `PROTOCOL_STATUS.md`. Treat this as an operational safety constraint.
-- `COURSE_STATUS.md` tracks the course-level evidence needed for the basic
+- `课程状态.md` tracks the course-level evidence needed for the basic
   score. This repository currently covers only the Web/APP control module.
 
 ## Runtime Architecture
@@ -47,7 +47,9 @@ video-stream health.
 ## Required Documentation
 
 - `AGENTS.md`: mandatory operating rules for agents.
-- `COURSE_STATUS.md`: course requirement status and evidence gate.
+- `课程状态.md`: course requirement status and evidence gate.
+- `docs/course/课程文档索引.md`: index for the group delivery, taskbook mapping, and
+  evidence documents.
 - `PROTOCOL_STATUS.md`: conflict status and resolution gate.
 - `docs/flows/web-control-real-car-validation.md`: required record for any
   hardware test.

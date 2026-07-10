@@ -5,10 +5,11 @@
 Before planning or editing, read these files in order:
 
 1. `AI_CONTEXT.md`
-2. `COURSE_STATUS.md`
-3. `PROTOCOL_STATUS.md`
-4. `.specify/memory/constitution.md`
-5. The relevant file under `specs/001-web-control-gateway/`
+2. `课程状态.md`
+3. `docs/course/课程文档索引.md` when work affects group delivery or course evidence
+4. `PROTOCOL_STATUS.md`
+5. `.specify/memory/constitution.md`
+6. The relevant file under `specs/001-web-control-gateway/`
 
 ## Repository Boundary
 
@@ -47,6 +48,6 @@ Before planning or editing, read these files in order:
 - Treat iframe page load as browser-page availability only, not proof that the
   car video stream is working.
 - Do not mark any course requirement complete without the executable evidence
-  required by `COURSE_STATUS.md` and its `docs/course/` checklists.
+  required by `课程状态.md` and its `docs/course/` checklists.
 - Do not commit, push, reset, clean, or modify external source repositories
   unless the user explicitly requests it.

@@ -9,7 +9,8 @@ For agent-assisted work, start with [AGENTS.md](AGENTS.md) and
 [AI_CONTEXT.md](AI_CONTEXT.md).
 
 Course-level delivery status and evidence requirements are tracked in
-[COURSE_STATUS.md](COURSE_STATUS.md).
+[课程状态.md](课程状态.md); the group execution and taskbook mapping
+are indexed at [docs/course/课程文档索引.md](docs/course/课程文档索引.md).
 
 ## Development
 
