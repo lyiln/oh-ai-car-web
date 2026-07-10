@@ -1,5 +1,10 @@
 # Contract: WebSocket Control API
 
+> **Unconfirmed protocol example:** The encoded packet in the result example
+> below is preserved from the original contract. It conflicts with the
+> source-derived packet used by this implementation. Do not treat either value
+> as real-car confirmed; see [`PROTOCOL_STATUS.md`](../../../PROTOCOL_STATUS.md).
+
 ## Endpoint
 
 ```text

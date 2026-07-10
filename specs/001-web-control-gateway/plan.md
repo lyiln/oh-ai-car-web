@@ -38,7 +38,7 @@ Build a first Web control surface for the existing smart car without changing th
 
 | Principle | Status | Evidence |
 |---|---|---|
-| Evidence-Backed Changes | PASS | Protocol decisions cite `CarEncode.ets`, `doc/ros_api.md`, and source analysis docs. |
+| Evidence-Backed Changes | PASS | Protocol decisions cite retained local source evidence under `docs/reference/` and `PROTOCOL_STATUS.md`. |
 | Existing App Preservation | PASS | The independent repository contains only `frontend/`, `gateway/`, `shared/`, and Web documentation; the original app remains untouched. |
 | Protocol Compatibility | PASS | Command mapping preserves `10/15/21/60/61/62/63/64` and existing encoding rules. |
 | Browser-to-TCP Boundary | PASS | Browser talks to localhost gateway via WebSocket; gateway owns raw TCP. |

@@ -1,6 +1,7 @@
 # oh-ai-car-ros-app Source Analysis
 
 ## Scope
+- 本文是来源提交 `6a9a7cb8839a6c16777eabf1f74e65d8c5867c1f` 的分析快照；其中出现的源码路径用于标识原始证据，不是本仓库的文件依赖。
 - 本次分析范围：`Code/oh-ai-car-ros-app` 的 OpenHarmony/ArkTS 源码结构、页面入口、控制调用链、TCP 编码协议、视频链路、风险与后续 Web 端开发影响。
 - 明确不包含：不分析真车固件/ROS 服务端实现，不运行构建，不连接设备，不修改业务源码，不清理现有 Git 工作区状态。
 

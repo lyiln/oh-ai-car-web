@@ -5,6 +5,11 @@
 **Status**: Implemented; real-car validation pending
 **Input**: Build the next Web-side development foundation from the existing OpenHarmony smart car controller.
 
+> **Protocol warning:** Existing source evidence and an original contract
+> example disagree on the button packet length and checksum. Neither is
+> real-car confirmed. See [`PROTOCOL_STATUS.md`](../../PROTOCOL_STATUS.md)
+> before changing command encoding or driving a physical car.
+
 ## Clarifications
 
 ### Session 2026-07-09
@@ -105,12 +110,11 @@ As an operator, I want to update four independent wheel speeds so that the Web a
 - **VideoConfig**: URL or proxy mode for video rendering.
 
 ## Evidence
-- `AI_CONTEXT.md`: existing app flow, defaults, and future Web direction.
-- `docs/architecture/oh-ai-car-ros-app-source-analysis.md`: confirmed call chains, command codes, risks, and Web gateway recommendation.
-- `doc/ros_api.md`: TCP port and command protocol.
-- `entry/src/main/ets/CarUtill/CarEncode.ets`: command encoding implementation.
-- `entry/src/main/ets/tcp/TCPClientManager.ets`: current raw TCP behavior.
-- `entry/src/main/ets/components/VideoComponents.ets`: video URL pattern and media command buttons.
+- `docs/reference/context/ai-context.md`: source-app flow, defaults, and Web direction.
+- `docs/reference/architecture/oh-ai-car-ros-app-source-analysis.md`: confirmed call chains, command codes, risks, and Web gateway recommendation.
+- `docs/reference/protocol/ros_api.md`: retained original TCP protocol document.
+- `docs/reference/protocol/encoder-evidence.md`: source-derived encoder, TCP, and video evidence without copied ArkTS business code.
+- `PROTOCOL_STATUS.md`: unresolved packet conflict and real-car validation rule.
 
 ## Open Questions
 - Does the car send useful acknowledgements or telemetry over TCP?
