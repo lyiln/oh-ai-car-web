@@ -268,3 +268,83 @@ CREATE UNIQUE INDEX IF NOT EXISTS whitelist_imports_one_live_per_vehicle_idx
   ON whitelist_imports(vehicle_id)
   WHERE is_snapshot=false;
 `;
+
+export const migration007 = `
+CREATE TABLE IF NOT EXISTS resident_destinations (
+  id uuid PRIMARY KEY,
+  vehicle_id uuid NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+  building text NOT NULL,
+  resident_key text NOT NULL DEFAULT '',
+  display_name text NOT NULL,
+  map_version text NOT NULL,
+  x double precision NOT NULL,
+  y double precision NOT NULL,
+  yaw double precision NOT NULL,
+  active boolean NOT NULL DEFAULT true,
+  created_by_user_id uuid NOT NULL REFERENCES users(id),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (vehicle_id, building, resident_key, map_version)
+);
+CREATE INDEX IF NOT EXISTS resident_destinations_vehicle_active_idx
+  ON resident_destinations(vehicle_id, active, building);
+
+ALTER TABLE whitelist_entries ADD COLUMN IF NOT EXISTS destination_id uuid REFERENCES resident_destinations(id) ON DELETE SET NULL;
+
+CREATE TABLE IF NOT EXISTS response_tasks (
+  id uuid PRIMARY KEY,
+  observation_id uuid NOT NULL UNIQUE REFERENCES plate_observations(id) ON DELETE CASCADE,
+  violation_id uuid REFERENCES violations(id) ON DELETE SET NULL,
+  source_patrol_task_id uuid NOT NULL REFERENCES patrol_tasks(id) ON DELETE CASCADE,
+  source_vehicle_id uuid NOT NULL REFERENCES vehicles(id),
+  assigned_vehicle_id uuid REFERENCES vehicles(id),
+  destination_id uuid NOT NULL REFERENCES resident_destinations(id),
+  plate text NOT NULL,
+  owner_name text NOT NULL DEFAULT '',
+  building text NOT NULL,
+  status text NOT NULL CHECK (status IN ('pending_review','confirmed','assigned','navigating','arrived','completed','cancelled','failed')),
+  eligibility_reason text NOT NULL DEFAULT '',
+  ai_suggestion text NOT NULL DEFAULT '',
+  notification_text text NOT NULL DEFAULT '',
+  confirmed_by_user_id uuid REFERENCES users(id),
+  confirmed_at timestamptz,
+  assigned_at timestamptz,
+  navigation_started_at timestamptz,
+  arrived_at timestamptz,
+  completed_at timestamptz,
+  cancelled_at timestamptz,
+  failed_at timestamptz,
+  failure_reason text,
+  arrival_evidence_url text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS response_tasks_status_created_idx ON response_tasks(status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS response_tasks_vehicle_active_idx
+  ON response_tasks(assigned_vehicle_id)
+  WHERE status IN ('assigned','navigating','arrived');
+
+CREATE TABLE IF NOT EXISTS response_task_events (
+  id uuid PRIMARY KEY,
+  task_id uuid NOT NULL REFERENCES response_tasks(id) ON DELETE CASCADE,
+  device_event_id text,
+  event_type text NOT NULL,
+  details jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (task_id, device_event_id)
+);
+CREATE INDEX IF NOT EXISTS response_task_events_task_created_idx ON response_task_events(task_id, created_at);
+`;
+
+export const migration008 = `
+ALTER TABLE response_tasks DROP CONSTRAINT IF EXISTS response_tasks_status_check;
+ALTER TABLE response_tasks ADD CONSTRAINT response_tasks_status_check CHECK (
+  status IN ('pending_review','confirmed','assigned','navigating','arrived','cancellation_requested','completed','cancelled','failed')
+);
+ALTER TABLE response_tasks ADD COLUMN IF NOT EXISTS cancel_requested_at timestamptz;
+ALTER TABLE response_tasks ADD COLUMN IF NOT EXISTS stop_confirmed_at timestamptz;
+DROP INDEX IF EXISTS response_tasks_vehicle_active_idx;
+CREATE UNIQUE INDEX response_tasks_vehicle_active_idx
+  ON response_tasks(assigned_vehicle_id)
+  WHERE status IN ('assigned','navigating','arrived','cancellation_requested');
+`;

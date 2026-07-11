@@ -11,6 +11,7 @@ const NAV = [
   { to: '/patrol/records', label: '巡逻记录' },
   { to: '/map', label: '全局地图' },
   { to: '/violations', label: '违规车辆' },
+  { to: '/responses', label: '上门处置' },
   { to: '/reviews', label: '待人工审核' },
   { to: '/whitelist', label: '白名单管理' },
   { to: '/reports', label: '报告中心' },

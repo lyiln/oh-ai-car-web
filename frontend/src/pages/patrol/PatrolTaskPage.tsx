@@ -26,14 +26,20 @@ export function PatrolTaskPage() {
 
   useEffect(() => {
     void (async () => {
-      const [nextRoutes, list] = await Promise.all([
-        patrolClient.routes(selectedId),
-        selectedId ? opsClient.whitelist(selectedId) : Promise.resolve([]),
-      ]);
-      setRoutes(nextRoutes);
-      setRouteId(nextRoutes[0]?.id ?? '');
-      setWhitelistCount(list.length);
-      await refresh(selectedId);
+      try {
+        const [nextRoutes, list] = await Promise.all([
+          patrolClient.routes(selectedId),
+          selectedId ? opsClient.whitelist(selectedId) : Promise.resolve([]),
+        ]);
+        setRoutes(nextRoutes);
+        setRouteId(nextRoutes[0]?.id ?? '');
+        setWhitelistCount(list.length);
+        await refresh(selectedId);
+      } catch (reason) {
+        setMessage(reason instanceof Error ? reason.message : '巡检配置加载失败');
+        setRoutes([]);
+        setRouteId('');
+      }
     })();
   }, [selectedId]);
 

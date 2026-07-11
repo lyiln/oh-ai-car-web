@@ -1,7 +1,10 @@
 import { useEffect, useState } from 'react';
 import { FormModal } from '../../components/layout/FormModal.js';
-import type { MapZone, Waypoint } from '../../services/api.js';
+import type { MapZone, ResidentDestination, Waypoint } from '../../services/api.js';
 import * as mapClient from '../../services/mapClient.js';
+import * as responseClient from '../../services/responseClient.js';
+import { useSelectedDevice } from '../../contexts/SelectedDeviceContext.js';
+import { useAuth } from '../../contexts/AuthContext.js';
 
 function parseCoordinates(text: string): Array<[number, number]> {
   return text
@@ -18,6 +21,8 @@ function parseCoordinates(text: string): Array<[number, number]> {
 }
 
 export function MapPage() {
+  const { selectedId } = useSelectedDevice();
+  const { user } = useAuth();
   const [zones, setZones] = useState<MapZone[]>([]);
   const [waypoints, setWaypoints] = useState<Waypoint[]>([]);
   const [name, setName] = useState('');
@@ -25,15 +30,21 @@ export function MapPage() {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [addOpen, setAddOpen] = useState(false);
+  const [destinationOpen, setDestinationOpen] = useState(false);
+  const [destinations, setDestinations] = useState<ResidentDestination[]>([]);
+  const [destinationForm, setDestinationForm] = useState({ building: '', displayName: '', mapVersion: '', x: '', y: '', yaw: '0' });
   const [layers, setLayers] = useState({ waypoints: true, zones: true, violations: true, track: false });
 
   const refresh = async () => {
-    const [nextZones, nextWaypoints] = await Promise.all([mapClient.zones(), mapClient.waypoints()]);
+    const [nextZones, nextWaypoints, nextDestinations] = await Promise.all([
+      mapClient.zones(), mapClient.waypoints(), selectedId ? responseClient.destinations(selectedId) : Promise.resolve([]),
+    ]);
     setZones(nextZones);
     setWaypoints(nextWaypoints);
+    setDestinations(nextDestinations);
   };
 
-  useEffect(() => { void refresh().catch((reason: unknown) => setMessage(reason instanceof Error ? reason.message : '加载失败')); }, []);
+  useEffect(() => { void refresh().catch((reason: unknown) => setMessage(reason instanceof Error ? reason.message : '加载失败')); }, [selectedId]);
 
   const closeDrawer = () => {
     setAddOpen(false);
@@ -67,6 +78,19 @@ export function MapPage() {
     }
   };
 
+  const addDestination = async (event: React.FormEvent) => {
+    event.preventDefault(); setError('');
+    if (!selectedId) return setError('请先选择设备');
+    try {
+      await responseClient.createDestination({
+        vehicleId: selectedId, building: destinationForm.building, displayName: destinationForm.displayName,
+        mapVersion: destinationForm.mapVersion, x: Number(destinationForm.x), y: Number(destinationForm.y), yaw: Number(destinationForm.yaw),
+      });
+      setDestinationOpen(false); setDestinationForm({ building: '', displayName: '', mapVersion: '', x: '', y: '', yaw: '0' });
+      setMessage('住户一层目的地已保存'); await refresh();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '目的地保存失败'); }
+  };
+
   return (
     <div className="page">
       <header className="page-header">
@@ -74,7 +98,7 @@ export function MapPage() {
           <h1>全局地图</h1>
           <p>禁停区、航点与图层管理</p>
         </div>
-        <button type="button" className="primary" onClick={() => setAddOpen(true)}>新增禁停区</button>
+        <div className="button-row"><button type="button" className="secondary" disabled={!selectedId || user?.role !== 'admin'} onClick={() => setDestinationOpen(true)}>新增住户目的地</button><button type="button" className="primary" onClick={() => setAddOpen(true)}>新增禁停区</button></div>
       </header>
       {message && <p className="notice">{message}</p>}
       {error && !addOpen && <p className="error">{error}</p>}
@@ -117,6 +141,11 @@ export function MapPage() {
             )}
           </>
         )}
+        <h3 className="mt-16">一层住户目的地</h3>
+        {destinations.length === 0 ? <div className="empty-state">当前设备暂无住户目的地</div> : <table>
+          <thead><tr><th>楼栋</th><th>名称</th><th>地图版本</th><th>Nav2 Pose</th><th>状态</th></tr></thead>
+          <tbody>{destinations.map((destination) => <tr key={destination.id}><td>{destination.building}</td><td>{destination.displayName}</td><td>{destination.mapVersion}</td><td>{destination.x}, {destination.y}, {destination.yaw}</td><td>{destination.active ? '启用' : '停用'}</td></tr>)}</tbody>
+        </table>}
       </section>
 
       <FormModal open={addOpen} title="新增禁停区" onClose={closeDrawer}>
@@ -134,6 +163,17 @@ export function MapPage() {
           </label>
           {error && <p className="error">{error}</p>}
           <button type="submit" className="primary">保存</button>
+        </form>
+      </FormModal>
+      <FormModal open={destinationOpen} title="新增一层住户目的地" onClose={() => setDestinationOpen(false)}>
+        <form className="stack-form" onSubmit={(event) => void addDestination(event)}>
+          <label>楼栋标识<input required value={destinationForm.building} onChange={(e) => setDestinationForm({ ...destinationForm, building: e.target.value })} placeholder="1号楼" /></label>
+          <label>显示名称<input required value={destinationForm.displayName} onChange={(e) => setDestinationForm({ ...destinationForm, displayName: e.target.value })} placeholder="1号楼一层公共门口" /></label>
+          <label>地图版本<input required value={destinationForm.mapVersion} onChange={(e) => setDestinationForm({ ...destinationForm, mapVersion: e.target.value })} placeholder="community-map-v1" /></label>
+          <label>X<input required type="number" step="any" value={destinationForm.x} onChange={(e) => setDestinationForm({ ...destinationForm, x: e.target.value })} /></label>
+          <label>Y<input required type="number" step="any" value={destinationForm.y} onChange={(e) => setDestinationForm({ ...destinationForm, y: e.target.value })} /></label>
+          <label>Yaw<input required type="number" step="any" value={destinationForm.yaw} onChange={(e) => setDestinationForm({ ...destinationForm, yaw: e.target.value })} /></label>
+          {error && <p className="error">{error}</p>}<button type="submit" className="primary">保存目的地</button>
         </form>
       </FormModal>
     </div>

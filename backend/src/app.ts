@@ -8,6 +8,7 @@ import type { PoolClient } from 'pg';
 import { loadConfig, type Config } from './config.js';
 import { Database } from './db/index.js';
 import { registerPatrolPlatformRoutes } from './routes/patrol-platform.js';
+import { createResponseCandidate, registerResponsePlatformRoutes } from './routes/response-platform.js';
 import { hashSecret, randomSecret, sign, verify, type SignedPayload } from './security.js';
 
 type Role = 'admin' | 'operator';
@@ -28,7 +29,7 @@ interface VehicleRow {
 interface DeviceCredentialRow { vehicle_id: string; secret_hash: string; }
 interface SessionPayload extends SignedPayload { sub: string; role: Role; }
 interface LeasePayload extends SignedPayload { sub: string; role: Role; leaseId: string; vehicleId: string; }
-type PatrolSocket = { send: (value: string) => void; vehicleId?: string };
+type PatrolSocket = { send: (value: string) => void; vehicleId: string };
 const SESSION_COOKIE = 'oh_ai_session';
 const LEASE_MS = 60_000;
 const USER_SELECT = 'id, username, display_name, password_hash, role, active, email';
@@ -59,14 +60,17 @@ export class RealtimeHub {
       socket.send(JSON.stringify({ type: 'pose_update', vehicleId, ...pose }));
     }
   }
-  subscribePatrol(socket: { send: (value: string) => void }, vehicleId?: string) {
+  subscribePatrol(socket: { send: (value: string) => void }, vehicleId: string) {
     const entry: PatrolSocket = { send: socket.send.bind(socket), vehicleId };
     this.patrolSubscribers.add(entry);
     return () => { this.patrolSubscribers.delete(entry); };
   }
-  publishPatrol(msg: unknown) {
+  publishPatrol(msg: { vehicleId: string; [key: string]: unknown }) {
     const text = JSON.stringify(msg);
-    for (const socket of this.patrolSubscribers) socket.send(text);
+    for (const socket of this.patrolSubscribers) {
+      if (socket.vehicleId !== msg.vehicleId) continue;
+      socket.send(text);
+    }
   }
 }
 
@@ -295,6 +299,8 @@ export async function createApp(services: AppServices = {}) {
     await client.query('SELECT id FROM vehicles WHERE id=$1 FOR UPDATE', [vehicleId]);
     const patrol = await client.query("SELECT status FROM patrol_tasks WHERE vehicle_id=$1 AND status IN ('queued','running','cancellation_requested') LIMIT 1", [vehicleId]);
     if (patrol.rowCount) throw Object.assign(new Error('Patrol is active or awaiting zero-velocity stop confirmation'), { statusCode: 409 });
+    const response = await client.query("SELECT status FROM response_tasks WHERE assigned_vehicle_id=$1 AND status IN ('assigned','navigating','arrived','cancellation_requested') LIMIT 1", [vehicleId]);
+    if (response.rowCount) throw Object.assign(new Error('Doorstep response is active or awaiting safe completion'), { statusCode: 409 });
     await client.query("UPDATE control_leases SET released_at=now(),release_reason='expired' WHERE vehicle_id=$1 AND released_at IS NULL AND expires_at<=now()", [vehicleId]);
     const existing = await client.query<{ user_id: string }>('SELECT user_id FROM control_leases WHERE vehicle_id=$1 AND released_at IS NULL AND expires_at>now() LIMIT 1', [vehicleId]);
     if (existing.rows[0] && existing.rows[0].user_id !== user.id) throw Object.assign(new Error('Vehicle is controlled by another operator'), { statusCode: 409 });
@@ -305,7 +311,9 @@ export async function createApp(services: AppServices = {}) {
   app.post('/api/vehicles/:id/control-lease', async (request) => { const user = await requireUser(request); const vehicleId = (request.params as { id: string }).id; if (!await canAccessVehicle(user, vehicleId)) throw Object.assign(new Error('Vehicle access denied'), { statusCode: 403 }); const lease = await db.transaction((client) => acquireLease(client, user, vehicleId)); await audit('control-lease.acquire', 'success', user.id, vehicleId); return { leaseId: lease.id, expiresAt: lease.expiresAt.toISOString(), gatewayToken: leaseToken(lease.id, vehicleId, user, lease.expiresAt) }; });
   app.post('/api/control-leases/:id/renew', async (request) => { const user = await requireUser(request); const leaseId = (request.params as { id: string }).id; const expiresAt = new Date(Date.now() + LEASE_MS); const result = await db.query<{ vehicle_id: string }>('UPDATE control_leases SET expires_at=$1 WHERE id=$2 AND user_id=$3 AND released_at IS NULL AND expires_at>now() RETURNING vehicle_id', [expiresAt, leaseId, user.id]); if (!result.rows[0]) throw Object.assign(new Error('Control lease expired'), { statusCode: 409 }); await audit('control-lease.renew', 'success', user.id, result.rows[0].vehicle_id); return { expiresAt: expiresAt.toISOString(), gatewayToken: leaseToken(leaseId, result.rows[0].vehicle_id, user, expiresAt) }; });
   app.delete('/api/control-leases/:id', async (request) => { const user = await requireUser(request); const leaseId = (request.params as { id: string }).id; const result = await db.query<{ vehicle_id: string }>("UPDATE control_leases SET released_at=now(),release_reason='operator' WHERE id=$1 AND user_id=$2 AND released_at IS NULL RETURNING vehicle_id", [leaseId, user.id]); if (result.rows[0]) await audit('control-lease.release', 'success', user.id, result.rows[0].vehicle_id); return { ok: true }; });
-  app.post('/internal/control-lease/verify', async (request) => { const body = object(request.body); const token = string(body?.token, 'token'); const claim = verify<LeasePayload>(token, config.sessionSecret); if (!claim?.leaseId || !claim.vehicleId) return { valid: false }; const result = await db.query<VehicleRow>('SELECT v.* FROM control_leases l JOIN vehicles v ON v.id=l.vehicle_id JOIN users u ON u.id=l.user_id WHERE l.id=$1 AND l.vehicle_id=$2 AND l.user_id=$3 AND l.released_at IS NULL AND l.expires_at>now() AND u.active=true', [claim.leaseId, claim.vehicleId, claim.sub]); return result.rows[0] ? { valid: true, vehicle: vehicleDto(result.rows[0]), expiresAt: new Date(claim.exp).toISOString() } : { valid: false };
+  app.post('/internal/control-lease/verify', async (request) => { const body = object(request.body); const token = string(body?.token, 'token'); const claim = verify<LeasePayload>(token, config.sessionSecret); if (!claim?.leaseId || !claim.vehicleId) return { valid: false }; const result = await db.query<VehicleRow>(`SELECT v.* FROM control_leases l JOIN vehicles v ON v.id=l.vehicle_id JOIN users u ON u.id=l.user_id
+    WHERE l.id=$1 AND l.vehicle_id=$2 AND l.user_id=$3 AND l.released_at IS NULL AND l.expires_at>now() AND u.active=true
+      AND NOT EXISTS (SELECT 1 FROM response_tasks rt WHERE rt.assigned_vehicle_id=l.vehicle_id AND rt.status IN ('assigned','navigating','arrived','cancellation_requested'))`, [claim.leaseId, claim.vehicleId, claim.sub]); return result.rows[0] ? { valid: true, vehicle: vehicleDto(result.rows[0]), expiresAt: new Date(claim.exp).toISOString() } : { valid: false };
   });
 
   app.post('/device/v1/telemetry', async (request, reply) => {
@@ -410,7 +418,16 @@ export async function createApp(services: AppServices = {}) {
         }
         return { observationId: obs.rows[0].id, observationCount: obs.rows[0].observation_count };
       });
-      return { ok: true, observationId, classification, noParking, deduplicated: observationCount > 1 };
+      const response = await createResponseCandidate(db, hub, {
+          observationId,
+          taskId,
+          vehicleId,
+          plate,
+          confidence,
+          noParking,
+          evidenceUrl: typeof body.evidenceImageUrl === 'string' ? body.evidenceImageUrl : null,
+        });
+      return { ok: true, observationId, classification, noParking, deduplicated: observationCount > 1, ...response };
     }
     if (body?.type !== 'waypoint' || typeof body.waypointId !== 'string') throw Object.assign(new Error('Unsupported scheduler event'), { statusCode: 400 });
     await db.query("INSERT INTO patrol_events (id,task_id,event_type,waypoint_id,details) VALUES ($1,$2,'waypoint',$3,$4)", [randomUUID(), taskId, body.waypointId, JSON.stringify(body)]);
@@ -431,6 +448,17 @@ export async function createApp(services: AppServices = {}) {
     leaseToken: (leaseId, vehicleId, user, expiresAt) => leaseToken(leaseId, vehicleId, user as UserRow, expiresAt),
     audit,
     hub,
+  });
+
+  registerResponsePlatformRoutes(app, {
+    db,
+    requireUser,
+    requireAdmin,
+    canAccessVehicle: (user, vehicleId) => canAccessVehicle(user as UserRow, vehicleId),
+    deviceVehicle,
+    audit,
+    hub,
+    ai: { baseUrl: config.aiBaseUrl, apiKey: config.aiApiKey, model: config.aiModel },
   });
 
   app.addHook('onClose', async () => { if (!services.db) await db.close(); });

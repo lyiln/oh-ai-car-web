@@ -1,5 +1,5 @@
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
-import { migration001, migration002, migration003, migration004, migration005, migration006 } from './schema.js';
+import { migration001, migration002, migration003, migration004, migration005, migration006, migration007, migration008 } from './schema.js';
 
 export class Database {
   readonly pool: Pool;
@@ -20,6 +20,8 @@ export class Database {
       { version: '004-platform-operations', sql: migration004 },
             { version: '005-patrol-snapshot-reviews', sql: migration005 },
       { version: '006-whitelist-live-version-locking', sql: migration006 },
+      { version: '007-doorstep-response', sql: migration007 },
+      { version: '008-doorstep-response-safety', sql: migration008 },
     ]) {
       const applied = await this.pool.query<{ version: string }>('SELECT version FROM schema_migrations WHERE version=$1', [migration.version]);
       if (applied.rowCount) continue;

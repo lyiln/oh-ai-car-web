@@ -259,6 +259,68 @@ describe('platform API against PostGIS', () => {
     );
   });
 
+  it('runs an operator-confirmed doorstep response with zero-velocity and evidence gates', async () => {
+    const adminCookie = await login('admin', 'new-password');
+    const operatorCookie = await login('operator-a', 'password');
+    const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-DOOR', name: '上门处置车', host: '192.168.1.30', tcpPort: 6000, videoPort: 6500 } });
+    const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
+    await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA] } });
+    const destination = await app.inject({ method: 'POST', url: '/api/resident-destinations', headers: { origin, cookie: adminCookie }, payload: { vehicleId, building: '1号楼', displayName: '1号楼一层门口', mapVersion: 'v-door', x: 4, y: 5, yaw: 0 } });
+    expect(destination.statusCode).toBe(200);
+    const routeId = randomUUID(); const waypointId = randomUUID(); const whitelistId = randomUUID();
+    await db.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [routeId, vehicleId, '上门路线', 'v-door', 'generated', ids.admin]);
+    await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds,no_parking_roi) VALUES ($1,$2,0,$3,0,0,0,8,$4)', [waypointId, routeId, '东门禁停点', JSON.stringify([0.1, 0.1, 0.5, 0.5])]);
+    for (const ordinal of [1, 2]) await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,$3,$4,0,0,0,8)', [randomUUID(), routeId, ordinal, `点${ordinal}`]);
+    await db.query('INSERT INTO whitelist_imports (id,vehicle_id,name,created_by_user_id) VALUES ($1,$2,$3,$4)', [whitelistId, vehicleId, '上门白名单', ids.admin]);
+    await db.query("INSERT INTO whitelist_entries (id,whitelist_id,plate,owner_name,building,category) VALUES ($1,$2,'D12345','住户甲','1号楼','private')", [randomUUID(), whitelistId]);
+    const started = await app.inject({ method: 'POST', url: '/api/patrol/start', headers: { origin, cookie: operatorCookie }, payload: { deviceId: vehicleId, routeId, shift: 'morning' } });
+    const patrolTaskId = started.json<{ task: { id: string } }>().task.id;
+    const credential = await app.inject({ method: 'POST', url: `/api/vehicles/${vehicleId}/device-credentials`, headers: { origin, cookie: adminCookie } });
+    const token = credential.json<{ credential: { token: string } }>().credential.token;
+    await app.inject({ method: 'GET', url: '/device/v1/patrol/tasks/next', headers: { authorization: `Bearer ${token}` } });
+    const observed = await app.inject({ method: 'POST', url: `/device/v1/patrol/tasks/${patrolTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: {
+      type: 'observation', waypointId, occurredAt: '2026-07-11T04:00:00.000Z', plate: 'D12345', confidence: 0.95,
+      vehicleBox: [0.2, 0.2, 0.2, 0.2], evidenceImageUrl: 'https://evidence.invalid/no-parking.jpg',
+    } });
+    expect(observed.statusCode).toBe(200);
+    const responseTaskId = observed.json<{ responseTaskId: string; responseEligible: boolean }>().responseTaskId;
+    expect(observed.json()).toMatchObject({ responseEligible: true, reason: 'operator_confirmation_required', ownerName: '住户甲', building: '1号楼' });
+    const blockingLeaseId = randomUUID();
+    await db.query('INSERT INTO control_leases (id,vehicle_id,user_id,expires_at) VALUES ($1,$2,$3,now()+interval \'5 minutes\')', [blockingLeaseId, vehicleId, ids.operatorA]);
+    const confirmed = await app.inject({ method: 'POST', url: `/api/response-tasks/${responseTaskId}/confirm`, headers: { origin, cookie: operatorCookie }, payload: {} });
+    expect(confirmed.statusCode).toBe(200);
+    expect(confirmed.json()).toMatchObject({ assignedVehicleId: null, assignmentPending: true, advice: { source: 'template' } });
+    await db.query('UPDATE control_leases SET released_at=now() WHERE id=$1', [blockingLeaseId]);
+    const assigned = await app.inject({ method: 'POST', url: `/api/response-tasks/${responseTaskId}/assign`, headers: { origin, cookie: operatorCookie }, payload: {} });
+    expect(assigned.statusCode).toBe(200);
+    expect(assigned.json()).toMatchObject({ assignedVehicleId: vehicleId, deduplicated: false });
+    expect((await app.inject({ method: 'POST', url: `/api/response-tasks/${responseTaskId}/assign`, headers: { origin, cookie: operatorCookie }, payload: {} })).json()).toMatchObject({ assignedVehicleId: vehicleId, deduplicated: true });
+    const claimed = await app.inject({ method: 'GET', url: '/device/v1/response/tasks/next', headers: { authorization: `Bearer ${token}` } });
+    expect(claimed.json<{ task: { id: string; destinationName: string } }>().task).toMatchObject({ id: responseTaskId, destinationName: '1号楼一层门口' });
+    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'nav-1', type: 'navigation_started' } })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'arrive-bad', type: 'arrived', zeroVelocity: false } })).statusCode).toBe(409);
+    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'arrive-1', type: 'arrived', zeroVelocity: true } })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'proof-1', type: 'arrival_evidence', evidenceUrl: 'https://evidence.invalid/door.jpg' } })).statusCode).toBe(200);
+    const completed = await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'done-1', type: 'completed', zeroVelocity: true } });
+    expect(completed.statusCode).toBe(200);
+    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'done-1', type: 'completed', zeroVelocity: true } })).json()).toMatchObject({ deduplicated: true });
+    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'late-failure', type: 'failed', reason: 'late' } })).statusCode).toBe(409);
+
+    const observedForCancel = await app.inject({ method: 'POST', url: `/device/v1/patrol/tasks/${patrolTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: {
+      type: 'observation', waypointId, occurredAt: '2026-07-11T05:00:00.000Z', plate: 'D12345', confidence: 0.96,
+      vehicleBox: [0.2, 0.2, 0.2, 0.2], evidenceImageUrl: 'https://evidence.invalid/no-parking-2.jpg',
+    } });
+    const cancelTaskId = observedForCancel.json<{ responseTaskId: string }>().responseTaskId;
+    expect((await app.inject({ method: 'POST', url: `/api/response-tasks/${cancelTaskId}/confirm`, headers: { origin, cookie: operatorCookie }, payload: {} })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${cancelTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'cancel-nav', type: 'navigation_started' } })).statusCode).toBe(200);
+    const cancelRequested = await app.inject({ method: 'POST', url: `/api/response-tasks/${cancelTaskId}/cancel`, headers: { origin, cookie: operatorCookie }, payload: {} });
+    expect(cancelRequested.json()).toMatchObject({ cancellationRequested: true });
+    expect((await app.inject({ method: 'POST', url: `/api/response-tasks/${cancelTaskId}/cancel`, headers: { origin, cookie: operatorCookie }, payload: {} })).json()).toMatchObject({ cancellationRequested: true, deduplicated: true });
+    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${cancelTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'stop-bad', type: 'stop_confirmed', zeroVelocity: false } })).statusCode).toBe(409);
+    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${cancelTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'stop-ok', type: 'stop_confirmed', zeroVelocity: true } })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${cancelTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'cancelled-failure', type: 'failed' } })).statusCode).toBe(409);
+  });
+
   it('scopes operational records and whitelist changes to the authorised vehicle', async () => {
     const adminCookie = await login('admin', 'new-password');
     const operatorACookie = await login('operator-a', 'password');

@@ -2,6 +2,12 @@
 
 ## Project State
 
+- **Active handoff:** before further doorstep-response or real-car work, read
+  `NEXT_SESSION.md`, `tasks/code-review-doorstep-response.md`, and
+  `tasks/real-car-doorstep-integration-plan.md`. Stage 0 review blockers are
+  repaired; the next allowed step is read-only stage 1 hardware/ROS discovery.
+  Physical autonomous motion is not approved yet.
+
 - `oh-ai-car-web` is an independent npm workspace for browser-based smart-car
   control. The original OpenHarmony project is not required to clone, build,
   test, or run this repository.
@@ -11,10 +17,13 @@
   dark AppShell, React Router pages (dashboard, fleet, console, patrol,
   map, violations, reviews, whitelist, reports, settings), password login (OTP
   APIs are not enabled because no server-side delivery provider is configured),
-  devices API aliases, patrol/map/ops domain tables (migrations 003–007), and
+  devices API aliases, patrol/map/ops domain tables (migrations 003–008), and
   `/patrol/live` WebSocket. See `docs/architecture/patrol-platform-api.md`.
 - The primary open risk is the unresolved button packet conflict documented in
   `PROTOCOL_STATUS.md`. Treat this as an operational safety constraint.
+- The doorstep-response implementation is present in migration 007 and
+  `backend/src/routes/response-platform.ts`, but its ROS/Nav2 scheduler and
+  physical-car behavior remain external and unverified.
 - `课程状态.md` tracks the course-level evidence needed for the basic
   score. This repository currently covers only the Web/APP control module.
 
@@ -28,6 +37,7 @@ Platform browser -> Vite/Nginx -> Fastify API -> PostgreSQL/PostGIS
 ROS2 /gps/fix -> Python edge agent -> HTTPS device telemetry API
 Platform browser -> lease -> local gateway -> car TCP :6000
 Platform browser -> /patrol/live WS -> pose_update / patrol_* events
+Device response scheduler -> /device/v1/response/* -> Nav2 pause/goal/resume
 ```
 
 - `frontend/`: React/Vite operator interface (AppShell + classic `/connect`).
@@ -72,6 +82,8 @@ video-stream health.
 - `docs/architecture/vehicle-platform-overview.md`: onboarding guide for the
   platform, backend data flow, security boundaries, and local startup order.
 - `docs/deployment/vehicle-platform.md`: Docker and ROS2 edge-agent setup.
+- `tasks/real-car-doorstep-integration-plan.md`: decision-complete staged handoff
+  for repairing blockers, building the ROS adapter, and validating a real car.
 
 ## Commands
 

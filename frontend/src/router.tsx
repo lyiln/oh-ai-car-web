@@ -17,6 +17,7 @@ import { ReviewQueuePage } from './pages/reviews/ReviewQueuePage.js';
 import { WhitelistPage } from './pages/whitelist/WhitelistPage.js';
 import { ReportsPage } from './pages/reports/ReportsPage.js';
 import { SettingsPage } from './pages/settings/SettingsPage.js';
+import { ResponseTasksPage } from './pages/responses/ResponseTasksPage.js';
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
@@ -61,6 +62,7 @@ export const router = createBrowserRouter([
       { path: 'patrol/records/:id', element: <PatrolRecordDetailPage /> },
       { path: 'map', element: <MapPage /> },
       { path: 'violations', element: <ViolationsPage /> },
+      { path: 'responses', element: <ResponseTasksPage /> },
       { path: 'reviews', element: <ReviewQueuePage /> },
       { path: 'whitelist', element: <WhitelistPage /> },
       { path: 'reports', element: <ReportsPage /> },

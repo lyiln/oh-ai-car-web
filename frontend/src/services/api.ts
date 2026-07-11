@@ -149,6 +149,48 @@ export interface Waypoint {
   order?: number;
 }
 
+export interface ResidentDestination {
+  id: string;
+  vehicleId: string;
+  building: string;
+  residentKey: string;
+  displayName: string;
+  mapVersion: string;
+  x: number;
+  y: number;
+  yaw: number;
+  active: boolean;
+}
+
+export interface ResponseTask {
+  id: string;
+  observationId: string;
+  violationId?: string | null;
+  sourceVehicleId: string;
+  sourceVehicleName: string;
+  assignedVehicleId?: string | null;
+  assignedVehicleName?: string | null;
+  destinationId: string;
+  destinationName: string;
+  mapVersion: string;
+  plate: string;
+  ownerName: string;
+  building: string;
+  status: 'pending_review' | 'confirmed' | 'assigned' | 'navigating' | 'arrived' | 'cancellation_requested' | 'completed' | 'cancelled' | 'failed';
+  eligibilityReason: string;
+  aiSuggestion?: string;
+  notificationText?: string;
+  evidenceUrl?: string | null;
+  arrivalEvidenceUrl?: string | null;
+  failureReason?: string | null;
+  waypoint: string;
+  confidence: number;
+  x: number;
+  y: number;
+  yaw: number;
+  createdAt: string;
+}
+
 const baseUrl = () => import.meta.env.VITE_PLATFORM_API_URL ?? window.location.origin;
 
 export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {

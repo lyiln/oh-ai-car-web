@@ -11,6 +11,9 @@ export interface Config {
   bootstrapAdminEmail: string | undefined;
   otpExpiryMinutes: number;
   otpResendCooldownSeconds: number;
+  aiBaseUrl: string | undefined;
+  aiApiKey: string | undefined;
+  aiModel: string;
 }
 
 export function loadConfig(overrides: Partial<Config> = {}): Config {
@@ -34,6 +37,9 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     bootstrapAdminEmail: process.env.BOOTSTRAP_ADMIN_EMAIL,
     otpExpiryMinutes: Number(process.env.OTP_EXPIRY_MINUTES ?? 5),
     otpResendCooldownSeconds: Number(process.env.OTP_RESEND_COOLDOWN_SECONDS ?? 60),
+    aiBaseUrl: process.env.AI_BASE_URL,
+    aiApiKey: process.env.AI_API_KEY,
+    aiModel: process.env.AI_MODEL ?? 'gpt-4.1-mini',
     ...overrides,
   };
   if (process.env.NODE_ENV === 'production' && !config.publicOrigin) throw new Error('PLATFORM_PUBLIC_ORIGIN is required in production');

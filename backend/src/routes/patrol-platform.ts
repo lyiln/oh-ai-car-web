@@ -64,8 +64,8 @@ export type PatrolRouteDeps = {
   audit: (action: string, outcome: string, actorUserId?: string, vehicleId?: string, metadata?: Record<string, unknown>) => Promise<void>;
   hub: {
     publish: (vehicleId: string, payload: unknown) => void;
-    publishPatrol?: (msg: unknown) => void;
-    subscribePatrol?: (socket: { send: (value: string) => void }, vehicleId?: string) => () => void;
+    publishPatrol?: (msg: { vehicleId: string; [key: string]: unknown }) => void;
+    subscribePatrol?: (socket: { send: (value: string) => void }, vehicleId: string) => () => void;
   };
 };
 
@@ -418,6 +418,8 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
       if (manualControl.rowCount) throw httpError('Safely disconnect the local gateway and release the active control lease before starting patrol', 409);
       const active = await client.query("SELECT 1 FROM patrol_tasks WHERE vehicle_id=$1 AND status IN ('queued','running','cancellation_requested')", [deviceId]);
       if (active.rowCount) throw httpError('Device already has an active patrol task', 409);
+      const activeResponse = await client.query("SELECT 1 FROM response_tasks WHERE assigned_vehicle_id=$1 AND status IN ('assigned','navigating','arrived','cancellation_requested')", [deviceId]);
+      if (activeResponse.rowCount) throw httpError('Device already has an active doorstep response task', 409);
       const whitelist = await client.query<{ id: string }>(
         'SELECT id FROM whitelist_imports WHERE vehicle_id=$1 AND is_snapshot=false ORDER BY created_at DESC, id DESC LIMIT 1',
         [deviceId],
@@ -449,7 +451,7 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
     });
     await db.query('UPDATE vehicles SET last_patrol_at=now(), updated_at=now() WHERE id=$1', [deviceId]);
     await audit('patrol.start', 'success', user.id, deviceId, { taskId: id, routeId, shift });
-    hub.publishPatrol?.({ type: 'patrol_status', taskId: id, deviceId, status: 'queued' });
+    hub.publishPatrol?.({ type: 'patrol_status', taskId: id, vehicleId: deviceId, deviceId, status: 'queued' });
     const task = await db.query<PatrolTaskRow>(`${TASK_SELECT} WHERE t.id=$1`, [id]);
     return { task: taskDto(task.rows[0]) };
   });
@@ -483,7 +485,7 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
     if (!stopped.rowCount) throw httpError('Task cannot be stopped', 409);
     await db.query("INSERT INTO patrol_events (id,task_id,event_type,details) VALUES ($1,$2,'status',$3)", [randomUUID(), task.id, JSON.stringify({ status: 'cancellation_requested', source: 'operator' })]);
     await audit('patrol.stop', 'success', user.id, task.vehicle_id, { taskId: task.id });
-    hub.publishPatrol?.({ type: 'patrol_status', taskId: task.id, deviceId: task.vehicle_id, status: 'cancellation_requested' });
+    hub.publishPatrol?.({ type: 'patrol_status', taskId: task.id, vehicleId: task.vehicle_id, deviceId: task.vehicle_id, status: 'cancellation_requested' });
     return { ok: true as const };
   });
 
@@ -589,6 +591,13 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
       const noParkingCount = observationStats.rows.reduce((sum, row) => sum + row.no_parking, 0);
       const eventCount = await db.query<{ c: number }>('SELECT count(*)::int AS c FROM patrol_events WHERE task_id=$1', [id]);
       const violationCount = await db.query<{ c: number }>('SELECT count(*)::int AS c FROM violations WHERE task_id=$1', [id]);
+      const responseStats = await db.query<{ total: number; completed: number; ai_used: number; average_seconds: number | null }>(
+        `SELECT count(*)::int AS total,
+          count(*) FILTER (WHERE status='completed')::int AS completed,
+          count(*) FILTER (WHERE ai_suggestion<>'')::int AS ai_used,
+          avg(extract(epoch FROM (completed_at-created_at))) FILTER (WHERE completed_at IS NOT NULL)::float8 AS average_seconds
+         FROM response_tasks WHERE source_patrol_task_id=$1`, [id],
+      );
       const stats = {
         eventCount: eventCount.rows[0]?.c ?? 0,
         violationCount: violationCount.rows[0]?.c ?? 0,
@@ -599,6 +608,10 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
         suspectedExternal: counts.get('suspected_external')?.count ?? 0,
         pendingReview: counts.get('pending_review')?.count ?? 0,
         noParkingCount,
+        responseCount: responseStats.rows[0]?.total ?? 0,
+        responseCompleted: responseStats.rows[0]?.completed ?? 0,
+        responseAiAdviceCount: responseStats.rows[0]?.ai_used ?? 0,
+        responseAverageSeconds: responseStats.rows[0]?.average_seconds ?? null,
         status: taskRow.status,
       };
 
@@ -666,6 +679,10 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
 <tr><td>已登记私家车</td><td>${stats.registeredPrivate}</td></tr>
 <tr><td>访客车辆</td><td>${stats.visitorCount}</td></tr>
 <tr><td>疑似外来车辆</td><td>${stats.suspectedExternal}</td></tr>
+<tr><td>上门处置任务</td><td>${stats.responseCount}</td></tr>
+<tr><td>已完成上门处置</td><td>${stats.responseCompleted}</td></tr>
+<tr><td>已生成处置建议</td><td>${stats.responseAiAdviceCount}</td></tr>
+<tr><td>平均处置耗时（秒）</td><td>${stats.responseAverageSeconds === null ? '—' : Math.round(stats.responseAverageSeconds as number)}</td></tr>
 <tr><td>待人工审核</td><td>${stats.pendingReview}</td></tr>
 <tr><td>违规停车</td><td>${stats.noParkingCount}</td></tr>
 <tr><td>违规记录</td><td>${stats.violationCount}</td></tr>

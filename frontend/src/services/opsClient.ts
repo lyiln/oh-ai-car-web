@@ -23,12 +23,8 @@ export async function dashboardSummary(): Promise<DashboardSummary> {
 }
 
 export async function violations(): Promise<Violation[]> {
-  try {
-    const result = await apiRequest<{ violations: Violation[] }>('/api/violations');
-    return result.violations ?? [];
-  } catch {
-    return [];
-  }
+  const result = await apiRequest<{ violations: Violation[] }>('/api/violations');
+  return result.violations ?? [];
 }
 
 export async function violation(id: string): Promise<Violation | null> {
@@ -41,12 +37,8 @@ export async function violation(id: string): Promise<Violation | null> {
 }
 
 export async function pendingReviews(): Promise<Review[]> {
-  try {
-    const result = await apiRequest<{ reviews: Review[] }>('/api/reviews/pending');
-    return result.reviews ?? [];
-  } catch {
-    return [];
-  }
+  const result = await apiRequest<{ reviews: Review[] }>('/api/reviews/pending');
+  return result.reviews ?? [];
 }
 
 export async function resolveReview(
