@@ -1,5 +1,5 @@
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
-import { migration001 } from './schema.js';
+import { migration001, migration002, migration003 } from './schema.js';
 
 export class Database {
   readonly pool: Pool;
@@ -14,6 +14,10 @@ export class Database {
   async migrate(): Promise<void> {
     await this.pool.query(migration001);
     await this.pool.query("INSERT INTO schema_migrations (version) VALUES ('001') ON CONFLICT DO NOTHING");
+    await this.pool.query(migration002);
+    await this.pool.query("INSERT INTO schema_migrations (version) VALUES ('002-patrol-inspection') ON CONFLICT DO NOTHING");
+    await this.pool.query(migration003);
+    await this.pool.query("INSERT INTO schema_migrations (version) VALUES ('003-patrol-stop-confirmation') ON CONFLICT DO NOTHING");
   }
   close(): Promise<void> { return this.pool.end(); }
 }
