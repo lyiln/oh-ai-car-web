@@ -7,7 +7,15 @@ describe('TrackMap', () => {
 
   it('adds the converted track and latest-position marker to the map', async () => {
     const add = vi.fn(); const setFitView = vi.fn();
-    class Map { constructor(_node: HTMLElement, _options: object) {} destroy() {} setFitView = setFitView; add = add; }
+    class Map {
+      constructor(_node: HTMLElement, _options: object) {}
+      destroy() {}
+      setFitView = setFitView;
+      setCenter() {}
+      setZoom() {}
+      clearMap() {}
+      add = add;
+    }
     class Polyline { constructor(_options: unknown) {} }
     class Marker { constructor(_options: unknown) {} }
     window.AMap = { Map, Polyline, Marker, convertFrom: (_points, _type, done) => done('complete', { locations: [{ lng: 116.4, lat: 39.9 }] }) };

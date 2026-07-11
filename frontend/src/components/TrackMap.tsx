@@ -1,8 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { TrackPoint } from '../services/platformClient.js';
 
-declare global { interface Window { AMap?: { Map: new (node: HTMLElement, options: object) => { destroy: () => void; setFitView: () => void; add: (overlays: unknown[]) => void }; Marker: new (options: object) => unknown; Polyline: new (options: object) => unknown; convertFrom: (points: number[][], type: string, callback: (status: string, result: { locations: Array<{ lng: number; lat: number }> }) => void) => void; }; _AMapSecurityConfig?: { serviceHost: string }; } }
-
 let amapLoading: Promise<typeof window.AMap> | undefined;
 function loadAmap(key: string): Promise<NonNullable<typeof window.AMap>> {
   if (window.AMap) return Promise.resolve(window.AMap);
@@ -14,7 +12,7 @@ export function TrackMap({ points }: { points: TrackPoint[] }) {
   const node = useRef<HTMLDivElement>(null); const [message, setMessage] = useState('');
   useEffect(() => {
     const key = import.meta.env.VITE_AMAP_KEY; if (!key) { setMessage('未配置 VITE_AMAP_KEY；轨迹点已加载，但地图底图未启用。'); return; }
-    let map: { destroy: () => void; setFitView: () => void; add: (overlays: unknown[]) => void } | undefined; let cancelled = false;
+    let map: { destroy: () => void; setFitView: (overlays?: unknown[]) => void; add: (overlays: unknown[]) => void } | undefined; let cancelled = false;
     void loadAmap(key).then((AMap) => {
       if (!node.current || cancelled) return;
       map = new AMap.Map(node.current, { zoom: 15, viewMode: '2D' });

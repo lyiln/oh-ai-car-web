@@ -7,11 +7,11 @@
   test, or run this repository.
 - v1 local control is implemented and has automated protocol, gateway, and
   frontend tests. Controlled real-car validation is still pending.
-- The vehicle-management platform MVP adds a Fastify/PostgreSQL backend,
-  browser login and saved-vehicle UI, renewable control leases, ROS2 GPS
-  telemetry ingestion, trajectory display, and Docker Compose deployment
-  assets. Code validation is complete; deployment, a real AMap key, ROS2 GPS,
-  and vehicle validation remain pending.
+- The **巡牌通 · PatrolPlate** management platform extends the fleet MVP with a
+  dark AppShell, React Router pages (dashboard, fleet, console, patrol,
+  map, violations, reviews, whitelist, reports, settings), password/OTP login,
+  devices API aliases, patrol/map/ops domain tables (migrations 003–007), and
+  `/patrol/live` WebSocket. See `docs/architecture/patrol-platform-api.md`.
 - The primary open risk is the unresolved button packet conflict documented in
   `PROTOCOL_STATUS.md`. Treat this as an operational safety constraint.
 - `课程状态.md` tracks the course-level evidence needed for the basic
@@ -23,16 +23,17 @@
 Browser UI -> ws://127.0.0.1:8787/control -> local Node gateway -> car TCP :6000
 Browser UI -> direct car video HTTP :6500/index2
 
-Platform browser -> Nginx -> Fastify API -> PostgreSQL/PostGIS
+Platform browser -> Vite/Nginx -> Fastify API -> PostgreSQL/PostGIS
 ROS2 /gps/fix -> Python edge agent -> HTTPS device telemetry API
 Platform browser -> lease -> local gateway -> car TCP :6000
+Platform browser -> /patrol/live WS -> pose_update / patrol_* events
 ```
 
-- `frontend/`: React/Vite operator interface.
+- `frontend/`: React/Vite operator interface (AppShell + classic `/connect`).
 - `gateway/`: localhost WebSocket server and raw TCP client.
 - `shared/`: WebSocket types and car packet encoder.
-- `backend/`: Fastify API, SQL schema/migration, sessions, leases, telemetry,
-  audit, and retention cleanup.
+- `backend/`: Fastify API, SQL migrations, sessions, leases, telemetry,
+  patrol/map/ops routes, audit, and retention cleanup.
 - `edge-agent/`: ROS2 `NavSatFix` to HTTPS telemetry bridge with SQLite outbox.
 - Network defaults: `192.168.1.11`, TCP `6000`, video `6500`.
 - The gateway accepts only the documented localhost production/Vite Origins and

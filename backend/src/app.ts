@@ -7,24 +7,60 @@ import Fastify, { type FastifyRequest } from 'fastify';
 import type { PoolClient } from 'pg';
 import { loadConfig, type Config } from './config.js';
 import { Database } from './db/index.js';
+import { registerPatrolPlatformRoutes } from './routes/patrol-platform.js';
 import { hashSecret, randomSecret, sign, verify, type SignedPayload } from './security.js';
 
 type Role = 'admin' | 'operator';
-interface UserRow { id: string; username: string; display_name: string; password_hash: string; role: Role; active: boolean; }
-interface VehicleRow { id: string; code: string; name: string; description: string; tcp_host: string; tcp_port: number; video_port: number; archived: boolean; }
+interface UserRow { id: string; username: string; display_name: string; password_hash: string; role: Role; active: boolean; email: string | null; }
+interface VehicleRow {
+  id: string;
+  code: string;
+  name: string;
+  description: string;
+  tcp_host: string;
+  tcp_port: number;
+  video_port: number;
+  archived: boolean;
+  bridge_url?: string | null;
+  last_seen_at?: Date | null;
+  last_patrol_at?: Date | null;
+}
 interface SessionPayload extends SignedPayload { sub: string; role: Role; }
 interface LeasePayload extends SignedPayload { sub: string; role: Role; leaseId: string; vehicleId: string; }
+type PatrolSocket = { send: (value: string) => void; vehicleId?: string };
 const SESSION_COOKIE = 'oh_ai_session';
 const LEASE_MS = 60_000;
+const USER_SELECT = 'id, username, display_name, password_hash, role, active, email';
 
 function object(value: unknown): Record<string, unknown> | null { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null; }
 function string(value: unknown, field: string): string { if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} is required`); return value.trim(); }
 function number(value: unknown, field: string, min: number, max: number): number { if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) throw new Error(`${field} is invalid`); return value; }
+function normalizeEmail(value: string): string { return value.trim().toLowerCase(); }
+function isEmail(value: string): boolean { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value); }
+function userDto(user: UserRow) { return { id: user.id, username: user.username, displayName: user.display_name, role: user.role, active: user.active, email: user.email }; }
+function generatePasscode(): string { return String(Math.floor(100_000 + Math.random() * 900_000)); }
 
 export class RealtimeHub {
   private readonly subscribers = new Map<string, Set<{ send: (value: string) => void }>>();
+  private readonly patrolSubscribers = new Set<PatrolSocket>();
   subscribe(vehicleId: string, socket: { send: (value: string) => void }) { const set = this.subscribers.get(vehicleId) ?? new Set(); set.add(socket); this.subscribers.set(vehicleId, set); return () => { set.delete(socket); if (!set.size) this.subscribers.delete(vehicleId); }; }
-  publish(vehicleId: string, payload: unknown) { for (const socket of this.subscribers.get(vehicleId) ?? []) socket.send(JSON.stringify({ type: 'vehicle.position', vehicleId, payload })); }
+  publish(vehicleId: string, payload: unknown) {
+    for (const socket of this.subscribers.get(vehicleId) ?? []) socket.send(JSON.stringify({ type: 'vehicle.position', vehicleId, payload }));
+    const pose = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
+    for (const socket of this.patrolSubscribers) {
+      if (socket.vehicleId && socket.vehicleId !== vehicleId) continue;
+      socket.send(JSON.stringify({ type: 'pose_update', vehicleId, ...pose }));
+    }
+  }
+  subscribePatrol(socket: { send: (value: string) => void }, vehicleId?: string) {
+    const entry: PatrolSocket = { send: socket.send.bind(socket), vehicleId };
+    this.patrolSubscribers.add(entry);
+    return () => { this.patrolSubscribers.delete(entry); };
+  }
+  publishPatrol(msg: unknown) {
+    const text = JSON.stringify(msg);
+    for (const socket of this.patrolSubscribers) socket.send(text);
+  }
 }
 
 export interface AppServices { db?: Database; config?: Partial<Config>; }
@@ -49,8 +85,12 @@ export async function createApp(services: AppServices = {}) {
   function session(request: FastifyRequest): SessionPayload | null { const value = request.cookies[SESSION_COOKIE]; return value ? verify<SessionPayload>(value, config.sessionSecret) : null; }
   async function currentUser(request: FastifyRequest): Promise<UserRow | null> {
     const claim = session(request); if (!claim) return null;
-    const result = await db.query<UserRow>('SELECT id, username, display_name, password_hash, role, active FROM users WHERE id=$1', [claim.sub]);
+    const result = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users WHERE id=$1`, [claim.sub]);
     return result.rows[0]?.active ? result.rows[0] : null;
+  }
+  function issueSession(reply: { setCookie: (name: string, value: string, options: Record<string, unknown>) => void }, user: UserRow) {
+    const token = sign({ sub: user.id, role: user.role, exp: Date.now() + 8 * 60 * 60_000 }, config.sessionSecret);
+    reply.setCookie(SESSION_COOKIE, token, { httpOnly: true, sameSite: 'lax', secure: config.cookieSecure, path: '/', maxAge: 8 * 60 * 60 });
   }
   async function requireUser(request: FastifyRequest): Promise<UserRow> { const user = await currentUser(request); if (!user) throw Object.assign(new Error('Authentication required'), { statusCode: 401 }); return user; }
   async function requireAdmin(request: FastifyRequest): Promise<UserRow> { const user = await requireUser(request); if (user.role !== 'admin') throw Object.assign(new Error('Administrator role required'), { statusCode: 403 }); return user; }
@@ -59,7 +99,21 @@ export async function createApp(services: AppServices = {}) {
     const result = await db.query('SELECT 1 FROM vehicle_members WHERE vehicle_id=$1 AND user_id=$2', [vehicleId, user.id]);
     return result.rowCount === 1;
   }
-  function vehicleDto(row: VehicleRow) { return { id: row.id, code: row.code, name: row.name, description: row.description, host: row.tcp_host, tcpPort: row.tcp_port, videoPort: row.video_port, archived: row.archived }; }
+  function vehicleDto(row: VehicleRow) {
+    return {
+      id: row.id,
+      code: row.code,
+      name: row.name,
+      description: row.description,
+      host: row.tcp_host,
+      tcpPort: row.tcp_port,
+      videoPort: row.video_port,
+      bridgeUrl: row.bridge_url ?? '',
+      lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at).toISOString() : null,
+      lastPatrolAt: row.last_patrol_at ? new Date(row.last_patrol_at).toISOString() : null,
+      archived: row.archived,
+    };
+  }
   function leaseToken(leaseId: string, vehicleId: string, user: UserRow, expiresAt: Date) { return sign({ sub: user.id, role: user.role, leaseId, vehicleId, exp: expiresAt.getTime() }, config.sessionSecret); }
 
   app.setErrorHandler((error, _request, reply) => reply.status((error as { statusCode?: number }).statusCode ?? 400).send({ error: error instanceof Error ? error.message : 'Request failed' }));
@@ -67,30 +121,151 @@ export async function createApp(services: AppServices = {}) {
 
   app.post('/api/auth/login', async (request, reply) => {
     const body = object(request.body); const username = string(body?.username, 'username'); const password = string(body?.password, 'password');
-    const result = await db.query<UserRow>('SELECT id, username, display_name, password_hash, role, active FROM users WHERE username=$1', [username]);
+    const result = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users WHERE username=$1`, [username]);
     const user = result.rows[0];
     if (!user || !user.active || !await argon2.verify(user.password_hash, password)) { await audit('auth.login', 'rejected', undefined, undefined, { username }); return reply.status(401).send({ error: 'Invalid username or password' }); }
-    const token = sign({ sub: user.id, role: user.role, exp: Date.now() + 8 * 60 * 60_000 }, config.sessionSecret);
-    reply.setCookie(SESSION_COOKIE, token, { httpOnly: true, sameSite: 'lax', secure: config.cookieSecure, path: '/', maxAge: 8 * 60 * 60 });
-    await audit('auth.login', 'success', user.id); return { user: { id: user.id, username: user.username, displayName: user.display_name, role: user.role } };
+    issueSession(reply, user);
+    await audit('auth.login', 'success', user.id); return { user: userDto(user) };
+  });
+  app.post('/api/auth/request-otp', async (request, reply) => {
+    const body = object(request.body); const username = string(body?.username, 'username');
+    const generic = { ok: true as const, message: '若账号已登记将收到验证码', time: String(config.otpExpiryMinutes) };
+    const result = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users WHERE username=$1 AND active=true`, [username]);
+    const user = result.rows[0];
+    if (!user || !user.email) {
+      await audit('auth.otp.request', 'unknown_user', undefined, undefined, { username });
+      return generic;
+    }
+    const email = normalizeEmail(user.email);
+    const recent = await db.query<{ created_at: Date }>('SELECT created_at FROM auth_otps WHERE email=$1 ORDER BY created_at DESC LIMIT 1', [email]);
+    if (recent.rows[0] && Date.now() - recent.rows[0].created_at.getTime() < config.otpResendCooldownSeconds * 1000) {
+      await audit('auth.otp.request', 'throttled', undefined, undefined, { username, email });
+      return reply.status(429).send({ error: '请稍后再获取验证码' });
+    }
+    const passcode = generatePasscode();
+    const expiresAt = new Date(Date.now() + config.otpExpiryMinutes * 60_000);
+    await db.query('INSERT INTO auth_otps (id, user_id, email, code_hash, expires_at) VALUES ($1,$2,$3,$4,$5)', [randomUUID(), user.id, email, await argon2.hash(passcode), expiresAt]);
+    await audit('auth.otp.request', 'success', user.id, undefined, { username, email });
+    return { ...generic, passcode, deliveryEmail: email, time: String(config.otpExpiryMinutes) };
+  });
+  app.post('/api/auth/verify-otp', async (request, reply) => {
+    const body = object(request.body); const username = string(body?.username, 'username'); const passcode = string(body?.passcode, 'passcode');
+    if (!/^\d{6}$/.test(passcode)) throw Object.assign(new Error('passcode is invalid'), { statusCode: 400 });
+    const userResult = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users WHERE username=$1 AND active=true`, [username]);
+    const candidate = userResult.rows[0];
+    if (!candidate?.email) {
+      await audit('auth.otp.verify', 'rejected', undefined, undefined, { username });
+      return reply.status(401).send({ error: '验证码无效或已过期' });
+    }
+    const email = normalizeEmail(candidate.email);
+    const otp = await db.query<{ id: string; user_id: string; code_hash: string; expires_at: Date }>('SELECT id, user_id, code_hash, expires_at FROM auth_otps WHERE email=$1 AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1', [email]);
+    const row = otp.rows[0];
+    if (!row || row.expires_at.getTime() < Date.now() || !await argon2.verify(row.code_hash, passcode)) {
+      await audit('auth.otp.verify', 'rejected', undefined, undefined, { username, email });
+      return reply.status(401).send({ error: '验证码无效或已过期' });
+    }
+    await db.query('UPDATE auth_otps SET consumed_at=now() WHERE id=$1', [row.id]);
+    const result = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users WHERE id=$1 AND active=true`, [row.user_id]);
+    const user = result.rows[0];
+    if (!user) { await audit('auth.otp.verify', 'rejected', undefined, undefined, { username, email }); return reply.status(401).send({ error: '验证码无效或已过期' }); }
+    issueSession(reply, user);
+    await audit('auth.otp.verify', 'success', user.id, undefined, { username, email });
+    return { user: userDto(user) };
   });
   app.post('/api/auth/logout', async (request, reply) => { const user = await currentUser(request); reply.clearCookie(SESSION_COOKIE, { path: '/' }); if (user) await audit('auth.logout', 'success', user.id); return { ok: true }; });
-  app.get('/api/auth/me', async (request) => { const user = await requireUser(request); return { user: { id: user.id, username: user.username, displayName: user.display_name, role: user.role } }; });
+  app.get('/api/auth/me', async (request) => { const user = await requireUser(request); return { user: userDto(user) }; });
+  app.patch('/api/auth/profile', async (request) => {
+    const user = await requireUser(request);
+    if (user.role !== 'admin') throw Object.assign(new Error('Administrator role required'), { statusCode: 403 });
+    const body = object(request.body);
+    const displayNameProvided = Object.prototype.hasOwnProperty.call(body ?? {}, 'displayName');
+    const emailProvided = Object.prototype.hasOwnProperty.call(body ?? {}, 'email');
+    const passwordProvided = Object.prototype.hasOwnProperty.call(body ?? {}, 'password');
+    if (!displayNameProvided && !emailProvided && !passwordProvided) throw Object.assign(new Error('displayName, email, or password is required'), { statusCode: 400 });
 
-  app.get('/api/users', async (request) => { await requireAdmin(request); const result = await db.query<UserRow>('SELECT id, username, display_name, password_hash, role, active FROM users ORDER BY username'); return { users: result.rows.map(({ password_hash: _hash, display_name, ...user }) => ({ ...user, displayName: display_name })) }; });
+    let displayName: string | undefined;
+    if (displayNameProvided) displayName = string(body?.displayName, 'displayName');
+
+    let email: string | null | undefined;
+    if (emailProvided) {
+      if (body?.email === null || body?.email === '') email = null;
+      else {
+        email = normalizeEmail(string(body?.email, 'email'));
+        if (!isEmail(email)) throw Object.assign(new Error('email is invalid'), { statusCode: 400 });
+        const clash = await db.query<{ id: string }>('SELECT id FROM users WHERE email=$1 AND id<>$2', [email, user.id]);
+        if (clash.rows[0]) throw Object.assign(new Error('email is already in use'), { statusCode: 409 });
+      }
+    }
+
+    let passwordHash: string | undefined;
+    if (passwordProvided) {
+      const password = string(body?.password, 'password');
+      const currentPassword = string(body?.currentPassword, 'currentPassword');
+      if (!await argon2.verify(user.password_hash, currentPassword)) {
+        await audit('auth.profile', 'rejected', user.id, undefined, { reason: 'bad_current_password' });
+        throw Object.assign(new Error('当前密码不正确'), { statusCode: 401 });
+      }
+      passwordHash = await argon2.hash(password);
+    }
+
+    const next = await db.query<UserRow>(
+      `UPDATE users SET
+        display_name = COALESCE($1, display_name),
+        email = CASE WHEN $2::boolean THEN $3 ELSE email END,
+        password_hash = COALESCE($4, password_hash),
+        updated_at = now()
+      WHERE id=$5
+      RETURNING ${USER_SELECT}`,
+      [
+        displayName ?? null,
+        emailProvided,
+        emailProvided ? email ?? null : null,
+        passwordHash ?? null,
+        user.id,
+      ],
+    );
+    const updated = next.rows[0];
+    await audit('auth.profile', 'success', user.id, undefined, {
+      displayName: displayNameProvided,
+      email: emailProvided,
+      password: passwordProvided,
+    });
+    return { user: userDto(updated) };
+  });
+
+  app.get('/api/users', async (request) => { await requireAdmin(request); const result = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users ORDER BY username`); return { users: result.rows.map(userDto) }; });
   app.post('/api/users', async (request) => {
     const admin = await requireAdmin(request); const body = object(request.body); const username = string(body?.username, 'username'); const displayName = string(body?.displayName, 'displayName'); const password = string(body?.password, 'password'); const role = body?.role === 'admin' ? 'admin' : body?.role === 'operator' ? 'operator' : (() => { throw new Error('role is invalid'); })();
-    const id = randomUUID(); await db.query('INSERT INTO users (id,username,display_name,password_hash,role) VALUES ($1,$2,$3,$4,$5)', [id, username, displayName, await argon2.hash(password), role]); await audit('user.create', 'success', admin.id, undefined, { createdUserId: id }); return { user: { id, username, displayName, role, active: true } };
+    const emailRaw = typeof body?.email === 'string' && body.email.trim() ? normalizeEmail(body.email) : null;
+    if (emailRaw && !isEmail(emailRaw)) throw Object.assign(new Error('email is invalid'), { statusCode: 400 });
+    const id = randomUUID();
+    await db.query('INSERT INTO users (id,username,display_name,password_hash,role,email) VALUES ($1,$2,$3,$4,$5,$6)', [id, username, displayName, await argon2.hash(password), role, emailRaw]);
+    await audit('user.create', 'success', admin.id, undefined, { createdUserId: id });
+    return { user: { id, username, displayName, role, active: true, email: emailRaw } };
   });
-  app.patch('/api/users/:id', async (request) => { const admin = await requireAdmin(request); const body = object(request.body); const active = body?.active; if (typeof active !== 'boolean') throw new Error('active is required'); await db.query('UPDATE users SET active=$1,updated_at=now() WHERE id=$2', [active, (request.params as { id: string }).id]); await audit('user.update', 'success', admin.id, undefined, { targetUserId: (request.params as { id: string }).id, active }); return { ok: true }; });
+  app.patch('/api/users/:id', async (request) => {
+    const admin = await requireAdmin(request); const body = object(request.body); const id = (request.params as { id: string }).id;
+    const active = body?.active; const emailProvided = Object.prototype.hasOwnProperty.call(body ?? {}, 'email');
+    if (typeof active !== 'boolean' && !emailProvided) throw new Error('active or email is required');
+    let email: string | null | undefined;
+    if (emailProvided) {
+      if (body?.email === null || body?.email === '') email = null;
+      else { email = normalizeEmail(string(body?.email, 'email')); if (!isEmail(email)) throw Object.assign(new Error('email is invalid'), { statusCode: 400 }); }
+    }
+    if (typeof active === 'boolean' && email !== undefined) await db.query('UPDATE users SET active=$1,email=$2,updated_at=now() WHERE id=$3', [active, email, id]);
+    else if (typeof active === 'boolean') await db.query('UPDATE users SET active=$1,updated_at=now() WHERE id=$2', [active, id]);
+    else await db.query('UPDATE users SET email=$1,updated_at=now() WHERE id=$2', [email, id]);
+    await audit('user.update', 'success', admin.id, undefined, { targetUserId: id, active, email });
+    return { ok: true };
+  });
 
   app.get('/api/vehicles', async (request) => {
     const user = await requireUser(request); const result = user.role === 'admin' ? await db.query<VehicleRow>('SELECT * FROM vehicles WHERE archived=false ORDER BY name') : await db.query<VehicleRow>('SELECT v.* FROM vehicles v JOIN vehicle_members m ON m.vehicle_id=v.id WHERE m.user_id=$1 AND v.archived=false ORDER BY v.name', [user.id]);
     return { vehicles: result.rows.map(vehicleDto) };
   });
   app.post('/api/vehicles', async (request) => {
-    const admin = await requireAdmin(request); const body = object(request.body); const id = randomUUID(); const code = string(body?.code, 'code'); const name = string(body?.name, 'name'); const host = string(body?.host, 'host'); const tcpPort = number(body?.tcpPort, 'tcpPort', 1, 65535); const videoPort = number(body?.videoPort, 'videoPort', 1, 65535); const description = typeof body?.description === 'string' ? body.description : '';
-    await db.query('INSERT INTO vehicles (id,code,name,description,tcp_host,tcp_port,video_port) VALUES ($1,$2,$3,$4,$5,$6,$7)', [id, code, name, description, host, tcpPort, videoPort]); await audit('vehicle.create', 'success', admin.id, id); return { vehicle: { id, code, name, description, host, tcpPort, videoPort, archived: false } };
+    const admin = await requireAdmin(request); const body = object(request.body); const id = randomUUID(); const code = string(body?.code, 'code'); const name = string(body?.name, 'name'); const host = string(body?.host, 'host'); const tcpPort = number(body?.tcpPort, 'tcpPort', 1, 65535); const videoPort = number(body?.videoPort, 'videoPort', 1, 65535); const description = typeof body?.description === 'string' ? body.description : ''; const bridgeUrl = typeof body?.bridgeUrl === 'string' ? body.bridgeUrl : '';
+    await db.query('INSERT INTO vehicles (id,code,name,description,tcp_host,tcp_port,video_port,bridge_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [id, code, name, description, host, tcpPort, videoPort, bridgeUrl]); await audit('vehicle.create', 'success', admin.id, id); return { vehicle: { id, code, name, description, host, tcpPort, videoPort, bridgeUrl, lastSeenAt: null, lastPatrolAt: null, archived: false } };
   });
   app.get('/api/vehicles/:id', async (request) => { const user = await requireUser(request); const id = (request.params as { id: string }).id; if (!await canAccessVehicle(user, id)) throw Object.assign(new Error('Vehicle access denied'), { statusCode: 403 }); const result = await db.query<VehicleRow>('SELECT * FROM vehicles WHERE id=$1', [id]); if (!result.rows[0]) throw Object.assign(new Error('Vehicle not found'), { statusCode: 404 }); return { vehicle: vehicleDto(result.rows[0]) }; });
   app.patch('/api/vehicles/:id', async (request) => { const admin = await requireAdmin(request); const id = (request.params as { id: string }).id; const body = object(request.body); const description = typeof body?.description === 'string' ? body.description : ''; await db.query('UPDATE vehicles SET name=COALESCE($1,name),description=$2,updated_at=now() WHERE id=$3', [typeof body?.name === 'string' ? body.name.trim() : null, description, id]); await audit('vehicle.update', 'success', admin.id, id); return { ok: true }; });
@@ -117,12 +292,25 @@ export async function createApp(services: AppServices = {}) {
     const credential = await db.query<{ vehicle_id: string; secret_hash: string }>('SELECT vehicle_id,secret_hash FROM device_credentials WHERE id=$1 AND active=true', [credentialId]); if (!credential.rows[0] || credential.rows[0].secret_hash !== hashSecret(secret)) return reply.status(401).send({ error: 'Invalid device credential' });
     const body = object(request.body); if (!Array.isArray(body?.points) || !body.points.length) throw new Error('points must be a non-empty array'); const vehicleId = credential.rows[0].vehicle_id; let accepted = 0;
     for (const raw of body.points) { const point = object(raw); const occurredAt = string(point?.occurredAt, 'occurredAt'); const longitude = number(point?.longitude, 'longitude', -180, 180); const latitude = number(point?.latitude, 'latitude', -90, 90); const optional = (key: string, min = -Infinity, max = Infinity) => point?.[key] === undefined || point?.[key] === null ? null : number(point?.[key], key, min, max); const row = await db.query('INSERT INTO telemetry_points (id,vehicle_id,occurred_at,longitude,latitude,altitude_m,accuracy_m,speed_kph,heading_deg,battery_pct,mode) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (vehicle_id,occurred_at) DO NOTHING RETURNING id', [randomUUID(), vehicleId, occurredAt, longitude, latitude, optional('altitudeM'), optional('accuracyM', 0), optional('speedKph', 0), optional('headingDeg', 0, 360), optional('batteryPct', 0, 100), typeof point?.mode === 'string' ? point.mode : null]); if (row.rowCount) { accepted++; hub.publish(vehicleId, { occurredAt, longitude, latitude, altitudeM: optional('altitudeM'), accuracyM: optional('accuracyM', 0), speedKph: optional('speedKph', 0), headingDeg: optional('headingDeg', 0, 360), batteryPct: optional('batteryPct', 0, 100), mode: typeof point?.mode === 'string' ? point.mode : null }); } }
+    await db.query('UPDATE vehicles SET last_seen_at=now() WHERE id=$1', [vehicleId]);
     return { accepted };
   });
   app.get('/api/vehicles/:id/track', async (request) => { const user = await requireUser(request); const vehicleId = (request.params as { id: string }).id; if (!await canAccessVehicle(user, vehicleId)) throw Object.assign(new Error('Vehicle access denied'), { statusCode: 403 }); const query = request.query as { from?: string; to?: string }; const result = await db.query('SELECT occurred_at AS "occurredAt",longitude,latitude,altitude_m AS "altitudeM",accuracy_m AS "accuracyM",speed_kph AS "speedKph",heading_deg AS "headingDeg",battery_pct AS "batteryPct",mode FROM telemetry_points WHERE vehicle_id=$1 AND occurred_at >= COALESCE($2::timestamptz,now()-interval \'24 hours\') AND occurred_at <= COALESCE($3::timestamptz,now()) ORDER BY occurred_at', [vehicleId, query.from ?? null, query.to ?? null]); return { points: result.rows }; });
   app.get('/api/audit-logs', async (request) => { await requireAdmin(request); const result = await db.query('SELECT id,actor_user_id AS "actorUserId",vehicle_id AS "vehicleId",action,outcome,metadata,created_at AS "createdAt" FROM audit_logs ORDER BY created_at DESC LIMIT 200'); return { logs: result.rows }; });
 
   app.get('/ws', { websocket: true }, async (socket, request) => { const user = await currentUser(request); if (!user) return socket.close(1008, 'Authentication required'); let unsubscribe: (() => void) | undefined; socket.on('message', async (raw: Buffer) => { try { const message = JSON.parse(raw.toString()) as { type?: string; vehicleId?: string }; if (message.type !== 'subscribe' || !message.vehicleId || !await canAccessVehicle(user, message.vehicleId)) return socket.send(JSON.stringify({ type: 'error', message: 'Vehicle access denied' })); unsubscribe?.(); unsubscribe = hub.subscribe(message.vehicleId, socket); socket.send(JSON.stringify({ type: 'subscribed', vehicleId: message.vehicleId })); } catch { socket.send(JSON.stringify({ type: 'error', message: 'Invalid message' })); } }); socket.on('close', () => unsubscribe?.()); });
+
+  registerPatrolPlatformRoutes(app, {
+    db,
+    requireUser,
+    requireAdmin,
+    canAccessVehicle: (user, vehicleId) => canAccessVehicle(user as UserRow, vehicleId),
+    vehicleDto: (row) => vehicleDto(row),
+    acquireLease: (client, user, vehicleId) => acquireLease(client, user as UserRow, vehicleId),
+    leaseToken: (leaseId, vehicleId, user, expiresAt) => leaseToken(leaseId, vehicleId, user as UserRow, expiresAt),
+    audit,
+    hub,
+  });
 
   app.addHook('onClose', async () => { if (!services.db) await db.close(); });
   return app;
