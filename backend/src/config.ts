@@ -8,6 +8,9 @@ export interface Config {
   allowedOrigins: string[];
   bootstrapAdminUsername: string | undefined;
   bootstrapAdminPassword: string | undefined;
+  bootstrapAdminEmail: string | undefined;
+  otpExpiryMinutes: number;
+  otpResendCooldownSeconds: number;
 }
 
 export function loadConfig(overrides: Partial<Config> = {}): Config {
@@ -28,6 +31,9 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     allowedOrigins,
     bootstrapAdminUsername: process.env.BOOTSTRAP_ADMIN_USERNAME,
     bootstrapAdminPassword: process.env.BOOTSTRAP_ADMIN_PASSWORD,
+    bootstrapAdminEmail: process.env.BOOTSTRAP_ADMIN_EMAIL,
+    otpExpiryMinutes: Number(process.env.OTP_EXPIRY_MINUTES ?? 5),
+    otpResendCooldownSeconds: Number(process.env.OTP_RESEND_COOLDOWN_SECONDS ?? 60),
     ...overrides,
   };
   if (process.env.NODE_ENV === 'production' && !config.publicOrigin) throw new Error('PLATFORM_PUBLIC_ORIGIN is required in production');

@@ -16,7 +16,7 @@ vi.mock('../src/services/controlClient.js', () => ({
   },
 }));
 
-import App from '../src/app/App.js';
+import { ClassicConsole } from '../src/app/ClassicConsole.js';
 
 describe('command confirmation state', () => {
   beforeEach(() => { send.mockReset(); listeners.clear(); });
@@ -25,7 +25,7 @@ describe('command confirmation state', () => {
   it('marks recording active only after the gateway confirms the write', async () => {
     let resolve: (() => void) | undefined;
     send.mockReturnValueOnce(new Promise<void>((done) => { resolve = done; }));
-    render(<App />);
+    render(<ClassicConsole />);
     const button = await screen.findByTitle('开始录像');
     fireEvent.click(button);
     expect(send).toHaveBeenCalledWith('startRecording', {});
@@ -36,7 +36,7 @@ describe('command confirmation state', () => {
 
   it('keeps tracking disabled in the UI when the gateway rejects the command', async () => {
     send.mockRejectedValueOnce(new Error('TCP socket is not connected'));
-    render(<App />);
+    render(<ClassicConsole />);
     const toggle = await screen.findByRole('checkbox');
     fireEvent.click(toggle);
     await waitFor(() => expect(toggle).not.toBeChecked());
@@ -44,7 +44,7 @@ describe('command confirmation state', () => {
   });
 
   it('disables all car controls when another browser owns the connection', async () => {
-    render(<App />);
+    render(<ClassicConsole />);
     for (const listener of listeners) listener({ type: 'state', connected: true, target: { host: '127.0.0.1', tcpPort: 6000, videoPort: 6500 }, ownsControl: false, controlAvailable: false, lastError: null });
     expect(await screen.findByText('其他页面正在控制')).toBeInTheDocument();
     expect(screen.getByTitle('前进')).toBeDisabled();
@@ -52,7 +52,7 @@ describe('command confirmation state', () => {
   });
 
   it('clears media and tracking state after a disconnected state event', async () => {
-    render(<App />);
+    render(<ClassicConsole />);
     fireEvent.click(await screen.findByTitle('开始录像'));
     await waitFor(() => expect(screen.getByTitle('停止录像')).toBeInTheDocument());
     const toggle = screen.getByRole('checkbox');

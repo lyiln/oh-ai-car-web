@@ -1,0 +1,135 @@
+# 巡牌通 · PatrolPlate 平台 API 契约
+
+品牌：**巡牌通 · PatrolPlate**。登录页见现有 `/api/auth/*`。本文描述管理端业务 API（migration 003–007）。
+
+## 认证
+
+所有 `/api/*`（除 `/device/v1/*`、`/internal/*`）需已登录会话 Cookie `oh_ai_session`，且请求 Origin 受信任。
+
+## 设备 `/api/devices`
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/devices` | 设备列表（映射 `vehicles`） |
+| POST | `/api/devices` | 管理员创建 |
+| PUT | `/api/devices/:id` | 管理员更新 |
+| DELETE | `/api/devices/:id` | 软删除（archived） |
+| POST | `/api/devices/:id/connect` | 申请 control lease |
+| GET | `/api/devices/:id/status` | 在线/租约状态 |
+| GET | `/api/devices/:id/pose` | 最新 GPS 点 |
+
+兼容：原有 `/api/vehicles*` 仍可用。
+
+## 工作台
+
+| 方法 | 路径 |
+|------|------|
+| GET | `/api/dashboard/summary` |
+
+返回：`onlineDevices`、`todayPatrols`、`pendingReviews`、`violations`、`recentTasks`、`todayAlerts`。
+
+## 巡检 `/api/patrol`
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/patrol/start` | 启动任务；白名单为空时 409 |
+| POST | `/api/patrol/stop` | 停止任务 |
+| GET | `/api/patrol/status` | 当前状态 |
+| GET | `/api/patrol/tasks` | 任务列表 |
+| GET | `/api/patrol/tasks/:id` | 任务详情 |
+| GET | `/api/patrol/tasks/:id/events` | 生命周期事件与去重后的车牌观测 |
+| GET | `/api/patrol/tasks/:id/report` | 任务结束后生成 FR-007 报告（HTML + CSV，含任务元数据、证据表和物业跟进清单） |
+| GET | `/api/patrol/routes` | 路线；空时种子 `route_morning_a` |
+
+## 地图 `/api/map`
+
+| 方法 | 路径 |
+|------|------|
+| GET | `/api/map` |
+| GET | `/api/map/waypoints` |
+| GET/POST | `/api/map/zones` |
+| PUT/DELETE | `/api/map/zones/:id` |
+
+禁停区使用 PostGIS `geometry(Polygon,4326)`，API 返回坐标环。
+
+设备侧使用 `/device/v1/patrol/tasks/:id/events` 发送 `observation`。观测必须属于
+任务快照路线中的航点；低于 0.75 的置信度进入待复核，其余车牌使用任务快照的白名单分类；
+同一任务、航点、车牌和 30 分钟窗口会合并计数，禁停 ROI 相交独立记录。
+
+**白名单快照隔离（FR-002）**：单条新增、批量导入和任务启动以同一车辆行锁串行执行。批量导入的有效行在一个事务中提交；任务启动在持锁事务内将当前活跃白名单复制为不可变快照（`whitelist_imports.is_snapshot=true`）。因此任务只会看到完整的导入前或导入后版本，后续导入只影响下一次巡检，不影响正在运行任务的分类。
+
+**待复核流程（FR-005）**：置信度 < 0.75 的首次观测（去重后计数为 1）除写入 `plate_observations` 外，还以事务方式同步写入 `patrol_events`（event_type='observation'）和 `reviews`（reason='low_confidence'，status='pending'），确保 `GET /api/reviews/pending` 立即可见。
+
+## 违规与审核
+
+| 方法 | 路径 |
+|------|------|
+| GET | `/api/violations` |
+| GET | `/api/violations/:event_id` |
+| GET | `/api/reviews/pending` |
+| POST | `/api/reviews/:event_id/resolve` |
+
+管理员可访问所有车辆；操作员只能读取或处理 `vehicle_members` 授权车辆的违规、审核、报告和工作台统计。无权的单条违规或报告返回 404。
+
+## 白名单 / 报告 / 设置
+
+| 方法 | 路径 |
+|------|------|
+| GET | `/api/whitelist?deviceId=:id` |
+| POST | `/api/whitelist`（请求体必须含 `deviceId`） |
+| POST | `/api/whitelist/import`（请求体必须含 `deviceId`） |
+| GET | `/api/reports` · `/api/reports/:id` |
+| GET/PUT | `/api/settings` |
+
+## WebSocket
+
+| 路径 | 事件 |
+|------|------|
+| `/ws` | 兼容：`vehicle.position` |
+| `/patrol/live` | `pose_update`、`device_status`、`patrol_status`、`patrol_event`、`violation_alert` |
+
+客户端发送 `{ "type": "subscribe", "vehicleId": "<uuid>" }`。
+
+## 前端路由
+
+| 路由 | 页面 |
+|------|------|
+| `/login` | 登录 |
+| `/dashboard` | 工作台 |
+| `/fleet` | 设备管理 |
+| `/console` | 控制台（需已选设备） |
+| `/patrol/tasks` | 巡检任务 |
+| `/patrol/records` | 巡逻记录 |
+| `/patrol/records/:id` | 记录详情 |
+| `/map` | 全局地图 |
+| `/violations` | 违规车辆 |
+| `/reviews` | 待审核 |
+| `/whitelist` | 白名单 |
+| `/reports` | 报告中心 |
+| `/settings` | 系统设置 |
+| `/connect` · `/remote` | 遗留本机控制台 |
+
+当前设备 ID 存于 `localStorage` 键 `patrol:selectedDeviceId`。
+
+白名单类型仅支持 `private` 和 `visitor`。创建、导入和查询均显式绑定当前设备（`deviceId`）且过滤快照行；巡检启动会验证目标车辆活跃白名单（非快照）至少包含一条记录，并原子性创建不可变快照供任务引用。
+
+## 授权说明
+
+`reviews`、`violations`、`reports`、`dashboard` 等端点使用 `$N::uuid IS NULL OR EXISTS (... AND vm.user_id=$N)` 模式：管理员传 `NULL`（全量访问），操作员传自身 user_id（仅限授权车辆）。
+
+## 数据库迁移
+
+| 版本 | 内容 |
+|------|------|
+| 001 | users / vehicles / telemetry / leases / audit / schema_migrations |
+| 002-patrol-inspection | patrol_routes / waypoints / whitelist_imports / whitelist_entries / patrol_tasks / patrol_events / plate_observations |
+| 003-patrol-stop-confirmation | cancellation_requested 状态 / stop_requested_at / stop_confirmed_at |
+| 004-platform-operations | users.email / auth_otps / vehicles.bridge_url / map_metadata / map_zones / violations / reviews / patrol_reports / platform_settings；patrol_events 新增 plate / waypoint / confidence / evidence_url / review_status / occurred_at 列 |
+| 005-patrol-snapshot-reviews | whitelist_imports.is_snapshot（白名单快照隔离）；patrol_events.event_type 约束扩展为包含 'observation' |
+| 006-whitelist-live-version-locking | 历史重复活跃白名单转为快照；每车唯一活跃白名单索引；导入与快照的车辆锁语义 |
+
+## 演示注意
+
+1. 重启 backend 以应用 migration 003–006。
+2. 先在白名单页添加至少一条车牌，否则「开始巡检」返回 409。
+3. 控制台遥控仍经本机 gateway（`:8787`）+ lease，不暴露 raw TCP。

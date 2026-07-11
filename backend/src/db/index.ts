@@ -1,5 +1,5 @@
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
-import { migration001, migration002, migration003 } from './schema.js';
+import { migration001, migration002, migration003, migration004, migration005, migration006 } from './schema.js';
 
 export class Database {
   readonly pool: Pool;
@@ -12,12 +12,20 @@ export class Database {
     finally { client.release(); }
   }
   async migrate(): Promise<void> {
-    await this.pool.query(migration001);
-    await this.pool.query("INSERT INTO schema_migrations (version) VALUES ('001') ON CONFLICT DO NOTHING");
-    await this.pool.query(migration002);
-    await this.pool.query("INSERT INTO schema_migrations (version) VALUES ('002-patrol-inspection') ON CONFLICT DO NOTHING");
-    await this.pool.query(migration003);
-    await this.pool.query("INSERT INTO schema_migrations (version) VALUES ('003-patrol-stop-confirmation') ON CONFLICT DO NOTHING");
+    await this.pool.query('CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())');
+    for (const migration of [
+      { version: '001', sql: migration001 },
+      { version: '002-patrol-inspection', sql: migration002 },
+      { version: '003-patrol-stop-confirmation', sql: migration003 },
+      { version: '004-platform-operations', sql: migration004 },
+            { version: '005-patrol-snapshot-reviews', sql: migration005 },
+      { version: '006-whitelist-live-version-locking', sql: migration006 },
+    ]) {
+      const applied = await this.pool.query<{ version: string }>('SELECT version FROM schema_migrations WHERE version=$1', [migration.version]);
+      if (applied.rowCount) continue;
+      await this.pool.query(migration.sql);
+      await this.pool.query('INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING', [migration.version]);
+    }
   }
   close(): Promise<void> { return this.pool.end(); }
 }

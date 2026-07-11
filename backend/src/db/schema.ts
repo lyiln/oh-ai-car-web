@@ -89,8 +89,8 @@ CREATE INDEX IF NOT EXISTS patrol_routes_vehicle_created_idx ON patrol_routes(ve
 CREATE TABLE IF NOT EXISTS patrol_waypoints (
   id uuid PRIMARY KEY,
   route_id uuid NOT NULL REFERENCES patrol_routes(id) ON DELETE CASCADE,
-  ordinal integer NOT NULL CHECK (ordinal >= 0),
   name text NOT NULL,
+  ordinal integer NOT NULL CHECK (ordinal >= 0),
   x double precision NOT NULL,
   y double precision NOT NULL,
   yaw double precision NOT NULL,
@@ -166,4 +166,105 @@ ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS stop_confirmed_at timestamptz;
 ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS zero_velocity_confirmed_at timestamptz;
 DROP INDEX IF EXISTS patrol_tasks_vehicle_active_idx;
 CREATE UNIQUE INDEX IF NOT EXISTS patrol_tasks_vehicle_active_idx ON patrol_tasks(vehicle_id) WHERE status IN ('queued', 'running', 'cancellation_requested');
+`;
+
+export const migration004 = `
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email text;
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique_idx ON users (email) WHERE email IS NOT NULL;
+CREATE TABLE IF NOT EXISTS auth_otps (
+  id uuid PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  email text NOT NULL,
+  code_hash text NOT NULL,
+  expires_at timestamptz NOT NULL,
+  consumed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS auth_otps_email_created_idx ON auth_otps(email, created_at DESC);
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS bridge_url text NOT NULL DEFAULT '';
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS last_seen_at timestamptz;
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS last_patrol_at timestamptz;
+ALTER TABLE patrol_events ADD COLUMN IF NOT EXISTS plate text;
+ALTER TABLE patrol_events ADD COLUMN IF NOT EXISTS waypoint text;
+ALTER TABLE patrol_events ADD COLUMN IF NOT EXISTS confidence double precision;
+ALTER TABLE patrol_events ADD COLUMN IF NOT EXISTS evidence_url text;
+ALTER TABLE patrol_events ADD COLUMN IF NOT EXISTS review_status text NOT NULL DEFAULT 'pending';
+ALTER TABLE patrol_events ADD COLUMN IF NOT EXISTS occurred_at timestamptz NOT NULL DEFAULT now();
+CREATE TABLE IF NOT EXISTS map_metadata (
+  id uuid PRIMARY KEY,
+  name text NOT NULL DEFAULT 'default',
+  basemap_url text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS map_zones (
+  id uuid PRIMARY KEY,
+  name text NOT NULL,
+  active boolean NOT NULL DEFAULT true,
+  geom geometry(Polygon, 4326) NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS map_zones_geom_idx ON map_zones USING GIST (geom);
+CREATE TABLE IF NOT EXISTS violations (
+  id uuid PRIMARY KEY,
+  event_id uuid REFERENCES patrol_events(id) ON DELETE SET NULL,
+  plate text,
+  violation_type text NOT NULL DEFAULT 'no_parking' CHECK (violation_type IN ('no_parking','suspected_external')),
+  zone_id uuid REFERENCES map_zones(id) ON DELETE SET NULL,
+  task_id uuid REFERENCES patrol_tasks(id) ON DELETE SET NULL,
+  vehicle_id uuid REFERENCES vehicles(id) ON DELETE SET NULL,
+  waypoint text,
+  priority text NOT NULL DEFAULT 'normal' CHECK (priority IN ('high','normal','low')),
+  disposition text NOT NULL DEFAULT 'pending' CHECK (disposition IN ('pending','processed','dismissed')),
+  evidence_url text,
+  occurred_at timestamptz NOT NULL DEFAULT now(),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS violations_occurred_idx ON violations(occurred_at DESC);
+CREATE TABLE IF NOT EXISTS reviews (
+  id uuid PRIMARY KEY,
+  event_id uuid NOT NULL REFERENCES patrol_events(id) ON DELETE CASCADE,
+  reason text NOT NULL DEFAULT 'low_confidence',
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','resolved')),
+  resolver_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  resolution text,
+  resolved_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS reviews_pending_idx ON reviews(created_at DESC) WHERE status='pending';
+CREATE TABLE IF NOT EXISTS patrol_reports (
+  id uuid PRIMARY KEY,
+  task_id uuid NOT NULL REFERENCES patrol_tasks(id) ON DELETE CASCADE,
+  html_content text NOT NULL DEFAULT '',
+  csv_content text NOT NULL DEFAULT '',
+  stats jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS platform_settings (
+  key text PRIMARY KEY,
+  value jsonb NOT NULL DEFAULT '{}'::jsonb,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+`;
+
+export const migration005 = `
+ALTER TABLE whitelist_imports ADD COLUMN IF NOT EXISTS is_snapshot boolean NOT NULL DEFAULT false;
+ALTER TABLE patrol_events DROP CONSTRAINT IF EXISTS patrol_events_event_type_check;
+ALTER TABLE patrol_events ADD CONSTRAINT patrol_events_event_type_check
+  CHECK (event_type IN ('status', 'waypoint', 'observation'));
+`;
+
+export const migration006 = `
+WITH ranked_live_whitelists AS (
+  SELECT id, row_number() OVER (PARTITION BY vehicle_id ORDER BY created_at DESC, id DESC) AS rank
+  FROM whitelist_imports
+  WHERE is_snapshot=false
+)
+UPDATE whitelist_imports
+SET is_snapshot=true
+WHERE id IN (SELECT id FROM ranked_live_whitelists WHERE rank > 1);
+
+CREATE UNIQUE INDEX IF NOT EXISTS whitelist_imports_one_live_per_vehicle_idx
+  ON whitelist_imports(vehicle_id)
+  WHERE is_snapshot=false;
 `;

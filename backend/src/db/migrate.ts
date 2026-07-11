@@ -1,3 +1,4 @@
+import '../load-env.js';
 import { loadConfig } from '../config.js';
 import { Database } from './index.js';
 
