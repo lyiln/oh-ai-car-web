@@ -8,7 +8,7 @@
    `https://cars.example.edu`). It is required in production and is used to
    restrict CORS and Cookie-authenticated write requests. Use
    `PLATFORM_ALLOWED_ORIGINS` only for additional trusted development origins.
-2. Start the platform with `docker compose up --build`. The first start runs the
+2. Start the local smoke-test platform with `docker compose up --build`. The first start runs the
    SQL migration and creates the configured bootstrap administrator exactly once.
 3. Open `http://<server>:8080` and sign in. Create vehicle records, assign
    operators, and rotate device credentials through the administrator API
@@ -21,8 +21,18 @@
    `PLATFORM_API_URL=http://<server>:8080 npm run dev:gateway`. The gateway then
    rejects control connections without a live platform lease.
 
-Do not expose the local gateway beyond the operator machine. Use HTTPS and set
-`COOKIE_SECURE=true` before any non-local deployment. Run
+The supplied Compose file explicitly runs the backend in development mode so
+browser-based local HTTP smoke tests can use a non-secure Cookie. It is not a
+production deployment definition. Production must terminate HTTPS and run with
+`NODE_ENV=production`, a non-default `SESSION_SECRET` of at least 32 characters,
+`COOKIE_SECURE=true`, and `PLATFORM_PUBLIC_ORIGIN` set; the backend refuses to
+start if any of these gates is absent. Do not expose the local gateway beyond
+the operator machine. Run
 `npm run test:integration --workspace=@oh-ai-car-web/backend` in a Docker-ready
 environment before deployment; it starts a temporary PostGIS database and does
 not use the deployment data volume.
+
+Use `npm run test:deploy-live` to build the Compose stack, authenticate, verify
+an authorised `/patrol/live` subscription through Nginx, and verify that an
+unauthenticated connection closes with policy code 1008. It creates an isolated
+Compose project and removes its containers and volumes when finished.

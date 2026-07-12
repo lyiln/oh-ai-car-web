@@ -62,6 +62,7 @@ export type PatrolRouteDeps = {
   acquireLease: (client: PoolClient, user: RouteUser, vehicleId: string) => Promise<{ id: string; expiresAt: Date }>;
   leaseToken: (leaseId: string, vehicleId: string, user: RouteUser, expiresAt: Date) => string;
   audit: (action: string, outcome: string, actorUserId?: string, vehicleId?: string, metadata?: Record<string, unknown>) => Promise<void>;
+  isTrustedOrigin: (origin: string | undefined) => boolean;
   hub: {
     publish: (vehicleId: string, payload: unknown) => void;
     publishPatrol?: (msg: { vehicleId: string; [key: string]: unknown }) => void;
@@ -250,7 +251,7 @@ const TASK_SELECT = `
 `;
 
 export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolRouteDeps): void {
-  const { db, requireUser, requireAdmin, canAccessVehicle, acquireLease, leaseToken, audit, hub } = deps;
+  const { db, requireUser, requireAdmin, canAccessVehicle, acquireLease, leaseToken, audit, hub, isTrustedOrigin } = deps;
 
   // --- Devices (vehicle aliases) ---
   app.get('/api/devices', async (request) => {
@@ -1341,6 +1342,10 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
 
   // --- WebSocket /patrol/live ---
   app.get('/patrol/live', { websocket: true }, async (socket, request) => {
+    if (!isTrustedOrigin(request.headers.origin)) {
+      socket.close(1008, 'Untrusted WebSocket origin');
+      return;
+    }
     let user: RouteUser & AuthUser;
     try {
       user = await requireUser(request);

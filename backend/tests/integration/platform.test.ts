@@ -1,14 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import argon2 from 'argon2';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { GenericContainer, Wait, type StartedTestContainer } from 'testcontainers';
 import { createApp } from '../../src/app.js';
 import { Database } from '../../src/db/index.js';
 
 const origin = 'https://platform.example.test';
+const defaultPassword = 'password';
 let container: StartedTestContainer;
 let db: Database;
 let app: Awaited<ReturnType<typeof createApp>>;
+const deliveredOtps: Array<{ to: string; passcode: string; expiresInMinutes: number }> = [];
 const ids = { admin: randomUUID(), operatorA: randomUUID(), operatorB: randomUUID() };
 
 function cookie(response: { headers: Record<string, unknown> }) { return String(response.headers['set-cookie']).split(';')[0]; }
@@ -62,70 +64,91 @@ beforeAll(async () => {
     // races that restart and produces ECONNRESET on the initial migration query.
     .withWaitStrategy(Wait.forLogMessage(/PostgreSQL init process complete; ready for start up/))
     .start();
-  db = new Database(`postgres://platform:platform@${container.getHost()}:${container.getMappedPort(5432)}/platform`);
-  await waitForDatabase(db);
-  await db.migrate();
+  const databaseUrl = `postgres://platform:platform@${container.getHost()}:${container.getMappedPort(5432)}/platform`;
+  const firstMigrator = new Database(databaseUrl);
+  const secondMigrator = new Database(databaseUrl);
+  await waitForDatabase(firstMigrator);
+  await Promise.all([firstMigrator.migrate(), secondMigrator.migrate()]);
+  const migrations = await firstMigrator.query<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version');
+  expect(migrations.rows).toHaveLength(10);
+  await secondMigrator.close();
+  db = firstMigrator;
   for (const [name, id, role, email] of [
     ['admin', ids.admin, 'admin', 'admin@example.test'],
     ['operator-a', ids.operatorA, 'operator', 'operator-a@example.test'],
     ['operator-b', ids.operatorB, 'operator', 'operator-b@example.test'],
   ] as const) {
-    await db.query('INSERT INTO users (id,username,display_name,password_hash,role,email) VALUES ($1,$2,$3,$4,$5,$6)', [id, name, name, await argon2.hash('password'), role, email]);
+    await db.query('INSERT INTO users (id,username,display_name,password_hash,role,email) VALUES ($1,$2,$3,$4,$5,$6)', [id, name, name, await argon2.hash(defaultPassword), role, email]);
   }
-  app = await createApp({ db, config: { sessionSecret: 'integration-secret', publicOrigin: origin, allowedOrigins: [origin], otpExpiryMinutes: 5, otpResendCooldownSeconds: 60 } });
+  app = await createApp({
+    db,
+    config: { sessionSecret: 'integration-secret', publicOrigin: origin, allowedOrigins: [origin], otpExpiryMinutes: 5, otpResendCooldownSeconds: 60 },
+    mailer: {
+      available: true,
+      async sendLoginPasscode(input) { deliveredOtps.push(input); },
+    },
+  });
 }, 120_000);
 
 afterAll(async () => { if (app) await app.close(); if (db) await db.close(); if (container) await container.stop(); });
 
+beforeEach(async () => {
+  await db.query('UPDATE users SET password_hash=$1 WHERE id=$2', [await argon2.hash(defaultPassword), ids.admin]);
+  await db.query('DELETE FROM auth_otps');
+  deliveredOtps.length = 0;
+});
+
 describe('platform API against PostGIS', () => {
   it('enforces roles, serializes leases, and accepts idempotent telemetry', async () => {
-    const adminCookie = await login('admin', 'password');
+    const adminCookie = await login('admin', defaultPassword);
     const created = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-1', name: '巡检车', host: '192.168.1.11', tcpPort: 6000, videoPort: 6500 } });
     expect(created.statusCode).toBe(200); const vehicleId = created.json<{ vehicle: { id: string } }>().vehicle.id;
     const members = await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA, ids.operatorB] } });
     expect(members.statusCode).toBe(200);
-    const operatorACookie = await login('operator-a', 'password'); const operatorBCookie = await login('operator-b', 'password');
+    const operatorACookie = await login('operator-a', defaultPassword); const operatorBCookie = await login('operator-b', defaultPassword);
     expect((await app.inject({ method: 'GET', url: '/api/users', headers: { cookie: operatorACookie } })).statusCode).toBe(403);
     const firstLease = await app.inject({ method: 'POST', url: `/api/vehicles/${vehicleId}/control-lease`, headers: { origin, cookie: operatorACookie } });
     expect(firstLease.statusCode).toBe(200);
     expect((await app.inject({ method: 'POST', url: `/api/vehicles/${vehicleId}/control-lease`, headers: { origin, cookie: operatorBCookie } })).statusCode).toBe(409);
     const credential = await app.inject({ method: 'POST', url: `/api/vehicles/${vehicleId}/device-credentials`, headers: { origin, cookie: adminCookie } });
     const token = credential.json<{ credential: { token: string } }>().credential.token;
-    const point = { occurredAt: '2026-07-11T00:00:00.000Z', longitude: 116.3, latitude: 39.8 };
+    const point = { occurredAt: new Date(Date.now() - 60_000).toISOString(), longitude: 116.3, latitude: 39.8 };
     expect((await app.inject({ method: 'POST', url: '/device/v1/telemetry', headers: { authorization: `Bearer ${token}` }, payload: { points: [point] } })).json()).toEqual({ accepted: 1 });
     expect((await app.inject({ method: 'POST', url: '/device/v1/telemetry', headers: { authorization: `Bearer ${token}` }, payload: { points: [point] } })).json()).toEqual({ accepted: 0 });
     const track = await app.inject({ method: 'GET', url: `/api/vehicles/${vehicleId}/track`, headers: { cookie: operatorACookie } });
     expect(track.statusCode).toBe(200); expect(track.json<{ points: unknown[] }>().points).toHaveLength(1);
   });
 
-  it('rejects OTP requests for unknown usernames', async () => {
+  it('delivers OTPs only to administrators without exposing account state or passcodes', async () => {
     const unknown = await app.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'nobody' } });
-    expect(unknown.statusCode).toBe(404);
-    expect(unknown.json<{ error?: string }>().error).toBe('该用户不存在');
+    expect(unknown.statusCode).toBe(200);
 
     const noEmailId = randomUUID();
     await db.query('INSERT INTO users (id,username,display_name,password_hash,role,email) VALUES ($1,$2,$3,$4,$5,$6)', [
       noEmailId, 'no-email-user', 'no-email-user', await argon2.hash('password'), 'operator', null,
     ]);
     const noEmail = await app.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'no-email-user' } });
-    expect(noEmail.statusCode).toBe(400);
-    expect(noEmail.json<{ error?: string }>().error).toBe('该用户未绑定邮箱');
+    expect(noEmail.statusCode).toBe(200);
 
     const requested = await app.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'operator-a' } });
     expect(requested.statusCode).toBe(200);
-    const body = requested.json<{ passcode?: string; deliveryEmail?: string; message?: string }>();
-    expect(body.message).toBe('验证码已发送');
-    expect(body.passcode).toBeUndefined();
-    expect(body.deliveryEmail).toBeUndefined();
+    expect(requested.json()).toEqual(unknown.json());
+    expect(noEmail.json()).toEqual(unknown.json());
+    expect(deliveredOtps).toHaveLength(0);
 
-    const throttled = await app.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'operator-a' } });
-    expect(throttled.statusCode).toBe(429);
+    const adminRequested = await app.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'admin' } });
+    expect(adminRequested.statusCode).toBe(200);
+    expect(adminRequested.json<{ passcode?: string; deliveryEmail?: string }>().passcode).toBeUndefined();
+    expect(adminRequested.json<{ passcode?: string; deliveryEmail?: string }>().deliveryEmail).toBeUndefined();
+    expect(deliveredOtps).toHaveLength(1);
+    expect(deliveredOtps[0]?.to).toBe('admin@example.test');
 
     const rejected = await app.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'operator-a', passcode: '000000' } });
     expect(rejected.statusCode).toBe(401);
 
-    const unavailable = await app.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'operator-a', passcode: '111111' } });
-    expect(unavailable.statusCode).toBe(401);
+    const verified = await app.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'admin', passcode: deliveredOtps[0]!.passcode } });
+    expect(verified.statusCode).toBe(200);
+    expect((await app.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'admin', passcode: deliveredOtps[0]!.passcode } })).statusCode).toBe(401);
   });
 
   it('allows admin to update own profile and rejects operators', async () => {
@@ -170,7 +193,7 @@ describe('platform API against PostGIS', () => {
   });
 
   it('keeps manual control blocked until a cancelled patrol reports zero velocity', async () => {
-    const adminCookie = await login('admin', 'new-password');
+    const adminCookie = await login('admin', defaultPassword);
     const operatorCookie = await login('operator-a', 'password');
     const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-SAFETY', name: '安全巡检车', host: '192.168.1.22', tcpPort: 6000, videoPort: 6500 } });
     const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
@@ -200,7 +223,7 @@ describe('platform API against PostGIS', () => {
   });
 
   it('classifies and deduplicates device observations using the task whitelist snapshot', async () => {
-    const adminCookie = await login('admin', 'new-password');
+    const adminCookie = await login('admin', defaultPassword);
     const operatorCookie = await login('operator-a', 'password');
     const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-OBS', name: '观测巡检车', host: '192.168.1.23', tcpPort: 6000, videoPort: 6500 } });
     const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
@@ -231,7 +254,7 @@ describe('platform API against PostGIS', () => {
   });
 
   it('creates patrol_events and reviews for pending-review observations, and whitelist snapshot is immutable', async () => {
-    const adminCookie = await login('admin', 'new-password');
+    const adminCookie = await login('admin', defaultPassword);
     const operatorCookie = await login('operator-a', 'password');
     const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-REVIEW', name: '审核测试车', host: '192.168.1.25', tcpPort: 6000, videoPort: 6500 } });
     const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
@@ -271,11 +294,13 @@ describe('platform API against PostGIS', () => {
   });
 
   it('runs an operator-confirmed doorstep response with zero-velocity and evidence gates', async () => {
-    const adminCookie = await login('admin', 'new-password');
+    const adminCookie = await login('admin', defaultPassword);
     const operatorCookie = await login('operator-a', 'password');
     const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-DOOR', name: '上门处置车', host: '192.168.1.30', tcpPort: 6000, videoPort: 6500 } });
     const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
     await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA] } });
+    await db.query('UPDATE vehicles SET last_seen_at=now() WHERE id=$1', [vehicleId]);
+    await db.query('INSERT INTO telemetry_points (id,vehicle_id,occurred_at,longitude,latitude,battery_pct) VALUES ($1,$2,now(),0,0,80)', [randomUUID(), vehicleId]);
     const destination = await app.inject({ method: 'POST', url: '/api/resident-destinations', headers: { origin, cookie: adminCookie }, payload: { vehicleId, building: '1号楼', displayName: '1号楼一层门口', mapVersion: 'v-door', x: 4, y: 5, yaw: 0 } });
     expect(destination.statusCode).toBe(200);
     const routeId = randomUUID(); const waypointId = randomUUID();
@@ -329,19 +354,49 @@ describe('platform API against PostGIS', () => {
     expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${cancelTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'stop-bad', type: 'stop_confirmed', zeroVelocity: false } })).statusCode).toBe(409);
     expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${cancelTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'stop-ok', type: 'stop_confirmed', zeroVelocity: true } })).statusCode).toBe(200);
     expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${cancelTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'cancelled-failure', type: 'failed' } })).statusCode).toBe(409);
+
+    const observeForHealthGate = async (occurredAt: string) => {
+      const response = await app.inject({ method: 'POST', url: `/device/v1/patrol/tasks/${patrolTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: {
+        type: 'observation', waypointId, occurredAt, plate: 'D12345', confidence: 0.97,
+        vehicleBox: [0.2, 0.2, 0.2, 0.2], evidenceImageUrl: `https://evidence.invalid/${occurredAt}.jpg`,
+      } });
+      return response.json<{ responseTaskId: string }>().responseTaskId;
+    };
+
+    await db.query('UPDATE telemetry_points SET battery_pct=10,occurred_at=now() WHERE vehicle_id=$1', [vehicleId]);
+    const lowBatteryTaskId = await observeForHealthGate('2026-07-11T06:00:00.000Z');
+    expect((await app.inject({ method: 'POST', url: `/api/response-tasks/${lowBatteryTaskId}/confirm`, headers: { origin, cookie: operatorCookie }, payload: {} })).json()).toMatchObject({ assignmentPending: true });
+
+    await db.query('UPDATE telemetry_points SET battery_pct=80,occurred_at=now() WHERE vehicle_id=$1', [vehicleId]);
+    await db.query("UPDATE patrol_routes SET map_version='mismatch' WHERE id=$1", [routeId]);
+    const mapMismatchTaskId = await observeForHealthGate('2026-07-11T07:00:00.000Z');
+    expect((await app.inject({ method: 'POST', url: `/api/response-tasks/${mapMismatchTaskId}/confirm`, headers: { origin, cookie: operatorCookie }, payload: {} })).json()).toMatchObject({ assignmentPending: true });
+
+    await db.query("UPDATE patrol_routes SET map_version='v-door' WHERE id=$1", [routeId]);
+    await db.query("UPDATE vehicles SET last_seen_at=now()-interval '3 minutes' WHERE id=$1", [vehicleId]);
+    await db.query("UPDATE telemetry_points SET occurred_at=now()-interval '3 minutes' WHERE vehicle_id=$1", [vehicleId]);
+    const offlineTaskId = await observeForHealthGate('2026-07-11T08:00:00.000Z');
+    expect((await app.inject({ method: 'POST', url: `/api/response-tasks/${offlineTaskId}/confirm`, headers: { origin, cookie: operatorCookie }, payload: {} })).json()).toMatchObject({ assignmentPending: true });
+
+    const backup = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-BACKUP', name: '空闲处置车', host: '192.168.1.31', tcpPort: 6000, videoPort: 6500 } });
+    const backupId = backup.json<{ vehicle: { id: string } }>().vehicle.id;
+    await db.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [randomUUID(), backupId, '备车路线', 'v-door', 'generated', ids.admin]);
+    await db.query('UPDATE vehicles SET last_seen_at=now() WHERE id=$1', [backupId]);
+    await db.query('INSERT INTO telemetry_points (id,vehicle_id,occurred_at,longitude,latitude,battery_pct) VALUES ($1,$2,now(),0,0,80)', [randomUUID(), backupId]);
+    expect((await app.inject({ method: 'POST', url: `/api/response-tasks/${offlineTaskId}/assign`, headers: { origin, cookie: operatorCookie }, payload: {} })).json()).toMatchObject({ assignedVehicleId: backupId, deduplicated: false });
   });
 
-  it('allows admin to manage global whitelist while operators can only read', async () => {
-    const adminCookie = await login('admin', 'new-password');
+  it('allows only administrators to manage global whitelist', async () => {
+    const adminCookie = await login('admin', defaultPassword);
     const operatorACookie = await login('operator-a', 'password');
     expect((await app.inject({ method: 'POST', url: '/api/whitelist', headers: { origin, cookie: adminCookie }, payload: { plate: 'B12345', vehicleType: 'commercial' } })).statusCode).toBe(400);
     expect((await app.inject({ method: 'POST', url: '/api/whitelist', headers: { origin, cookie: adminCookie }, payload: { plate: 'B12345', owner: '乙', building: '2号楼', vehicleType: 'visitor' } })).statusCode).toBe(200);
     expect((await app.inject({ method: 'POST', url: '/api/whitelist', headers: { origin, cookie: operatorACookie }, payload: { plate: 'B99999', owner: '丙', building: '3号楼', vehicleType: 'private' } })).statusCode).toBe(403);
-    expect((await app.inject({ method: 'GET', url: '/api/whitelist', headers: { origin, cookie: operatorACookie } })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'GET', url: '/api/whitelist', headers: { origin, cookie: operatorACookie } })).statusCode).toBe(403);
   });
 
   it('serializes a blocked whitelist import with patrol snapshot creation', async () => {
-    const adminCookie = await login('admin', 'new-password');
+    const adminCookie = await login('admin', defaultPassword);
     const operatorCookie = await login('operator-a', 'password');
     const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-WL-LOCK', name: '白名单锁测试车', host: '192.168.1.26', tcpPort: 6000, videoPort: 6500 } });
     const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
@@ -397,7 +452,7 @@ describe('platform API against PostGIS', () => {
   });
 
   it('keeps one live global whitelist when two first writes race', async () => {
-    const adminCookie = await login('admin', 'new-password');
+    const adminCookie = await login('admin', defaultPassword);
     await db.query('UPDATE whitelist_imports SET is_snapshot=true WHERE vehicle_id IS NULL AND is_snapshot=false');
     const writes = await Promise.all([
       app.inject({ method: 'POST', url: '/api/whitelist', headers: { origin, cookie: adminCookie }, payload: { plate: 'C10001', owner: '甲', building: '1号楼', vehicleType: 'private' } }),
@@ -409,7 +464,7 @@ describe('platform API against PostGIS', () => {
   });
 
   it('supports whitelist CRUD fields, fuzzy search, and role checks', async () => {
-    const adminCookie = await login('admin', 'new-password');
+    const adminCookie = await login('admin', defaultPassword);
     const operatorCookie = await login('operator-a', 'password');
     await resetGlobalWhitelist([]);
 
@@ -435,13 +490,13 @@ describe('platform API against PostGIS', () => {
     });
     expect(entry.validUntil).toContain('2027-12-31');
 
-    const listed = await app.inject({ method: 'GET', url: '/api/whitelist', headers: { origin, cookie: operatorCookie } });
+    const listed = await app.inject({ method: 'GET', url: '/api/whitelist', headers: { origin, cookie: adminCookie } });
     expect(listed.statusCode).toBe(200);
     expect(listed.json<{ entries: Array<{ plate: string; parkingSpot: string }> }>().entries).toEqual(
       expect.arrayContaining([expect.objectContaining({ plate: '京A·F0236', parkingSpot: 'B-12-301' })]),
     );
 
-    const searched = await app.inject({ method: 'GET', url: `/api/whitelist?q=${encodeURIComponent('苏')}`, headers: { origin, cookie: operatorCookie } });
+    const searched = await app.inject({ method: 'GET', url: `/api/whitelist?q=${encodeURIComponent('苏')}`, headers: { origin, cookie: adminCookie } });
     expect(searched.statusCode).toBe(200);
     expect(searched.json<{ entries: Array<{ owner: string }> }>().entries).toEqual([
       expect.objectContaining({ owner: '苏有鹏' }),
@@ -469,6 +524,12 @@ describe('platform API against PostGIS', () => {
     expect((await app.inject({
       method: 'DELETE',
       url: `/api/whitelist/${entry.id}`,
+      headers: { origin, cookie: operatorCookie },
+    })).statusCode).toBe(403);
+
+    expect((await app.inject({
+      method: 'GET',
+      url: '/api/whitelist',
       headers: { origin, cookie: operatorCookie },
     })).statusCode).toBe(403);
 

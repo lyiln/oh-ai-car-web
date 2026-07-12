@@ -1,6 +1,6 @@
 # 巡牌通 · PatrolPlate 平台 API 契约
 
-品牌：**巡牌通 · PatrolPlate**。登录页见现有 `/api/auth/*`。本文描述管理端业务 API（migration 003–007）。
+品牌：**巡牌通 · PatrolPlate**。登录页见现有 `/api/auth/*`。本文描述管理端业务 API（migration 003–008）。
 
 ## 认证
 
@@ -95,9 +95,11 @@
 | 路径 | 事件 |
 |------|------|
 | `/ws` | 兼容：`vehicle.position` |
-| `/patrol/live` | `pose_update`、`device_status`、`patrol_status`、`patrol_event`、`violation_alert` |
+| `/patrol/live` | `pose_update`、`device_status`、`patrol_status`、`patrol_event`、`violation_alert`、`response_status`、`assignment_changed`、`response_event` |
 
-客户端发送 `{ "type": "subscribe", "vehicleId": "<uuid>" }`。
+客户端发送 `{ "type": "subscribe", "vehicleId": "<uuid>" }`。两个 WebSocket
+入口均要求已认证 Cookie 和配置在 `PLATFORM_PUBLIC_ORIGIN` 或
+`PLATFORM_ALLOWED_ORIGINS` 中的 Origin；不受信或缺失 Origin 会以 1008 关闭。
 
 ## 前端路由
 

@@ -4,9 +4,10 @@
 
 - **Active handoff:** before further doorstep-response or real-car work, read
   `NEXT_SESSION.md`, `tasks/code-review-doorstep-response.md`, and
-  `tasks/real-car-doorstep-integration-plan.md`. Stage 0 review blockers are
-  repaired; the next allowed step is read-only stage 1 hardware/ROS discovery.
-  Physical autonomous motion is not approved yet.
+  `tasks/real-car-doorstep-integration-plan.md`. Stage 0 and the repository
+  deployment/security gate fixes are implemented; the next allowed step is
+  read-only stage 1 hardware/ROS discovery. Physical autonomous motion is not
+  approved yet.
 
 - `oh-ai-car-web` is an independent npm workspace for browser-based smart-car
   control. The original OpenHarmony project is not required to clone, build,
@@ -21,9 +22,9 @@
   `/patrol/live` WebSocket. See `docs/architecture/patrol-platform-api.md`.
 - The primary open risk is the unresolved button packet conflict documented in
   `PROTOCOL_STATUS.md`. Treat this as an operational safety constraint.
-- The doorstep-response implementation is present in migration 007 and
-  `backend/src/routes/response-platform.ts`, but its ROS/Nav2 scheduler and
-  physical-car behavior remain external and unverified.
+- The doorstep-response implementation is present in migrations 007–008 and
+  `backend/src/routes/response-platform.ts` at commit `7ebcabc`, but its
+  ROS/Nav2 scheduler and physical-car behavior remain external and unverified.
 - `课程状态.md` tracks the course-level evidence needed for the basic
   score. This repository currently covers only the Web/APP control module.
 

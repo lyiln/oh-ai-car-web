@@ -82,12 +82,13 @@ export async function createApp(services: AppServices = {}) {
   const app = Fastify({ logger: true });
   await app.register(cookie);
   const trustedOrigins = new Set(config.allowedOrigins);
-  await app.register(cors, { origin: (origin, callback) => callback(null, Boolean(origin && trustedOrigins.has(origin))), credentials: true });
+  const isTrustedOrigin = (origin: string | undefined) => Boolean(origin && trustedOrigins.has(origin));
+  await app.register(cors, { origin: (origin, callback) => callback(null, isTrustedOrigin(origin)), credentials: true });
   await app.register(websocket);
   app.addHook('onRequest', async (request, reply) => {
     const mutating = ['POST', 'PATCH', 'PUT', 'DELETE'].includes(request.method);
     const exempt = request.url.startsWith('/device/') || request.url.startsWith('/internal/');
-    if (mutating && !exempt && !trustedOrigins.has(request.headers.origin ?? '')) return reply.code(403).send({ error: 'Untrusted request origin' });
+    if (mutating && !exempt && !isTrustedOrigin(request.headers.origin)) return reply.code(403).send({ error: 'Untrusted request origin' });
   });
 
   async function audit(action: string, outcome: string, actorUserId?: string, vehicleId?: string, metadata: Record<string, unknown> = {}) {
@@ -441,7 +442,7 @@ export async function createApp(services: AppServices = {}) {
   app.get('/api/vehicles/:id/track', async (request) => { const user = await requireUser(request); const vehicleId = (request.params as { id: string }).id; if (!await canAccessVehicle(user, vehicleId)) throw Object.assign(new Error('Vehicle access denied'), { statusCode: 403 }); const query = request.query as { from?: string; to?: string }; const result = await db.query('SELECT occurred_at AS "occurredAt",longitude,latitude,altitude_m AS "altitudeM",accuracy_m AS "accuracyM",speed_kph AS "speedKph",heading_deg AS "headingDeg",battery_pct AS "batteryPct",mode FROM telemetry_points WHERE vehicle_id=$1 AND occurred_at >= COALESCE($2::timestamptz,now()-interval \'24 hours\') AND occurred_at <= COALESCE($3::timestamptz,now()) ORDER BY occurred_at', [vehicleId, query.from ?? null, query.to ?? null]); return { points: result.rows }; });
   app.get('/api/audit-logs', async (request) => { await requireAdmin(request); const result = await db.query('SELECT id,actor_user_id AS "actorUserId",vehicle_id AS "vehicleId",action,outcome,metadata,created_at AS "createdAt" FROM audit_logs ORDER BY created_at DESC LIMIT 200'); return { logs: result.rows }; });
 
-  app.get('/ws', { websocket: true }, async (socket, request) => { const user = await currentUser(request); if (!user) return socket.close(1008, 'Authentication required'); let unsubscribe: (() => void) | undefined; socket.on('message', async (raw: Buffer) => { try { const message = JSON.parse(raw.toString()) as { type?: string; vehicleId?: string }; if (message.type !== 'subscribe' || !message.vehicleId || !await canAccessVehicle(user, message.vehicleId)) return socket.send(JSON.stringify({ type: 'error', message: 'Vehicle access denied' })); unsubscribe?.(); unsubscribe = hub.subscribe(message.vehicleId, socket); socket.send(JSON.stringify({ type: 'subscribed', vehicleId: message.vehicleId })); } catch { socket.send(JSON.stringify({ type: 'error', message: 'Invalid message' })); } }); socket.on('close', () => unsubscribe?.()); });
+  app.get('/ws', { websocket: true }, async (socket, request) => { if (!isTrustedOrigin(request.headers.origin)) return socket.close(1008, 'Untrusted WebSocket origin'); const user = await currentUser(request); if (!user) return socket.close(1008, 'Authentication required'); let unsubscribe: (() => void) | undefined; socket.on('message', async (raw: Buffer) => { try { const message = JSON.parse(raw.toString()) as { type?: string; vehicleId?: string }; if (message.type !== 'subscribe' || !message.vehicleId || !await canAccessVehicle(user, message.vehicleId)) return socket.send(JSON.stringify({ type: 'error', message: 'Vehicle access denied' })); unsubscribe?.(); unsubscribe = hub.subscribe(message.vehicleId, socket); socket.send(JSON.stringify({ type: 'subscribed', vehicleId: message.vehicleId })); } catch { socket.send(JSON.stringify({ type: 'error', message: 'Invalid message' })); } }); socket.on('close', () => unsubscribe?.()); });
 
   registerPatrolPlatformRoutes(app, {
     db,
@@ -453,6 +454,7 @@ export async function createApp(services: AppServices = {}) {
     leaseToken: (leaseId, vehicleId, user, expiresAt) => leaseToken(leaseId, vehicleId, user as UserRow, expiresAt),
     audit,
     hub,
+    isTrustedOrigin,
   });
 
   registerResponsePlatformRoutes(app, {

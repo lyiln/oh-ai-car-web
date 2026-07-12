@@ -4,6 +4,8 @@
 
 Implemented from the user-approved “乱停车识别—上门处置” upgrade plan on 2026-07-12.
 
+Implementation commit: `7ebcabc` (`feat: add safe doorstep response workflow`).
+
 ## Delivered
 
 - Added migration 007 for resident Nav2 destinations, whitelist destination links, response tasks and idempotent device events.
@@ -12,6 +14,9 @@ Implemented from the user-approved “乱停车识别—上门处置” upgrade 
 - Added device claim and lifecycle APIs with transition validation, zero-velocity gates and arrival-evidence requirement.
 - Added destination management, a realtime response-task board and removed patrol route demo-data fallback.
 - Added the teacher-feedback response document under `docs/course/`.
+- Added migration 008 for recoverable assignment, `cancellation_requested`,
+  device-confirmed safe cancellation, terminal-state protection and active
+  response/control-lease interlocks.
 
 ## External Boundary
 
@@ -31,3 +36,4 @@ approved. See `tasks/code-review-doorstep-response.md`.
 - `VITE_PLATFORM_ENABLED=false npm run build`: passed.
 - Workspace unit tests passed: shared 5, gateway 12, frontend 13, backend 8. Gateway tests required local loopback permission because they bind temporary ports.
 - `npm run test:integration --workspace=@oh-ai-car-web/backend`: passed, 10 PostGIS scenarios including the new confirm/assign/claim/arrive/evidence/complete/idempotency flow.
+- Integration-test stability: telemetry uses a current timestamp within the track query window, and each scenario restores the administrator credential; the doorstep-response scenario now passes both independently and in the complete suite.

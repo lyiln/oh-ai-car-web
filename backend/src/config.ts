@@ -44,6 +44,12 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     aiModel: process.env.AI_MODEL ?? 'gpt-4.1-mini',
     ...overrides,
   };
-  if (process.env.NODE_ENV === 'production' && !config.publicOrigin) throw new Error('PLATFORM_PUBLIC_ORIGIN is required in production');
+  if (process.env.NODE_ENV === 'production') {
+    if (!config.publicOrigin) throw new Error('PLATFORM_PUBLIC_ORIGIN is required in production');
+    if (config.sessionSecret === 'development-only-change-me' || config.sessionSecret.length < 32) {
+      throw new Error('SESSION_SECRET must be at least 32 characters and must not use the development default in production');
+    }
+    if (!config.cookieSecure) throw new Error('COOKIE_SECURE=true is required in production');
+  }
   return config;
 }

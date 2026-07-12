@@ -10,7 +10,7 @@ Before planning or editing, read these files in order:
 4. `docs/course/课程文档索引.md` when work affects group delivery or course evidence
 5. `PROTOCOL_STATUS.md`
 6. `.specify/memory/constitution.md`
-7. The relevant file under `specs/001-web-control-gateway/`
+7. The relevant directory under [`specs/`](specs/README.md) (`001` gateway, `002` platform, `003` patrol)
 
 ## Repository Boundary
 

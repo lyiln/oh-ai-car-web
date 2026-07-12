@@ -119,10 +119,10 @@ async function assignVehicle(db: Database, taskId: string): Promise<string> {
          AND NOT EXISTS (SELECT 1 FROM response_tasks r WHERE r.assigned_vehicle_id=v.id AND r.status IN ('assigned','navigating','arrived','cancellation_requested'))
          AND NOT EXISTS (SELECT 1 FROM control_leases l WHERE l.vehicle_id=v.id AND l.released_at IS NULL AND l.expires_at>now())
          AND (v.id=$1 OR NOT EXISTS (SELECT 1 FROM patrol_tasks p WHERE p.vehicle_id=v.id AND p.status IN ('queued','running','cancellation_requested')))
-         AND (v.id=$1 OR EXISTS (SELECT 1 FROM patrol_routes pr WHERE pr.vehicle_id=v.id AND pr.map_version=$2))
-         AND (v.id=$1 OR v.last_seen_at>now()-interval '2 minutes' OR EXISTS
+         AND EXISTS (SELECT 1 FROM patrol_routes pr WHERE pr.vehicle_id=v.id AND pr.map_version=$2)
+         AND (v.last_seen_at>now()-interval '2 minutes' OR EXISTS
            (SELECT 1 FROM telemetry_points online WHERE online.vehicle_id=v.id AND online.occurred_at>now()-interval '2 minutes'))
-         AND (v.id=$1 OR COALESCE((SELECT battery_pct FROM telemetry_points battery WHERE battery.vehicle_id=v.id ORDER BY occurred_at DESC LIMIT 1),100)>=20)
+         AND (SELECT battery_pct FROM telemetry_points battery WHERE battery.vehicle_id=v.id ORDER BY occurred_at DESC LIMIT 1)>=20
        ORDER BY
          CASE WHEN v.id=$1 THEN 1 ELSE 0 END,
          CASE WHEN v.last_seen_at>now()-interval '2 minutes' THEN 0 ELSE 1 END,

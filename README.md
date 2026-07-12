@@ -8,6 +8,13 @@ Browser control console and localhost-only TCP gateway for the OH AI car.
 For agent-assisted work, start with [AGENTS.md](AGENTS.md) and
 [AI_CONTEXT.md](AI_CONTEXT.md).
 
+## Documentation
+
+Use the [documentation map](docs/README.md) to choose current guides,
+architecture, deployment, course delivery, or reference evidence. Product
+requirements are indexed at [specs/README.md](specs/README.md); active plans,
+reviews, and historical change reports are indexed at [tasks/README.md](tasks/README.md).
+
 Course-level delivery status and evidence requirements are tracked in
 [课程状态.md](课程状态.md); the group execution and taskbook mapping
 are indexed at [docs/course/课程文档索引.md](docs/course/课程文档索引.md).
@@ -32,8 +39,8 @@ The gateway listens on `http://127.0.0.1:8787` and WebSocket endpoint
 
 Run `npm test`, `npm run typecheck`, and `npm run build` before a review.
 
-Real-car validation is manual. Read `specs/001-web-control-gateway/quickstart.md`
-before connecting to a vehicle.
+Real-car validation is manual. Read the active [real-car integration plan](tasks/real-car-doorstep-integration-plan.md)
+and [validation record](docs/flows/web-control-real-car-validation.md) before connecting to a vehicle.
 
 ## Spec Kit
 
