@@ -33,12 +33,12 @@ Fastify 应用入口是 `backend/src/app.ts`；启动时 `backend/src/index.ts` 
 
 | 能力 | 后端行为 | 主要数据 |
 | --- | --- | --- |
-| 登录与角色 | 管理员创建账号；使用 Argon2 校验密码，签名 Cookie 保存 8 小时会话 | `users` |
+| 登录与角色 | 管理员创建账号；所有活跃账号可使用 Argon2 密码登录，已绑定邮箱的管理员还可通过后端 SMTP 接收一次性验证码；签名 Cookie 保存 8 小时会话 | `users`、`auth_otps` |
 | 车辆档案 | 保存车辆名称、编号、TCP 主机/端口、视频端口及成员授权 | `vehicles`、`vehicle_members` |
 | 控制权 | 每辆车同一时刻只允许一个有效租约；租约有效期 60 秒，页面每 20 秒续期 | `control_leases` |
 | GPS | 设备令牌验证后批量写入 WGS-84 轨迹点；同车同采集时间重复上报会忽略 | `device_credentials`、`telemetry_points` |
 | 实时更新 | GPS 成功写入后向已授权的 `/ws` 订阅者推送 `vehicle.position` | 内存订阅表 |
-| 巡检任务 | 路线 YAML、白名单 CSV、单车单活动任务、调度事件、车牌证据与 HTML 报告 | `patrol_*`、`whitelist_*`、`plate_observations` |
+| 巡检任务 | 路线 YAML、全局白名单 CSV、单车单活动任务、调度事件、车牌证据与 HTML 报告 | `patrol_*`、`whitelist_*`、`plate_observations` |
 | 审计与保留 | 记录登录、车辆、设备令牌、租约操作；每 6 小时清理 90 天前轨迹和 1 年前审计 | `audit_logs` |
 
 数据库 DDL 位于 `backend/src/db/schema.ts`。虽然数据库启用了 PostGIS 扩展，MVP 当前按经纬度字段和时间索引查询轨迹，尚未使用空间几何列。
@@ -60,9 +60,9 @@ Fastify 应用入口是 `backend/src/app.ts`；启动时 `backend/src/index.ts` 
 | `POST/DELETE /api/control-leases/:id...` | 操作员 | 续约或主动释放控制权 |
 | `GET /api/vehicles/:id/track` | 已授权用户 | 按 `from`/`to` 时间范围查询轨迹；省略时为最近 24 小时 |
 | `GET /api/audit-logs` | 管理员 | 读取最近 200 条审计记录 |
+| `GET/POST/PUT/DELETE /api/whitelist...`、`POST /api/whitelist/import` | 管理员 | 维护所有巡检车共享的全局白名单；任务启动时复制为不可变快照 |
 | `POST /device/v1/telemetry` | 边缘代理 | 使用 `Authorization: Bearer <credential>` 批量上报点位 |
 | `/api/vehicles/:id/patrol-routes` | 管理员/已授权用户 | 管理员导入路线 YAML；已授权用户读取路线与航点 |
-| `/api/vehicles/:id/whitelists` | 管理员/已授权用户 | 管理员导入业主/访客 CSV；已授权用户读取版本列表 |
 | `/api/vehicles/:id/patrol-tasks...` | 已授权用户 | 创建、启动、停止、查看任务与下载 HTML 报告；启动前须安全断开本机网关并释放有效人工控制租约 |
 | `/device/v1/patrol/tasks/next`、`.../events` | 巡检调度器 | 凭车辆设备令据领取任务，上报航点、状态与识别记录 |
 | `POST /internal/control-lease/verify` | 本机网关 | 验证租约令牌、车辆和当前连接目标 |
@@ -73,7 +73,7 @@ Fastify 应用入口是 `backend/src/app.ts`；启动时 `backend/src/index.ts` 
 ## 巡检任务与识别链路
 
 1. 管理员导入导航组维护的 YAML 路线。每条路线有 3-8 个固定航点、8-10 秒停留时间和可选的相机画面禁停 ROI；历史路线不被改写。
-2. 管理员导入 `plate,ownerName,building,category` CSV，`category` 为 `private` 或 `visitor`。创建任务时固定引用路线和白名单版本。
+2. 管理员导入小区全局白名单（车牌、车主、楼栋、车位、类型和可选有效期）。所有巡检车使用同一份 live 白名单；创建任务时固定复制为不可变快照。
 3. 操作员启动草稿任务前，后端在同一车辆锁定事务中检查有效人工控制租约；如存在则返回 409，任务保持 `draft`，操作员必须安全断开本机网关并释放租约。检查通过后任务才进入 `queued`；小车端 `patrol_scheduler` 使用已有设备凭据领取任务后进入 `running`，并按 Nav2 航点顺序导航。
 4. 调度器上报航点到达和识别事件。置信度低于 0.75 或无有效车牌为待复核；其余记录按白名单判为登记私家车、访客或疑似外来。相同任务、车牌、航点和 30 分钟窗口内的记录会合并。
 5. 禁停只按固定航点的相机 ROI 与车辆检测框相交判定，不把未标定的 GPS 当作禁停围栏。任务详情与 HTML 报告保留识别证据和处置统计。
@@ -98,6 +98,8 @@ Fastify 应用入口是 `backend/src/app.ts`；启动时 `backend/src/index.ts` 
 3. 后端写入轨迹并推送最新点。前端进入车辆地图时先查询最近 24 小时历史数据，再订阅实时位置事件。
 4. GPS 原始数据以 WGS-84 保存；前端在显示前调用高德 `AMap.convertFrom(..., 'gps')` 转为 GCJ-02。转换失败时不绘制可能错位的轨迹。
 5. 高德的 `securityJsCode` 不进入前端包，由 Nginx `/_AMapService` 代理附加；Web Key 作为受域名限制的前端构建参数提供。
+
+全局运营地图还会绘制禁停区、航点、违规点及选中车辆轨迹。浏览器定位不可用时回退到配置的默认中心；动态车牌和航点标签通过 DOM `textContent` 创建，不插入动态 HTML。
 
 速度、航向、电量和工作模式在 API 中是可选字段。当前 ROS2 `NavSatFix` 代理实际提供坐标、高度和由协方差计算的精度；其他字段需要未来接入相应 ROS2 话题后才会有值。
 

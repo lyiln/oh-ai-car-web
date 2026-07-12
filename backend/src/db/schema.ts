@@ -369,7 +369,7 @@ DO $$
 BEGIN
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_name='whitelist_entries' AND column_name='owner'
+    WHERE table_name='whitelist_entries' AND column_name='plate'
   ) AND NOT EXISTS (
     SELECT 1 FROM information_schema.columns
     WHERE table_name='whitelist_entries' AND column_name='whitelist_id'
@@ -462,19 +462,27 @@ BEGIN
     END IF;
 
     IF to_regclass('public.whitelist_entries_legacy_009') IS NOT NULL THEN
+      -- Old installations used several flat-table shapes. Read rows through JSONB so
+      -- absent optional columns do not abort the entire migration transaction.
+      WITH legacy_rows AS (
+        SELECT to_jsonb(e) AS payload FROM whitelist_entries_legacy_009 e
+      ), deduplicated AS (
+        SELECT DISTINCT ON (payload ->> 'plate') payload
+        FROM legacy_rows
+        WHERE COALESCE(payload ->> 'plate', '') <> ''
+        ORDER BY payload ->> 'plate', COALESCE(payload ->> 'created_at', '') DESC, COALESCE(payload ->> 'id', '') DESC
+      )
       INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, destination_id, parking_spot, valid_until)
-      SELECT gen_random_uuid(), global_id, plate,
-             COALESCE(owner, ''),
-             COALESCE(building, ''),
-             CASE WHEN vehicle_type='visitor' THEN 'visitor' ELSE 'private' END,
-             destination_id,
-             COALESCE(slot, ''),
-             expires_at
-      FROM (
-        SELECT DISTINCT ON (plate) plate, owner, building, vehicle_type, destination_id, slot, expires_at
-        FROM whitelist_entries_legacy_009
-        ORDER BY plate, created_at DESC, id DESC
-      ) AS legacy
+      SELECT gen_random_uuid(), global_id, payload ->> 'plate',
+             COALESCE(payload ->> 'owner', payload ->> 'owner_name', ''),
+             COALESCE(payload ->> 'building', ''),
+             CASE WHEN COALESCE(payload ->> 'vehicle_type', payload ->> 'category')='visitor' THEN 'visitor' ELSE 'private' END,
+             CASE WHEN COALESCE(payload ->> 'destination_id', '') ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+               THEN (payload ->> 'destination_id')::uuid ELSE NULL END,
+             COALESCE(payload ->> 'slot', payload ->> 'parking_spot', ''),
+             CASE WHEN COALESCE(payload ->> 'expires_at', payload ->> 'valid_until', '') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+               THEN COALESCE(payload ->> 'expires_at', payload ->> 'valid_until')::timestamptz ELSE NULL END
+      FROM deduplicated
       ON CONFLICT (whitelist_id, plate) DO UPDATE SET
         owner_name=EXCLUDED.owner_name,
         building=EXCLUDED.building,

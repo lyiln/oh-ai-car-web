@@ -16,6 +16,7 @@
 
 - 本机控制与安全边界：[`change-report-web-control-v1.md`](change-report-web-control-v1.md)、[`change-report-gateway-safety-hardening.md`](change-report-gateway-safety-hardening.md)、[`change-report-control-ownership-and-course-readiness.md`](change-report-control-ownership-and-course-readiness.md)。
 - 平台与巡检演进：[`vehicle-fleet-platform-mvp-plan.md`](vehicle-fleet-platform-mvp-plan.md)、[`change-report-vehicle-fleet-platform-mvp.md`](change-report-vehicle-fleet-platform-mvp.md)、[`change-report-patrol-inspection.md`](change-report-patrol-inspection.md)、[`change-report-patrol-p1-bugfixes.md`](change-report-patrol-p1-bugfixes.md)、[`change-report-whitelist-import-locking.md`](change-report-whitelist-import-locking.md)、[`change-report-patrol-platform-merge-fixes.md`](change-report-patrol-platform-merge-fixes.md)。
+- 2026-07-12 合并与安全修复：[`change-report-super-merge-security-fixes.md`](change-report-super-merge-security-fixes.md)。
 - 仓库与课程资料：[`change-report-self-contained-repository.md`](change-report-self-contained-repository.md)、[`change-report-course-delivery-documentation.md`](change-report-course-delivery-documentation.md)。
 
 新增记录命名为 `change-report-<topic>.md`、`code-review-<topic>.md` 或

@@ -1,10 +1,10 @@
 # 巡牌通 · PatrolPlate 平台 API 契约
 
-品牌：**巡牌通 · PatrolPlate**。登录页见现有 `/api/auth/*`。本文描述管理端业务 API（migration 003–008）。
+品牌：**巡牌通 · PatrolPlate**。登录页见现有 `/api/auth/*`。本文描述管理端业务 API（migration 003–010）。
 
 ## 认证
 
-所有 `/api/*`（除 `/device/v1/*`、`/internal/*`）需已登录会话 Cookie `oh_ai_session`，且请求 Origin 受信任。
+所有 `/api/*`（除 `/device/v1/*`、`/internal/*`）需已登录会话 Cookie `oh_ai_session`，且请求 Origin 受信任。密码登录适用于活跃账号；邮箱 OTP 仅对已绑定邮箱的管理员可用。验证码只在后端生成、哈希存储并经 SMTP 投递，API 不返回验证码或收件地址。
 
 ## 设备 `/api/devices`
 
@@ -56,7 +56,7 @@
 任务快照路线中的航点；低于 0.75 的置信度进入待复核，其余车牌使用任务快照的白名单分类；
 同一任务、航点、车牌和 30 分钟窗口会合并计数，禁停 ROI 相交独立记录。
 
-**白名单快照隔离（FR-002）**：单条新增、批量导入和任务启动以同一车辆行锁串行执行。批量导入的有效行在一个事务中提交；任务启动在持锁事务内将当前活跃白名单复制为不可变快照（`whitelist_imports.is_snapshot=true`）。因此任务只会看到完整的导入前或导入后版本，后续导入只影响下一次巡检，不影响正在运行任务的分类。
+**白名单快照隔离（FR-002）**：白名单是小区全局数据，只有管理员可读取、导入或修改。首次创建与写入在事务级 advisory lock 下串行；批量导入的有效行在一个事务中提交。任务启动在持锁事务内将当前全局 live 白名单复制为不可变快照（`whitelist_imports.is_snapshot=true`）。因此任务只会看到完整的导入前或导入后版本，后续导入只影响下一次巡检，不影响正在运行任务的分类。
 
 **待复核流程（FR-005）**：置信度 < 0.75 的首次观测（去重后计数为 1）除写入 `plate_observations` 外，还以事务方式同步写入 `patrol_events`（event_type='observation'）和 `reviews`（reason='low_confidence'，status='pending'），确保 `GET /api/reviews/pending` 立即可见。
 
@@ -69,15 +69,16 @@
 | GET | `/api/reviews/pending` |
 | POST | `/api/reviews/:event_id/resolve` |
 
-管理员可访问所有车辆；操作员只能读取或处理 `vehicle_members` 授权车辆的违规、审核、报告和工作台统计。无权的单条违规或报告返回 404。
+管理员可访问所有车辆；操作员只能读取或处理 `vehicle_members` 授权车辆的违规、审核、报告和工作台统计。无权的单条违规或报告返回 404。审核中只有管理员可选择 `whitelist`，该操作才会写入全局白名单；操作员仍可处理其授权车辆的其他审核结果。
 
 ## 白名单 / 报告 / 设置
 
 | 方法 | 路径 |
 |------|------|
-| GET | `/api/whitelist?deviceId=:id` |
-| POST | `/api/whitelist`（请求体必须含 `deviceId`） |
-| POST | `/api/whitelist/import`（请求体必须含 `deviceId`） |
+| GET | `/api/whitelist?q=:query`（管理员） |
+| GET/PUT/DELETE | `/api/whitelist/:id`（管理员） |
+| POST | `/api/whitelist`（管理员） |
+| POST | `/api/whitelist/import`（管理员） |
 | GET | `/api/reports` · `/api/reports/:id` |
 | GET/PUT | `/api/settings` |
 
@@ -122,7 +123,7 @@
 
 当前设备 ID 存于 `localStorage` 键 `patrol:selectedDeviceId`。
 
-白名单类型仅支持 `private` 和 `visitor`。创建、导入和查询均显式绑定当前设备（`deviceId`）且过滤快照行；巡检启动会验证目标车辆活跃白名单（非快照）至少包含一条记录，并原子性创建不可变快照供任务引用。
+白名单类型仅支持 `private` 和 `visitor`。创建、导入和查询均针对小区全局 live 白名单并过滤快照行；支持 `parkingSpot` 和可选 `validUntil`。巡检启动会验证全局 live 白名单至少包含一条记录，并原子性创建不可变快照供任务引用。
 
 ## 授权说明
 
@@ -140,6 +141,8 @@
 | 006-whitelist-live-version-locking | 历史重复活跃白名单转为快照；每车唯一活跃白名单索引；导入与快照的车辆锁语义 |
 | 007-doorstep-response | 住户目的地、上门处置任务与设备幂等事件 |
 | 008-doorstep-response-safety | 可恢复分配、安全取消状态、零速度停止确认与活动车辆互斥 |
+| 009-global-whitelist | 兼容旧版扁平白名单，将 live 数据迁移为全局版本并保留任务快照 |
+| 010-whitelist-entry-fields | 白名单车位和有效期字段 |
 
 ## 演示注意
 

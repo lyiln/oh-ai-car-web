@@ -16,10 +16,12 @@
   frontend tests. Controlled real-car validation is still pending.
 - The **巡牌通 · PatrolPlate** management platform extends the fleet MVP with a
   dark AppShell, React Router pages (dashboard, fleet, console, patrol,
-  map, violations, reviews, whitelist, reports, settings), password login (OTP
-  APIs are not enabled because no server-side delivery provider is configured),
-  devices API aliases, patrol/map/ops domain tables (migrations 003–008), and
-  `/patrol/live` WebSocket. See `docs/architecture/patrol-platform-api.md`.
+  map, violations, reviews, whitelist, reports, settings), password login and
+  administrator-only email OTP. OTP is generated and hashed in the backend and
+  delivered only through configured SMTP; it is unavailable rather than exposed
+  when SMTP is not configured. The platform also has devices API aliases,
+  patrol/map/ops domain tables (migrations 003–010), and `/patrol/live`
+  WebSocket. See `docs/architecture/patrol-platform-api.md`.
 - The primary open risk is the unresolved button packet conflict documented in
   `PROTOCOL_STATUS.md`. Treat this as an operational safety constraint.
 - The doorstep-response implementation is present in migrations 007–008 and

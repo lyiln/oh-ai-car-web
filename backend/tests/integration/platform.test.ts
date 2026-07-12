@@ -600,4 +600,40 @@ describe('platform API against PostGIS', () => {
     })]);
     expect(migrated.rows[0]?.valid_until.toISOString()).toContain('2028-02-02');
   });
+
+  it('migrates a legacy flat whitelist when optional columns are absent', async () => {
+    await db.query('DROP TABLE whitelist_entries CASCADE');
+    await db.query(`
+      CREATE TABLE whitelist_entries (
+        id uuid PRIMARY KEY,
+        plate text NOT NULL,
+        owner_name text,
+        building text,
+        category text,
+        parking_spot text,
+        valid_until timestamptz,
+        created_at timestamptz NOT NULL
+      )
+    `);
+    await db.query(
+      `INSERT INTO whitelist_entries (id,plate,owner_name,building,category,parking_spot,valid_until,created_at)
+       VALUES
+         ($1,'L00901','旧车主','1号楼','private','A-01','2027-01-01','2026-01-01'),
+         ($2,'L00901','新车主','2号楼','visitor','B-02','2028-02-02','2026-02-01')`,
+      [randomUUID(), randomUUID()],
+    );
+    await db.query("DELETE FROM schema_migrations WHERE version IN ('009-global-whitelist','010-whitelist-entry-fields')");
+    await db.migrate();
+
+    const migrated = await db.query<{ owner_name: string; building: string; category: string; parking_spot: string; valid_until: Date }>(
+      `SELECT e.owner_name, e.building, e.category, e.parking_spot, e.valid_until
+       FROM whitelist_entries e
+       JOIN whitelist_imports i ON i.id=e.whitelist_id
+       WHERE i.vehicle_id IS NULL AND i.is_snapshot=false AND e.plate='L00901'`,
+    );
+    expect(migrated.rows).toEqual([expect.objectContaining({
+      owner_name: '新车主', building: '2号楼', category: 'visitor', parking_spot: 'B-02',
+    })]);
+    expect(migrated.rows[0]?.valid_until.toISOString()).toContain('2028-02-02');
+  });
 });
