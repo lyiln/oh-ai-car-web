@@ -48,7 +48,7 @@ export function AppShell() {
           </div>
         </div>
         <nav className="shell-nav" aria-label="主导航">
-          {NAV.map((item) => (
+          {NAV.filter((item) => item.to !== '/whitelist' || user?.role === 'admin').map((item) => (
             <NavLink key={item.to} to={item.to} className={({ isActive }) => (isActive ? 'active' : undefined)}>
               {item.label}
             </NavLink>

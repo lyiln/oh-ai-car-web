@@ -76,6 +76,15 @@ CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_
 `;
 
 export const migration002 = `
+CREATE TABLE IF NOT EXISTS patrol_routes (
+  id uuid PRIMARY KEY,
+  vehicle_id uuid NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  map_version text NOT NULL,
+  source_yaml text NOT NULL,
+  created_by_user_id uuid NOT NULL REFERENCES users(id),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
 ALTER TABLE patrol_routes ADD COLUMN IF NOT EXISTS vehicle_id uuid REFERENCES vehicles(id) ON DELETE CASCADE;
 ALTER TABLE patrol_routes ADD COLUMN IF NOT EXISTS map_version text;
 ALTER TABLE patrol_routes ADD COLUMN IF NOT EXISTS source_yaml text;
@@ -90,15 +99,6 @@ WHERE vehicle_id IS NULL
    OR map_version IS NULL
    OR source_yaml IS NULL
    OR created_by_user_id IS NULL;
-CREATE TABLE IF NOT EXISTS patrol_routes (
-  id uuid PRIMARY KEY,
-  vehicle_id uuid NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
-  name text NOT NULL,
-  map_version text NOT NULL,
-  source_yaml text NOT NULL,
-  created_by_user_id uuid NOT NULL REFERENCES users(id),
-  created_at timestamptz NOT NULL DEFAULT now()
-);
 CREATE INDEX IF NOT EXISTS patrol_routes_vehicle_created_idx ON patrol_routes(vehicle_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS patrol_waypoints (
   id uuid PRIMARY KEY,
@@ -394,6 +394,8 @@ ALTER TABLE whitelist_imports ALTER COLUMN vehicle_id DROP NOT NULL;
 
 -- Ensure destination_id exists on modern table.
 ALTER TABLE whitelist_entries ADD COLUMN IF NOT EXISTS destination_id uuid REFERENCES resident_destinations(id) ON DELETE SET NULL;
+ALTER TABLE whitelist_entries ADD COLUMN IF NOT EXISTS parking_spot text NOT NULL DEFAULT '';
+ALTER TABLE whitelist_entries ADD COLUMN IF NOT EXISTS valid_until timestamptz;
 
 -- Ensure patrol_tasks.whitelist_id exists for snapshot linkage.
 ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS whitelist_id uuid REFERENCES whitelist_imports(id);
@@ -440,11 +442,11 @@ BEGIN
       SELECT 1 FROM information_schema.columns
       WHERE table_name='whitelist_entries' AND column_name='whitelist_id'
     ) THEN
-      INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, destination_id)
-      SELECT gen_random_uuid(), global_id, plate, owner_name, building, category, destination_id
+      INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, destination_id, parking_spot, valid_until)
+      SELECT gen_random_uuid(), global_id, plate, owner_name, building, category, destination_id, parking_spot, valid_until
       FROM (
         SELECT DISTINCT ON (e.plate)
-          e.plate, e.owner_name, e.building, e.category, e.destination_id
+          e.plate, e.owner_name, e.building, e.category, e.destination_id, e.parking_spot, e.valid_until
         FROM whitelist_entries e
         JOIN whitelist_imports i ON i.id = e.whitelist_id
         WHERE i.is_snapshot=false AND i.vehicle_id IS NOT NULL
@@ -454,18 +456,22 @@ BEGIN
         owner_name=EXCLUDED.owner_name,
         building=EXCLUDED.building,
         category=EXCLUDED.category,
-        destination_id=COALESCE(EXCLUDED.destination_id, whitelist_entries.destination_id);
+        destination_id=COALESCE(EXCLUDED.destination_id, whitelist_entries.destination_id),
+        parking_spot=EXCLUDED.parking_spot,
+        valid_until=EXCLUDED.valid_until;
     END IF;
 
     IF to_regclass('public.whitelist_entries_legacy_009') IS NOT NULL THEN
-      INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, destination_id)
+      INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, destination_id, parking_spot, valid_until)
       SELECT gen_random_uuid(), global_id, plate,
              COALESCE(owner, ''),
              COALESCE(building, ''),
              CASE WHEN vehicle_type='visitor' THEN 'visitor' ELSE 'private' END,
-             destination_id
+             destination_id,
+             COALESCE(slot, ''),
+             expires_at
       FROM (
-        SELECT DISTINCT ON (plate) plate, owner, building, vehicle_type, destination_id
+        SELECT DISTINCT ON (plate) plate, owner, building, vehicle_type, destination_id, slot, expires_at
         FROM whitelist_entries_legacy_009
         ORDER BY plate, created_at DESC, id DESC
       ) AS legacy
@@ -473,7 +479,9 @@ BEGIN
         owner_name=EXCLUDED.owner_name,
         building=EXCLUDED.building,
         category=EXCLUDED.category,
-        destination_id=COALESCE(EXCLUDED.destination_id, whitelist_entries.destination_id);
+        destination_id=COALESCE(EXCLUDED.destination_id, whitelist_entries.destination_id),
+        parking_spot=EXCLUDED.parking_spot,
+        valid_until=EXCLUDED.valid_until;
       DROP TABLE whitelist_entries_legacy_009;
     END IF;
 

@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
 import { Car, FileText, MapPinned, ScanLine, ShieldCheck } from 'lucide-react';
-import { isEmailJsConfigured, sendLoginPasscode } from '../services/emailService.js';
 import { PlatformClient, type PlatformUser } from '../services/platformClient.js';
 
 type LoginTab = 'password' | 'otp';
@@ -51,11 +50,7 @@ export function LoginPage({ onLogin }: { onLogin: (user: PlatformUser) => void }
       setBusy(true);
       setError('');
       if (!username.trim()) throw new Error('请输入用户名');
-      if (!isEmailJsConfigured()) throw new Error('邮件服务未配置');
-      const result = await client.requestOtp(username.trim());
-      if (result.passcode && result.deliveryEmail) {
-        await sendLoginPasscode(result.deliveryEmail, result.passcode, result.time);
-      }
+      await client.requestOtp(username.trim());
       setCooldown(60);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '获取验证码失败');

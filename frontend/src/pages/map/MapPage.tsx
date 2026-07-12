@@ -27,6 +27,7 @@ function parseCoordinates(text: string): Array<[number, number]> {
 export function MapPage() {
   const { selectedId } = useSelectedDevice();
   const { user } = useAuth();
+  const isAdmin = user?.role === 'admin';
   const [zones, setZones] = useState<MapZone[]>([]);
   const [waypoints, setWaypoints] = useState<Waypoint[]>([]);
   const [violations, setViolations] = useState<Violation[]>([]);
@@ -151,11 +152,11 @@ export function MapPage() {
           <p>在地图上绘制禁停区多边形，管理航点、违规车辆与图层</p>
         </div>
         <div className="button-row">
-          <button type="button" className="secondary" disabled={!selectedId || user?.role !== 'admin'} onClick={() => setDestinationOpen(true)}>新增住户目的地</button>
+          <button type="button" className="secondary" disabled={!selectedId || !isAdmin} onClick={() => setDestinationOpen(true)}>新增住户目的地</button>
           <button
             type="button"
             className="secondary"
-            disabled={!selectedZoneId || mode === 'draw'}
+            disabled={!isAdmin || !selectedZoneId || mode === 'draw'}
             onClick={() => setMode('edit')}
           >
             编辑禁停区
@@ -163,7 +164,7 @@ export function MapPage() {
           <button
             type="button"
             className="danger"
-            disabled={!selectedZoneId || mode !== 'view'}
+            disabled={!isAdmin || !selectedZoneId || mode !== 'view'}
             onClick={() => selectedZoneId && void remove(selectedZoneId)}
           >
             删除选中
@@ -171,7 +172,7 @@ export function MapPage() {
           <button
             type="button"
             className="primary"
-            disabled={mode === 'draw'}
+            disabled={!isAdmin || mode === 'draw'}
             onClick={() => { setSelectedZoneId(null); setMode('draw'); }}
           >
             绘制禁停区
@@ -210,7 +211,7 @@ export function MapPage() {
           {!layers.zones ? <div className="empty-state">图层已关闭</div> : zones.length === 0 ? (
             <div className="empty-state">
               <p>暂无禁停区</p>
-              <button type="button" className="primary" onClick={() => setMode('draw')}>绘制禁停区</button>
+              {isAdmin && <button type="button" className="primary" onClick={() => setMode('draw')}>绘制禁停区</button>}
             </div>
           ) : (
             <ul className="zone-list">
@@ -220,7 +221,7 @@ export function MapPage() {
                     <strong>{zone.name}</strong>
                     <small>{zone.coordinates?.length ?? 0} 个顶点</small>
                   </button>
-                  <button type="button" className="danger" onClick={() => void remove(zone.id)}>删除</button>
+                  {isAdmin && <button type="button" className="danger" onClick={() => void remove(zone.id)}>删除</button>}
                 </li>
               ))}
             </ul>

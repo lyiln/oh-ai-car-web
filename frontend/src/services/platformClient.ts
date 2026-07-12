@@ -3,7 +3,7 @@ export interface Vehicle { id: string; code: string; name: string; description: 
 export interface Lease { leaseId: string; expiresAt: string; gatewayToken: string; }
 export interface TrackPoint { occurredAt: string; longitude: number; latitude: number; altitudeM: number | null; accuracyM: number | null; speedKph: number | null; headingDeg: number | null; batteryPct: number | null; mode: string | null; }
 export interface AuditLog { id: string; actorUserId: string | null; vehicleId: string | null; action: string; outcome: string; metadata: unknown; createdAt: string; }
-export interface OtpRequestResult { ok: true; message: string; time: string; passcode?: string; deliveryEmail?: string; }
+export interface OtpRequestResult { ok: true; message: string; time: string; }
 export interface ProfileUpdate {
   displayName?: string;
   email?: string | null;

@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react';
 import type { Review } from '../../services/api.js';
 import * as opsClient from '../../services/opsClient.js';
+import { useAuth } from '../../contexts/AuthContext.js';
 
 export function ReviewQueuePage() {
+  const { user } = useAuth();
   const [reviews, setReviews] = useState<Review[]>([]);
   const [error, setError] = useState('');
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -63,7 +65,9 @@ export function ReviewQueuePage() {
               <div className="button-row">
                 <button type="button" className="primary" disabled={busyId === review.eventId} onClick={() => void resolve(review, 'confirm')}>确认</button>
                 <button type="button" className="secondary" disabled={busyId === review.eventId} onClick={() => void resolve(review, 'false_positive')}>误报</button>
-                <button type="button" className="secondary" disabled={busyId === review.eventId} onClick={() => void resolve(review, 'whitelist')}>加入白名单</button>
+                {user?.role === 'admin' && (
+                  <button type="button" className="secondary" disabled={busyId === review.eventId} onClick={() => void resolve(review, 'whitelist')}>加入白名单</button>
+                )}
                 <button type="button" className="secondary" disabled={busyId === review.eventId} onClick={() => void resolve(review, 'visitor')}>标记外来车</button>
               </div>
             </article>

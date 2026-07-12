@@ -220,24 +220,17 @@ async function ensureMapMetadata(db: Database): Promise<{ name: string; basemap_
 }
 
 async function ensureGlobalWhitelist(client: PoolClient, user: RouteUser): Promise<string> {
+  await client.query("SELECT pg_advisory_xact_lock(hashtext('oh-ai-car-web:global-whitelist'))");
   const existing = await client.query<{ id: string }>(
     'SELECT id FROM whitelist_imports WHERE vehicle_id IS NULL AND is_snapshot=false ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE',
   );
   if (existing.rows[0]) return existing.rows[0].id;
   const id = randomUUID();
-  try {
-    await client.query(
-      'INSERT INTO whitelist_imports (id,vehicle_id,name,created_by_user_id,is_snapshot) VALUES ($1,NULL,$2,$3,false)',
-      [id, '小区全局白名单', user.id],
-    );
-    return id;
-  } catch (error) {
-    const raced = await client.query<{ id: string }>(
-      'SELECT id FROM whitelist_imports WHERE vehicle_id IS NULL AND is_snapshot=false ORDER BY created_at DESC, id DESC LIMIT 1',
-    );
-    if (raced.rows[0]) return raced.rows[0].id;
-    throw error;
-  }
+  await client.query(
+    'INSERT INTO whitelist_imports (id,vehicle_id,name,created_by_user_id,is_snapshot) VALUES ($1,NULL,$2,$3,false)',
+    [id, '小区全局白名单', user.id],
+  );
+  return id;
 }
 
 const TASK_SELECT = `
@@ -946,12 +939,17 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
               po.longitude, po.latitude
        FROM violations v
        LEFT JOIN map_zones z ON z.id = v.zone_id
-       LEFT JOIN response_tasks rt ON rt.violation_id = v.id
-       LEFT JOIN plate_observations po ON po.id = COALESCE(rt.observation_id, (
-         SELECT po2.id FROM plate_observations po2
-         WHERE po2.task_id = v.task_id AND (v.plate IS NULL OR po2.plate = v.plate)
-         ORDER BY po2.occurred_at DESC LIMIT 1
-       ))
+       LEFT JOIN LATERAL (
+         SELECT po2.longitude, po2.latitude
+         FROM plate_observations po2
+         WHERE po2.id = COALESCE(
+           (SELECT rt.observation_id FROM response_tasks rt WHERE rt.violation_id=v.id ORDER BY rt.created_at DESC LIMIT 1),
+           (SELECT po3.id FROM plate_observations po3
+            WHERE po3.task_id=v.task_id AND (v.plate IS NULL OR po3.plate=v.plate)
+            ORDER BY po3.occurred_at DESC LIMIT 1)
+         )
+         LIMIT 1
+       ) po ON true
        ${where}
        ORDER BY v.occurred_at DESC
        LIMIT 200`,
@@ -970,12 +968,17 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
               z.name AS "zoneName", po.longitude, po.latitude
        FROM violations v
        LEFT JOIN map_zones z ON z.id = v.zone_id
-       LEFT JOIN response_tasks rt ON rt.violation_id = v.id
-       LEFT JOIN plate_observations po ON po.id = COALESCE(rt.observation_id, (
-         SELECT po2.id FROM plate_observations po2
-         WHERE po2.task_id = v.task_id AND (v.plate IS NULL OR po2.plate = v.plate)
-         ORDER BY po2.occurred_at DESC LIMIT 1
-       ))
+       LEFT JOIN LATERAL (
+         SELECT po2.longitude, po2.latitude
+         FROM plate_observations po2
+         WHERE po2.id = COALESCE(
+           (SELECT rt.observation_id FROM response_tasks rt WHERE rt.violation_id=v.id ORDER BY rt.created_at DESC LIMIT 1),
+           (SELECT po3.id FROM plate_observations po3
+            WHERE po3.task_id=v.task_id AND (v.plate IS NULL OR po3.plate=v.plate)
+            ORDER BY po3.occurred_at DESC LIMIT 1)
+         )
+         LIMIT 1
+       ) po ON true
        WHERE (v.id=$1 OR v.event_id=$1)
          AND ($2::uuid IS NULL OR EXISTS (SELECT 1 FROM vehicle_members vm WHERE vm.vehicle_id=v.vehicle_id AND vm.user_id=$2))
        LIMIT 1`,
@@ -1012,6 +1015,7 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     const resolutionInput = typeof body?.resolution === 'string' ? body.resolution : body?.action;
     const resolution = string(resolutionInput, 'resolution');
     const plate = typeof body?.plate === 'string' ? body.plate.trim() : null;
+    if (resolution === 'whitelist' && user.role !== 'admin') throw httpError('Administrator role required to update whitelist', 403);
 
     const reviewStatus =
       resolution === 'confirmed' || resolution === 'confirm' || resolution === 'false_positive' || resolution === 'whitelist' || resolution === 'external' || resolution === 'visitor'
@@ -1048,7 +1052,7 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
 
   // --- Whitelist ---
   app.get('/api/whitelist', async (request) => {
-    await requireUser(request);
+    await requireAdmin(request);
     const q = typeof (request.query as { q?: string }).q === 'string'
       ? (request.query as { q: string }).q.trim()
       : '';
@@ -1068,7 +1072,7 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
   });
 
   app.get('/api/whitelist/:id', async (request) => {
-    await requireUser(request);
+    await requireAdmin(request);
     const id = (request.params as { id: string }).id;
     const result = await db.query<WhitelistEntryRow>(
       `${WHITELIST_ENTRY_SELECT} WHERE ${WHITELIST_LIVE_CLAUSE} AND e.id=$1 LIMIT 1`,
@@ -1089,21 +1093,23 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     if (vehicleTypeRaw !== 'private' && vehicleTypeRaw !== 'visitor') throw httpError('vehicleType is invalid', 400);
     const vehicleType = vehicleTypeRaw;
     const validUntil = optionalValidUntil(body?.validUntil ?? body?.expiresAt);
-    const id = randomUUID();
-    await db.transaction(async (client) => {
+    const entry = await db.transaction(async (client) => {
       const whitelistId = await ensureGlobalWhitelist(client, admin);
-      await client.query(
+      const result = await client.query<WhitelistEntryRow>(
         `INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, parking_spot, valid_until)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
          ON CONFLICT (whitelist_id, plate) DO UPDATE SET
            owner_name=EXCLUDED.owner_name, building=EXCLUDED.building, category=EXCLUDED.category,
-           parking_spot=EXCLUDED.parking_spot, valid_until=EXCLUDED.valid_until`,
-        [id, whitelistId, plate, owner, building, vehicleType, parkingSpot, validUntil],
+           parking_spot=EXCLUDED.parking_spot, valid_until=EXCLUDED.valid_until
+         RETURNING id, plate, owner_name AS owner, building, parking_spot AS "parkingSpot",
+                   category AS "vehicleType", valid_until AS "validUntil"`,
+        [randomUUID(), whitelistId, plate, owner, building, vehicleType, parkingSpot, validUntil],
       );
+      return result.rows[0];
     });
     await audit('whitelist.create', 'success', admin.id, undefined, { plate });
     return {
-      entry: whitelistEntryDto({ id, plate, owner, building, parkingSpot, vehicleType, validUntil }),
+      entry: whitelistEntryDto(entry),
     };
   });
 

@@ -283,9 +283,23 @@ describe('platform API against PostGIS', () => {
     // Review queue must contain the low-confidence observation
     const reviews = await app.inject({ method: 'GET', url: '/api/reviews/pending', headers: { origin, cookie: operatorCookie } });
     expect(reviews.statusCode).toBe(200);
-    expect(reviews.json<{ reviews: Array<{ reason: string; deviceName: string }> }>().reviews).toEqual(
+    const pending = reviews.json<{ reviews: Array<{ eventId: string; reason: string; deviceName: string }> }>().reviews;
+    expect(pending).toEqual(
       expect.arrayContaining([expect.objectContaining({ reason: 'low_confidence', deviceName: '审核测试车' })]),
     );
+    const review = pending.find((item) => item.reason === 'low_confidence')!;
+    expect((await app.inject({
+      method: 'POST',
+      url: `/api/reviews/${review.eventId}/resolve`,
+      headers: { origin, cookie: operatorCookie },
+      payload: { action: 'whitelist', plate: 'B99998' },
+    })).statusCode).toBe(403);
+    expect((await app.inject({
+      method: 'POST',
+      url: `/api/reviews/${review.eventId}/resolve`,
+      headers: { origin, cookie: adminCookie },
+      payload: { action: 'whitelist', plate: 'B99998' },
+    })).statusCode).toBe(200);
     // Task events must include the 'observation' type event
     const events = await app.inject({ method: 'GET', url: `/api/patrol/tasks/${taskId}/events`, headers: { origin, cookie: operatorCookie } });
     expect(events.json<{ events: Array<{ eventType: string }> }>().events).toEqual(
@@ -490,28 +504,43 @@ describe('platform API against PostGIS', () => {
     });
     expect(entry.validUntil).toContain('2027-12-31');
 
+    const upserted = await app.inject({
+      method: 'POST',
+      url: '/api/whitelist',
+      headers: { origin, cookie: adminCookie },
+      payload: { plate: '京A·F0236', owner: '更新车主', building: '8号楼', vehicleType: 'visitor' },
+    });
+    expect(upserted.statusCode).toBe(200);
+    expect(upserted.json<{ entry: { id: string; owner: string; vehicleType: string } }>().entry).toMatchObject({
+      id: entry.id,
+      owner: '更新车主',
+      vehicleType: 'visitor',
+    });
+
     const listed = await app.inject({ method: 'GET', url: '/api/whitelist', headers: { origin, cookie: adminCookie } });
     expect(listed.statusCode).toBe(200);
-    expect(listed.json<{ entries: Array<{ plate: string; parkingSpot: string }> }>().entries).toEqual(
-      expect.arrayContaining([expect.objectContaining({ plate: '京A·F0236', parkingSpot: 'B-12-301' })]),
+    expect(listed.json<{ entries: Array<{ plate: string; parkingSpot: string; owner: string }> }>().entries).toEqual(
+      expect.arrayContaining([expect.objectContaining({ plate: '京A·F0236', parkingSpot: '', owner: '更新车主' })]),
     );
 
-    const searched = await app.inject({ method: 'GET', url: `/api/whitelist?q=${encodeURIComponent('苏')}`, headers: { origin, cookie: adminCookie } });
+    const searched = await app.inject({ method: 'GET', url: `/api/whitelist?q=${encodeURIComponent('更新')}`, headers: { origin, cookie: adminCookie } });
     expect(searched.statusCode).toBe(200);
     expect(searched.json<{ entries: Array<{ owner: string }> }>().entries).toEqual([
-      expect.objectContaining({ owner: '苏有鹏' }),
+      expect.objectContaining({ owner: '更新车主' }),
     ]);
 
     const updated = await app.inject({
       method: 'PUT',
       url: `/api/whitelist/${entry.id}`,
       headers: { origin, cookie: adminCookie },
-      payload: { building: '8号楼', parkingSpot: 'A-01' },
+      payload: { building: '8号楼', parkingSpot: 'A-01', owner: null, validUntil: null },
     });
     expect(updated.statusCode).toBe(200);
-    expect(updated.json<{ entry: { building: string; parkingSpot: string } }>().entry).toMatchObject({
+    expect(updated.json<{ entry: { building: string; parkingSpot: string; owner: string; validUntil: string | null } }>().entry).toMatchObject({
       building: '8号楼',
       parkingSpot: 'A-01',
+      owner: '',
+      validUntil: null,
     });
 
     expect((await app.inject({
@@ -541,5 +570,34 @@ describe('platform API against PostGIS', () => {
 
     const afterDelete = await app.inject({ method: 'GET', url: '/api/whitelist', headers: { origin, cookie: adminCookie } });
     expect(afterDelete.json<{ entries: Array<{ id: string }> }>().entries.find((item) => item.id === entry.id)).toBeUndefined();
+  });
+
+  it('migrates the latest per-vehicle whitelist metadata into the global version', async () => {
+    const adminCookie = await login('admin', defaultPassword);
+    const firstVehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-MIGRATE-1', name: '迁移测试车一', host: '192.168.1.41', tcpPort: 6000, videoPort: 6500 } });
+    const secondVehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-MIGRATE-2', name: '迁移测试车二', host: '192.168.1.42', tcpPort: 6000, videoPort: 6500 } });
+    const olderImport = randomUUID();
+    const newerImport = randomUUID();
+    await db.query('UPDATE whitelist_imports SET is_snapshot=true WHERE vehicle_id IS NULL AND is_snapshot=false');
+    await db.query(
+      "INSERT INTO whitelist_imports (id,vehicle_id,name,created_by_user_id,is_snapshot,created_at) VALUES ($1,$2,'旧白名单',$3,false,now()-interval '1 hour'),($4,$5,'新白名单',$3,false,now())",
+      [olderImport, firstVehicle.json<{ vehicle: { id: string } }>().vehicle.id, ids.admin, newerImport, secondVehicle.json<{ vehicle: { id: string } }>().vehicle.id],
+    );
+    await db.query(
+      "INSERT INTO whitelist_entries (id,whitelist_id,plate,owner_name,building,category,parking_spot,valid_until) VALUES ($1,$2,'M00901','旧车主','1号楼','private','A-01','2027-01-01'),($3,$4,'M00901','新车主','2号楼','visitor','B-02','2028-02-02')",
+      [randomUUID(), olderImport, randomUUID(), newerImport],
+    );
+    await db.query("DELETE FROM schema_migrations WHERE version IN ('009-global-whitelist','010-whitelist-entry-fields')");
+    await db.migrate();
+
+    const migrated = await db.query<{ owner_name: string; building: string; category: string; parking_spot: string; valid_until: Date }>(
+      `SELECT e.owner_name, e.building, e.category, e.parking_spot, e.valid_until
+       FROM whitelist_entries e JOIN whitelist_imports i ON i.id=e.whitelist_id
+       WHERE i.vehicle_id IS NULL AND i.is_snapshot=false AND e.plate='M00901'`,
+    );
+    expect(migrated.rows).toEqual([expect.objectContaining({
+      owner_name: '新车主', building: '2号楼', category: 'visitor', parking_spot: 'B-02',
+    })]);
+    expect(migrated.rows[0]?.valid_until.toISOString()).toContain('2028-02-02');
   });
 });

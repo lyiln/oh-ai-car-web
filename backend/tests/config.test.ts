@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { loadConfig } from '../src/config.js';
 
-const productionKeys = ['NODE_ENV', 'SESSION_SECRET', 'COOKIE_SECURE', 'PLATFORM_PUBLIC_ORIGIN', 'PLATFORM_ALLOWED_ORIGINS'] as const;
+const productionKeys = ['NODE_ENV', 'SESSION_SECRET', 'COOKIE_SECURE', 'PLATFORM_PUBLIC_ORIGIN', 'PLATFORM_ALLOWED_ORIGINS', 'SMTP_HOST', 'SMTP_USER', 'SMTP_PASSWORD', 'SMTP_FROM'] as const;
 const original = Object.fromEntries(productionKeys.map((key) => [key, process.env[key]]));
 
 function production(overrides: Record<string, string | undefined> = {}) {
@@ -10,6 +10,10 @@ function production(overrides: Record<string, string | undefined> = {}) {
     SESSION_SECRET: 'a'.repeat(32),
     COOKIE_SECURE: 'true',
     PLATFORM_PUBLIC_ORIGIN: 'https://platform.example.test',
+    SMTP_HOST: 'smtp.example.test',
+    SMTP_USER: 'mailer',
+    SMTP_PASSWORD: 'mailer-password',
+    SMTP_FROM: 'PatrolPlate <no-reply@example.test>',
     ...overrides,
   };
   for (const [key, value] of Object.entries(values)) {
@@ -37,6 +41,7 @@ describe('production configuration', () => {
     ['a short secret', { SESSION_SECRET: 'short-secret' }],
     ['an insecure cookie', { COOKIE_SECURE: 'false' }],
     ['a missing public origin', { PLATFORM_PUBLIC_ORIGIN: undefined }],
+    ['missing SMTP configuration', { SMTP_HOST: undefined }],
   ])('rejects %s', (_name, overrides) => {
     production(overrides);
     expect(() => loadConfig()).toThrow();

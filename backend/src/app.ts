@@ -7,6 +7,7 @@ import Fastify, { type FastifyRequest } from 'fastify';
 import type { PoolClient } from 'pg';
 import { loadConfig, type Config } from './config.js';
 import { Database } from './db/index.js';
+import { createSmtpOtpMailer, type OtpMailer } from './otp-mailer.js';
 import { registerPatrolPlatformRoutes } from './routes/patrol-platform.js';
 import { createResponseCandidate, registerResponsePlatformRoutes } from './routes/response-platform.js';
 import { hashSecret, randomSecret, sign, verify, type SignedPayload } from './security.js';
@@ -74,10 +75,11 @@ export class RealtimeHub {
   }
 }
 
-export interface AppServices { db?: Database; config?: Partial<Config>; }
+export interface AppServices { db?: Database; config?: Partial<Config>; mailer?: OtpMailer; }
 export async function createApp(services: AppServices = {}) {
   const config = loadConfig(services.config);
   const db = services.db ?? new Database(config.databaseUrl);
+  const mailer = services.mailer ?? createSmtpOtpMailer(config);
   const hub = new RealtimeHub();
   const app = Fastify({ logger: true });
   await app.register(cookie);
@@ -150,37 +152,41 @@ export async function createApp(services: AppServices = {}) {
   });
   app.post('/api/auth/request-otp', async (request, reply) => {
     const body = object(request.body); const username = string(body?.username, 'username');
-    const sent = { ok: true as const, message: '验证码已发送', time: String(config.otpExpiryMinutes) };
-    const result = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users WHERE username=$1 AND active=true`, [username]);
-    const user = result.rows[0];
-    if (!user) {
-      await audit('auth.otp.request', 'unknown_user', undefined, undefined, { username });
-      return reply.status(404).send({ error: '该用户不存在' });
+    const sent = { ok: true as const, message: '如该管理员账号已登记邮箱，验证码将发送至绑定邮箱', time: String(config.otpExpiryMinutes) };
+    if (!mailer.available) {
+      await audit('auth.otp.request', 'delivery_unavailable', undefined, undefined, { username });
+      return reply.status(503).send({ error: '邮箱登录暂不可用，请使用账号密码登录' });
     }
-    if (!user.email) {
-      await audit('auth.otp.request', 'no_email', user.id, undefined, { username });
-      return reply.status(400).send({ error: '该用户未绑定邮箱' });
+    const result = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users WHERE username=$1 AND active=true AND role='admin'`, [username]);
+    const user = result.rows[0];
+    if (!user || !user.email) {
+      await audit('auth.otp.request', 'ineligible', user?.id, undefined, { username });
+      return sent;
     }
     const email = normalizeEmail(user.email);
     const recent = await db.query<{ created_at: Date }>('SELECT created_at FROM auth_otps WHERE email=$1 ORDER BY created_at DESC LIMIT 1', [email]);
     if (recent.rows[0] && Date.now() - recent.rows[0].created_at.getTime() < config.otpResendCooldownSeconds * 1000) {
-      await audit('auth.otp.request', 'throttled', undefined, undefined, { username, email });
-      return reply.status(429).send({ error: '请稍后再获取验证码' });
+      await audit('auth.otp.request', 'throttled', user.id, undefined, { username, email });
+      return sent;
     }
     const passcode = generatePasscode();
     const expiresAt = new Date(Date.now() + config.otpExpiryMinutes * 60_000);
-    await db.query('INSERT INTO auth_otps (id, user_id, email, code_hash, expires_at) VALUES ($1,$2,$3,$4,$5)', [randomUUID(), user.id, email, await argon2.hash(passcode), expiresAt]);
-    await audit('auth.otp.request', 'success', user.id, undefined, { username, email });
-    if (config.otpExposeForClientDelivery) {
-      return { ...sent, passcode, deliveryEmail: email };
+    const otpId = randomUUID();
+    await db.query('INSERT INTO auth_otps (id, user_id, email, code_hash, expires_at) VALUES ($1,$2,$3,$4,$5)', [otpId, user.id, email, await argon2.hash(passcode), expiresAt]);
+    try {
+      await mailer.sendLoginPasscode({ to: email, passcode, expiresInMinutes: config.otpExpiryMinutes });
+      await audit('auth.otp.request', 'success', user.id, undefined, { username, email });
+    } catch (error) {
+      await db.query('DELETE FROM auth_otps WHERE id=$1', [otpId]);
+      await audit('auth.otp.request', 'delivery_failed', user.id, undefined, { username, error: error instanceof Error ? error.message : 'unknown' });
+      return reply.status(503).send({ error: '邮箱登录暂不可用，请使用账号密码登录' });
     }
-    app.log.warn({ userId: user.id }, 'OTP created but no server-side delivery provider is configured');
     return sent;
   });
   app.post('/api/auth/verify-otp', async (request, reply) => {
     const body = object(request.body); const username = string(body?.username, 'username'); const passcode = string(body?.passcode, 'passcode');
     if (!/^\d{6}$/.test(passcode)) throw Object.assign(new Error('passcode is invalid'), { statusCode: 400 });
-    const userResult = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users WHERE username=$1 AND active=true`, [username]);
+    const userResult = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users WHERE username=$1 AND active=true AND role='admin'`, [username]);
     const candidate = userResult.rows[0];
     if (!candidate?.email) {
       await audit('auth.otp.verify', 'rejected', undefined, undefined, { username });
@@ -194,7 +200,7 @@ export async function createApp(services: AppServices = {}) {
       return reply.status(401).send({ error: '验证码无效或已过期' });
     }
     await db.query('UPDATE auth_otps SET consumed_at=now() WHERE id=$1', [row.id]);
-    const result = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users WHERE id=$1 AND active=true`, [row.user_id]);
+    const result = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users WHERE id=$1 AND active=true AND role='admin'`, [row.user_id]);
     const user = result.rows[0];
     if (!user) { await audit('auth.otp.verify', 'rejected', undefined, undefined, { username, email }); return reply.status(401).send({ error: '验证码无效或已过期' }); }
     issueSession(reply, user);

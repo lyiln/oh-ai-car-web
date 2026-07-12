@@ -11,7 +11,12 @@ export interface Config {
   bootstrapAdminEmail: string | undefined;
   otpExpiryMinutes: number;
   otpResendCooldownSeconds: number;
-  otpExposeForClientDelivery: boolean;
+  smtpHost: string | undefined;
+  smtpPort: number;
+  smtpSecure: boolean;
+  smtpUser: string | undefined;
+  smtpPassword: string | undefined;
+  smtpFrom: string | undefined;
   aiBaseUrl: string | undefined;
   aiApiKey: string | undefined;
   aiModel: string;
@@ -38,7 +43,12 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     bootstrapAdminEmail: process.env.BOOTSTRAP_ADMIN_EMAIL,
     otpExpiryMinutes: Number(process.env.OTP_EXPIRY_MINUTES ?? 5),
     otpResendCooldownSeconds: Number(process.env.OTP_RESEND_COOLDOWN_SECONDS ?? 60),
-    otpExposeForClientDelivery: process.env.OTP_EXPOSE_FOR_CLIENT_DELIVERY === 'true',
+    smtpHost: process.env.SMTP_HOST,
+    smtpPort: Number(process.env.SMTP_PORT ?? 587),
+    smtpSecure: process.env.SMTP_SECURE === 'true',
+    smtpUser: process.env.SMTP_USER,
+    smtpPassword: process.env.SMTP_PASSWORD,
+    smtpFrom: process.env.SMTP_FROM,
     aiBaseUrl: process.env.AI_BASE_URL,
     aiApiKey: process.env.AI_API_KEY,
     aiModel: process.env.AI_MODEL ?? 'gpt-4.1-mini',
@@ -50,6 +60,9 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
       throw new Error('SESSION_SECRET must be at least 32 characters and must not use the development default in production');
     }
     if (!config.cookieSecure) throw new Error('COOKIE_SECURE=true is required in production');
+    if (!config.smtpHost || !config.smtpUser || !config.smtpPassword || !config.smtpFrom) {
+      throw new Error('SMTP_HOST, SMTP_USER, SMTP_PASSWORD, and SMTP_FROM are required in production');
+    }
   }
   return config;
 }
