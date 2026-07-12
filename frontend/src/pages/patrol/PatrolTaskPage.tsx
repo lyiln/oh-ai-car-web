@@ -29,7 +29,7 @@ export function PatrolTaskPage() {
       try {
         const [nextRoutes, list] = await Promise.all([
           patrolClient.routes(selectedId),
-          selectedId ? opsClient.whitelist(selectedId) : Promise.resolve([]),
+          opsClient.whitelist(),
         ]);
         setRoutes(nextRoutes);
         setRouteId(nextRoutes[0]?.id ?? '');

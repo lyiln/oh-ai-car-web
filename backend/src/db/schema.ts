@@ -76,6 +76,20 @@ CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_
 `;
 
 export const migration002 = `
+ALTER TABLE patrol_routes ADD COLUMN IF NOT EXISTS vehicle_id uuid REFERENCES vehicles(id) ON DELETE CASCADE;
+ALTER TABLE patrol_routes ADD COLUMN IF NOT EXISTS map_version text;
+ALTER TABLE patrol_routes ADD COLUMN IF NOT EXISTS source_yaml text;
+ALTER TABLE patrol_routes ADD COLUMN IF NOT EXISTS created_by_user_id uuid REFERENCES users(id);
+UPDATE patrol_routes
+SET
+  vehicle_id = COALESCE(vehicle_id, (SELECT id FROM vehicles ORDER BY created_at LIMIT 1)),
+  map_version = COALESCE(map_version, 'legacy'),
+  source_yaml = COALESCE(source_yaml, ''),
+  created_by_user_id = COALESCE(created_by_user_id, (SELECT id FROM users ORDER BY created_at LIMIT 1))
+WHERE vehicle_id IS NULL
+   OR map_version IS NULL
+   OR source_yaml IS NULL
+   OR created_by_user_id IS NULL;
 CREATE TABLE IF NOT EXISTS patrol_routes (
   id uuid PRIMARY KEY,
   vehicle_id uuid NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
@@ -347,4 +361,150 @@ DROP INDEX IF EXISTS response_tasks_vehicle_active_idx;
 CREATE UNIQUE INDEX response_tasks_vehicle_active_idx
   ON response_tasks(assigned_vehicle_id)
   WHERE status IN ('assigned','navigating','arrived','cancellation_requested');
+`;
+
+export const migration009 = `
+-- Repair legacy flat whitelist_entries (plate/owner/slot/...) into import/entries model if needed.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='whitelist_entries' AND column_name='owner'
+  ) AND NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='whitelist_entries' AND column_name='whitelist_id'
+  ) THEN
+    ALTER TABLE whitelist_entries RENAME TO whitelist_entries_legacy_009;
+    CREATE TABLE whitelist_entries (
+      id uuid PRIMARY KEY,
+      whitelist_id uuid NOT NULL REFERENCES whitelist_imports(id) ON DELETE CASCADE,
+      plate text NOT NULL,
+      owner_name text NOT NULL DEFAULT '',
+      building text NOT NULL DEFAULT '',
+      category text NOT NULL DEFAULT 'private' CHECK (category IN ('private', 'visitor')),
+      destination_id uuid REFERENCES resident_destinations(id) ON DELETE SET NULL,
+      UNIQUE (whitelist_id, plate)
+    );
+    -- One live import per legacy vehicle that still has vehicle-scoped imports; attach no legacy flat rows yet.
+    -- Legacy flat rows are attached to a temporary global import below.
+  END IF;
+END $$;
+
+ALTER TABLE whitelist_imports ALTER COLUMN vehicle_id DROP NOT NULL;
+
+-- Ensure destination_id exists on modern table.
+ALTER TABLE whitelist_entries ADD COLUMN IF NOT EXISTS destination_id uuid REFERENCES resident_destinations(id) ON DELETE SET NULL;
+
+-- Ensure patrol_tasks.whitelist_id exists for snapshot linkage.
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS whitelist_id uuid REFERENCES whitelist_imports(id);
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS created_by_user_id uuid REFERENCES users(id);
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS finished_at timestamptz;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='patrol_tasks' AND column_name='created_by'
+  ) THEN
+    UPDATE patrol_tasks SET created_by_user_id = COALESCE(created_by_user_id, created_by) WHERE created_by_user_id IS NULL;
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='patrol_tasks' AND column_name='ended_at'
+  ) THEN
+    UPDATE patrol_tasks SET finished_at = COALESCE(finished_at, ended_at) WHERE finished_at IS NULL;
+  END IF;
+END $$;
+
+DROP INDEX IF EXISTS whitelist_imports_one_live_per_vehicle_idx;
+
+-- Merge historical per-vehicle live entries / legacy flat rows into one global live whitelist.
+DO $$
+DECLARE
+  global_id uuid;
+  admin_id uuid;
+BEGIN
+  SELECT id INTO admin_id FROM users WHERE role='admin' ORDER BY created_at LIMIT 1;
+  IF admin_id IS NULL THEN
+    SELECT id INTO admin_id FROM users ORDER BY created_at LIMIT 1;
+  END IF;
+
+  SELECT id INTO global_id FROM whitelist_imports WHERE vehicle_id IS NULL AND is_snapshot=false LIMIT 1;
+  IF global_id IS NULL AND admin_id IS NOT NULL THEN
+    global_id := gen_random_uuid();
+    INSERT INTO whitelist_imports (id, vehicle_id, name, created_by_user_id, is_snapshot)
+    VALUES (global_id, NULL, '小区全局白名单', admin_id, false);
+  END IF;
+
+  IF global_id IS NOT NULL THEN
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_name='whitelist_entries' AND column_name='whitelist_id'
+    ) THEN
+      INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, destination_id)
+      SELECT gen_random_uuid(), global_id, plate, owner_name, building, category, destination_id
+      FROM (
+        SELECT DISTINCT ON (e.plate)
+          e.plate, e.owner_name, e.building, e.category, e.destination_id
+        FROM whitelist_entries e
+        JOIN whitelist_imports i ON i.id = e.whitelist_id
+        WHERE i.is_snapshot=false AND i.vehicle_id IS NOT NULL
+        ORDER BY e.plate, i.created_at DESC, e.id DESC
+      ) AS merged
+      ON CONFLICT (whitelist_id, plate) DO UPDATE SET
+        owner_name=EXCLUDED.owner_name,
+        building=EXCLUDED.building,
+        category=EXCLUDED.category,
+        destination_id=COALESCE(EXCLUDED.destination_id, whitelist_entries.destination_id);
+    END IF;
+
+    IF to_regclass('public.whitelist_entries_legacy_009') IS NOT NULL THEN
+      INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, destination_id)
+      SELECT gen_random_uuid(), global_id, plate,
+             COALESCE(owner, ''),
+             COALESCE(building, ''),
+             CASE WHEN vehicle_type='visitor' THEN 'visitor' ELSE 'private' END,
+             destination_id
+      FROM (
+        SELECT DISTINCT ON (plate) plate, owner, building, vehicle_type, destination_id
+        FROM whitelist_entries_legacy_009
+        ORDER BY plate, created_at DESC, id DESC
+      ) AS legacy
+      ON CONFLICT (whitelist_id, plate) DO UPDATE SET
+        owner_name=EXCLUDED.owner_name,
+        building=EXCLUDED.building,
+        category=EXCLUDED.category,
+        destination_id=COALESCE(EXCLUDED.destination_id, whitelist_entries.destination_id);
+      DROP TABLE whitelist_entries_legacy_009;
+    END IF;
+
+    UPDATE whitelist_imports
+    SET is_snapshot=true
+    WHERE is_snapshot=false AND vehicle_id IS NOT NULL;
+  END IF;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS whitelist_imports_one_live_global_idx
+  ON whitelist_imports ((true))
+  WHERE is_snapshot=false AND vehicle_id IS NULL;
+`;
+
+export const migration010 = `
+ALTER TABLE whitelist_entries ADD COLUMN IF NOT EXISTS parking_spot text NOT NULL DEFAULT '';
+ALTER TABLE whitelist_entries ADD COLUMN IF NOT EXISTS valid_until timestamptz;
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='whitelist_entries' AND column_name='slot'
+  ) THEN
+    EXECUTE 'UPDATE whitelist_entries SET parking_spot = COALESCE(NULLIF(parking_spot, ''''), slot) WHERE parking_spot = ''''';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='whitelist_entries' AND column_name='expires_at'
+  ) THEN
+    EXECUTE 'UPDATE whitelist_entries SET valid_until = COALESCE(valid_until, expires_at) WHERE valid_until IS NULL';
+  END IF;
+END $$;
 `;

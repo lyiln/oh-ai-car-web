@@ -131,6 +131,49 @@ function httpError(message: string, statusCode: number): Error {
   return Object.assign(new Error(message), { statusCode });
 }
 
+function optionalValidUntil(value: unknown): string | null {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value !== 'string') throw httpError('validUntil is invalid', 400);
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const date = new Date(trimmed);
+  if (Number.isNaN(date.getTime())) throw httpError('validUntil is invalid', 400);
+  return date.toISOString();
+}
+
+type WhitelistEntryRow = {
+  id: string;
+  plate: string;
+  owner: string | null;
+  building: string | null;
+  parkingSpot?: string | null;
+  vehicleType: string | null;
+  validUntil?: Date | string | null;
+};
+
+function whitelistEntryDto(row: WhitelistEntryRow) {
+  return {
+    id: row.id,
+    plate: row.plate,
+    owner: row.owner ?? '',
+    building: row.building ?? '',
+    parkingSpot: row.parkingSpot ?? '',
+    vehicleType: row.vehicleType,
+    validUntil: iso(row.validUntil ?? null),
+  };
+}
+
+const WHITELIST_ENTRY_SELECT = `
+  SELECT e.id, e.plate, e.owner_name AS owner, e.building,
+         e.parking_spot AS "parkingSpot", e.category AS "vehicleType",
+         e.valid_until AS "validUntil"
+  FROM whitelist_entries e
+  JOIN whitelist_imports i ON i.id=e.whitelist_id
+`;
+
+const WHITELIST_LIVE_CLAUSE = `i.vehicle_id IS NULL AND i.is_snapshot=false`;
+
+
 function normalizeRing(coordinates: unknown): number[][] {
   if (!Array.isArray(coordinates) || coordinates.length < 3) {
     throw httpError('coordinates must be an array of at least 3 [lng,lat] pairs', 400);
@@ -175,14 +218,25 @@ async function ensureMapMetadata(db: Database): Promise<{ name: string; basemap_
   return { name: 'default', basemap_url: '' };
 }
 
-async function platformWhitelist(client: PoolClient, user: RouteUser, vehicleId: string): Promise<string> {
-  const vehicle = await client.query<{ id: string }>('SELECT id FROM vehicles WHERE id=$1 AND archived=false FOR UPDATE', [vehicleId]);
-  if (!vehicle.rows[0]) throw httpError('Device not found', 404);
-  const existing = await client.query<{ id: string }>('SELECT id FROM whitelist_imports WHERE vehicle_id=$1 AND is_snapshot=false ORDER BY created_at DESC, id DESC LIMIT 1', [vehicleId]);
+async function ensureGlobalWhitelist(client: PoolClient, user: RouteUser): Promise<string> {
+  const existing = await client.query<{ id: string }>(
+    'SELECT id FROM whitelist_imports WHERE vehicle_id IS NULL AND is_snapshot=false ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE',
+  );
   if (existing.rows[0]) return existing.rows[0].id;
   const id = randomUUID();
-  await client.query('INSERT INTO whitelist_imports (id,vehicle_id,name,created_by_user_id) VALUES ($1,$2,$3,$4)', [id, vehicleId, '平台白名单', user.id]);
-  return id;
+  try {
+    await client.query(
+      'INSERT INTO whitelist_imports (id,vehicle_id,name,created_by_user_id,is_snapshot) VALUES ($1,NULL,$2,$3,false)',
+      [id, '小区全局白名单', user.id],
+    );
+    return id;
+  } catch (error) {
+    const raced = await client.query<{ id: string }>(
+      'SELECT id FROM whitelist_imports WHERE vehicle_id IS NULL AND is_snapshot=false ORDER BY created_at DESC, id DESC LIMIT 1',
+    );
+    if (raced.rows[0]) return raced.rows[0].id;
+    throw error;
+  }
 }
 
 const TASK_SELECT = `
@@ -421,8 +475,7 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
       const activeResponse = await client.query("SELECT 1 FROM response_tasks WHERE assigned_vehicle_id=$1 AND status IN ('assigned','navigating','arrived','cancellation_requested')", [deviceId]);
       if (activeResponse.rowCount) throw httpError('Device already has an active doorstep response task', 409);
       const whitelist = await client.query<{ id: string }>(
-        'SELECT id FROM whitelist_imports WHERE vehicle_id=$1 AND is_snapshot=false ORDER BY created_at DESC, id DESC LIMIT 1',
-        [deviceId],
+        'SELECT id FROM whitelist_imports WHERE vehicle_id IS NULL AND is_snapshot=false ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE',
       );
       if (!whitelist.rows[0]) throw httpError('Whitelist is empty; add at least one entry before starting patrol', 409);
       const whitelistHasEntries = await client.query('SELECT 1 FROM whitelist_entries WHERE whitelist_id=$1 LIMIT 1', [whitelist.rows[0].id]);
@@ -431,14 +484,14 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
       const snapshotId = randomUUID();
       const snapshot = await client.query(
         `INSERT INTO whitelist_imports (id, vehicle_id, name, created_by_user_id, is_snapshot)
-         SELECT $1, vehicle_id, name || ' [快照]', $2, true
-         FROM whitelist_imports WHERE id=$3`,
-        [snapshotId, user.id, whitelist.rows[0].id],
+         SELECT $1, $2, name || ' [快照]', $3, true
+         FROM whitelist_imports WHERE id=$4`,
+        [snapshotId, deviceId, user.id, whitelist.rows[0].id],
       );
       if (!snapshot.rowCount) throw httpError('Whitelist changed while starting patrol; retry the request', 409);
       await client.query(
-        `INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category)
-         SELECT gen_random_uuid(), $1, plate, owner_name, building, category
+        `INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, parking_spot, valid_until)
+         SELECT gen_random_uuid(), $1, plate, owner_name, building, category, parking_spot, valid_until
          FROM whitelist_entries WHERE whitelist_id=$2`,
         [snapshotId, whitelist.rows[0].id],
       );
@@ -888,9 +941,16 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     const result = await db.query(
       `SELECT v.id, v.plate, v.violation_type AS type, v.waypoint, v.priority, v.disposition AS status,
               v.evidence_url AS "evidenceUrl", v.occurred_at AS "occurredAt",
-              v.task_id AS "taskId", v.vehicle_id AS "deviceId", z.name AS "zoneName"
+              v.task_id AS "taskId", v.vehicle_id AS "deviceId", z.name AS "zoneName",
+              po.longitude, po.latitude
        FROM violations v
        LEFT JOIN map_zones z ON z.id = v.zone_id
+       LEFT JOIN response_tasks rt ON rt.violation_id = v.id
+       LEFT JOIN plate_observations po ON po.id = COALESCE(rt.observation_id, (
+         SELECT po2.id FROM plate_observations po2
+         WHERE po2.task_id = v.task_id AND (v.plate IS NULL OR po2.plate = v.plate)
+         ORDER BY po2.occurred_at DESC LIMIT 1
+       ))
        ${where}
        ORDER BY v.occurred_at DESC
        LIMIT 200`,
@@ -906,9 +966,15 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
       `SELECT v.id, v.plate, v.violation_type AS type, v.waypoint, v.priority, v.disposition AS status,
               v.evidence_url AS "evidenceUrl", v.occurred_at AS "occurredAt",
               v.task_id AS "taskId", v.vehicle_id AS "deviceId", v.event_id AS "eventId",
-              z.name AS "zoneName"
+              z.name AS "zoneName", po.longitude, po.latitude
        FROM violations v
        LEFT JOIN map_zones z ON z.id = v.zone_id
+       LEFT JOIN response_tasks rt ON rt.violation_id = v.id
+       LEFT JOIN plate_observations po ON po.id = COALESCE(rt.observation_id, (
+         SELECT po2.id FROM plate_observations po2
+         WHERE po2.task_id = v.task_id AND (v.plate IS NULL OR po2.plate = v.plate)
+         ORDER BY po2.occurred_at DESC LIMIT 1
+       ))
        WHERE (v.id=$1 OR v.event_id=$1)
          AND ($2::uuid IS NULL OR EXISTS (SELECT 1 FROM vehicle_members vm WHERE vm.vehicle_id=v.vehicle_id AND vm.user_id=$2))
        LIMIT 1`,
@@ -965,6 +1031,15 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
         `UPDATE patrol_events SET review_status=$1, plate=COALESCE($2, plate) WHERE id=$3`,
         [reviewStatus, plate, eventId],
       );
+      if (resolution === 'whitelist' && plate) {
+        const whitelistId = await ensureGlobalWhitelist(client, user);
+        await client.query(
+          `INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category)
+           VALUES ($1,$2,$3,$4,$5,'private')
+           ON CONFLICT (whitelist_id, plate) DO NOTHING`,
+          [randomUUID(), whitelistId, plate.toUpperCase(), '', ''],
+        );
+      }
     });
     await audit('review.resolve', 'success', user.id, event.rows[0].vehicle_id, { eventId, resolution, plate });
     return { ok: true as const };
@@ -972,50 +1047,140 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
 
   // --- Whitelist ---
   app.get('/api/whitelist', async (request) => {
-    const user = await requireUser(request);
-    const deviceId = string((request.query as { deviceId?: string }).deviceId, 'deviceId');
-    if (!await canAccessVehicle(user, deviceId)) throw httpError('Vehicle access denied', 403);
-    const result = await db.query(
-      `SELECT e.id, e.plate, e.owner_name AS owner, e.building, ''::text AS "parkingSpot",
-              e.category AS "vehicleType", NULL::timestamptz AS "validUntil", i.created_at AS "createdAt"
-       FROM whitelist_entries e JOIN whitelist_imports i ON i.id=e.whitelist_id
-       WHERE i.vehicle_id=$1 AND i.is_snapshot=false ORDER BY e.plate`,
-      [deviceId],
+    await requireUser(request);
+    const q = typeof (request.query as { q?: string }).q === 'string'
+      ? (request.query as { q: string }).q.trim()
+      : '';
+    const values: unknown[] = [];
+    let where = `WHERE ${WHITELIST_LIVE_CLAUSE}`;
+    if (q) {
+      values.push(`%${q}%`);
+      where += ` AND (
+        e.plate ILIKE $1 OR e.owner_name ILIKE $1 OR e.building ILIKE $1 OR e.parking_spot ILIKE $1
+      )`;
+    }
+    const result = await db.query<WhitelistEntryRow>(
+      `${WHITELIST_ENTRY_SELECT} ${where} ORDER BY e.plate`,
+      values,
     );
-    return { entries: result.rows };
+    return { entries: result.rows.map(whitelistEntryDto) };
+  });
+
+  app.get('/api/whitelist/:id', async (request) => {
+    await requireUser(request);
+    const id = (request.params as { id: string }).id;
+    const result = await db.query<WhitelistEntryRow>(
+      `${WHITELIST_ENTRY_SELECT} WHERE ${WHITELIST_LIVE_CLAUSE} AND e.id=$1 LIMIT 1`,
+      [id],
+    );
+    if (!result.rows[0]) throw httpError('Whitelist entry not found', 404);
+    return { entry: whitelistEntryDto(result.rows[0]) };
   });
 
   app.post('/api/whitelist', async (request) => {
     const admin = await requireAdmin(request);
     const body = object(request.body);
-    const deviceId = string(body?.deviceId, 'deviceId');
     const plate = string(body?.plate, 'plate').toUpperCase();
     const owner = optionalString(body?.owner);
     const building = optionalString(body?.building);
+    const parkingSpot = optionalString(body?.parkingSpot ?? body?.slot);
     const vehicleTypeRaw = optionalString(body?.vehicleType, 'private');
     if (vehicleTypeRaw !== 'private' && vehicleTypeRaw !== 'visitor') throw httpError('vehicleType is invalid', 400);
     const vehicleType = vehicleTypeRaw;
+    const validUntil = optionalValidUntil(body?.validUntil ?? body?.expiresAt);
     const id = randomUUID();
     await db.transaction(async (client) => {
-      const whitelistId = await platformWhitelist(client, admin, deviceId);
+      const whitelistId = await ensureGlobalWhitelist(client, admin);
       await client.query(
-        `INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
-        [id, whitelistId, plate, owner, building, vehicleType],
+        `INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, parking_spot, valid_until)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (whitelist_id, plate) DO UPDATE SET
+           owner_name=EXCLUDED.owner_name, building=EXCLUDED.building, category=EXCLUDED.category,
+           parking_spot=EXCLUDED.parking_spot, valid_until=EXCLUDED.valid_until`,
+        [id, whitelistId, plate, owner, building, vehicleType, parkingSpot, validUntil],
       );
     });
-    await audit('whitelist.create', 'success', admin.id, deviceId, { plate });
+    await audit('whitelist.create', 'success', admin.id, undefined, { plate });
     return {
-      entry: {
-        id, plate, owner, building, parkingSpot: '', vehicleType, validUntil: null,
-      },
+      entry: whitelistEntryDto({ id, plate, owner, building, parkingSpot, vehicleType, validUntil }),
     };
+  });
+
+  app.put('/api/whitelist/:id', async (request) => {
+    const admin = await requireAdmin(request);
+    const id = (request.params as { id: string }).id;
+    const body = object(request.body);
+    const existing = await db.query<{ id: string; whitelist_id: string }>(
+      `SELECT e.id, e.whitelist_id
+       FROM whitelist_entries e JOIN whitelist_imports i ON i.id=e.whitelist_id
+       WHERE e.id=$1 AND ${WHITELIST_LIVE_CLAUSE} LIMIT 1`,
+      [id],
+    );
+    if (!existing.rows[0]) throw httpError('Whitelist entry not found', 404);
+
+    const plate = body?.plate !== undefined ? string(body.plate, 'plate').toUpperCase() : null;
+    const owner = body?.owner !== undefined ? optionalString(body.owner) : null;
+    const building = body?.building !== undefined ? optionalString(body.building) : null;
+    const parkingSpot = body?.parkingSpot !== undefined || body?.slot !== undefined
+      ? optionalString(body?.parkingSpot ?? body?.slot)
+      : null;
+    const vehicleTypeRaw = body?.vehicleType !== undefined ? optionalString(body.vehicleType, 'private') : null;
+    if (vehicleTypeRaw !== null && vehicleTypeRaw !== 'private' && vehicleTypeRaw !== 'visitor') {
+      throw httpError('vehicleType is invalid', 400);
+    }
+    const validUntil = body?.validUntil !== undefined || body?.expiresAt !== undefined
+      ? optionalValidUntil(body?.validUntil ?? body?.expiresAt)
+      : undefined;
+
+    try {
+      const result = await db.query<WhitelistEntryRow>(
+        `UPDATE whitelist_entries SET
+           plate=COALESCE($1, plate),
+           owner_name=COALESCE($2, owner_name),
+           building=COALESCE($3, building),
+           category=COALESCE($4, category),
+           parking_spot=COALESCE($5, parking_spot),
+           valid_until=CASE WHEN $6::boolean THEN $7::timestamptz ELSE valid_until END
+         WHERE id=$8
+         RETURNING id, plate, owner_name AS owner, building, parking_spot AS "parkingSpot",
+                   category AS "vehicleType", valid_until AS "validUntil"`,
+        [
+          plate,
+          owner,
+          building,
+          vehicleTypeRaw,
+          parkingSpot,
+          validUntil !== undefined,
+          validUntil ?? null,
+          id,
+        ],
+      );
+      await audit('whitelist.update', 'success', admin.id, undefined, { entryId: id, plate: result.rows[0].plate });
+      return { entry: whitelistEntryDto(result.rows[0]) };
+    } catch (error) {
+      if ((error as { code?: string }).code === '23505') throw httpError('Plate already exists in whitelist', 409);
+      throw error;
+    }
+  });
+
+  app.delete('/api/whitelist/:id', async (request) => {
+    const admin = await requireAdmin(request);
+    const id = (request.params as { id: string }).id;
+    const result = await db.query(
+      `DELETE FROM whitelist_entries e
+       USING whitelist_imports i
+       WHERE e.whitelist_id=i.id AND e.id=$1 AND ${WHITELIST_LIVE_CLAUSE}
+       RETURNING e.id, e.plate`,
+      [id],
+    );
+    if (!result.rows[0]) throw httpError('Whitelist entry not found', 404);
+    await audit('whitelist.delete', 'success', admin.id, undefined, { entryId: id, plate: result.rows[0].plate });
+    return { ok: true as const };
   });
 
   app.post('/api/whitelist/import', async (request) => {
     const admin = await requireAdmin(request);
     const body = object(request.body);
-    const deviceId = string(body?.deviceId, 'deviceId');
     type RowIn = { plate?: string; owner?: string; building?: string; slot?: string; parkingSpot?: string; vehicleType?: string; expiresAt?: string; validUntil?: string };
     let rows: RowIn[] = [];
 
@@ -1042,7 +1207,7 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     let success = 0;
     let failed = 0;
     const errors: Array<{ index: number; plate?: string; error: string }> = [];
-    const validRows: Array<{ plate: string; owner: string; building: string; vehicleType: 'private' | 'visitor' }> = [];
+    const validRows: Array<{ plate: string; owner: string; building: string; parkingSpot: string; vehicleType: 'private' | 'visitor'; validUntil: string | null }> = [];
 
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
@@ -1050,9 +1215,11 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
         const plate = string(row.plate, 'plate').toUpperCase();
         const owner = optionalString(row.owner);
         const building = optionalString(row.building);
+        const parkingSpot = optionalString(row.parkingSpot ?? row.slot);
         const vehicleTypeRaw = optionalString(row.vehicleType, 'private');
         if (vehicleTypeRaw !== 'private' && vehicleTypeRaw !== 'visitor') throw httpError('vehicleType is invalid', 400);
-        validRows.push({ plate, owner, building, vehicleType: vehicleTypeRaw });
+        const validUntil = optionalValidUntil(row.validUntil ?? row.expiresAt);
+        validRows.push({ plate, owner, building, parkingSpot, vehicleType: vehicleTypeRaw, validUntil });
         success++;
       } catch (error) {
         failed++;
@@ -1061,19 +1228,20 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     }
 
     await db.transaction(async (client) => {
-      const whitelistId = await platformWhitelist(client, admin, deviceId);
+      const whitelistId = await ensureGlobalWhitelist(client, admin);
       for (const row of validRows) {
         await client.query(
-          `INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category)
-           VALUES ($1,$2,$3,$4,$5,$6)
+          `INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, parking_spot, valid_until)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
            ON CONFLICT (whitelist_id, plate) DO UPDATE SET
-             owner_name=EXCLUDED.owner_name, building=EXCLUDED.building, category=EXCLUDED.category`,
-          [randomUUID(), whitelistId, row.plate, row.owner, row.building, row.vehicleType],
+             owner_name=EXCLUDED.owner_name, building=EXCLUDED.building, category=EXCLUDED.category,
+             parking_spot=EXCLUDED.parking_spot, valid_until=EXCLUDED.valid_until`,
+          [randomUUID(), whitelistId, row.plate, row.owner, row.building, row.vehicleType, row.parkingSpot, row.validUntil],
         );
       }
     });
 
-    await audit('whitelist.import', 'success', admin.id, deviceId, { success, failed });
+    await audit('whitelist.import', 'success', admin.id, undefined, { success, failed });
     return { imported: success, failed, errors };
   });
 

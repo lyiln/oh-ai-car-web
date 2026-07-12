@@ -149,12 +149,16 @@ export async function createApp(services: AppServices = {}) {
   });
   app.post('/api/auth/request-otp', async (request, reply) => {
     const body = object(request.body); const username = string(body?.username, 'username');
-    const generic = { ok: true as const, message: '若账号已登记将收到验证码', time: String(config.otpExpiryMinutes) };
+    const sent = { ok: true as const, message: '验证码已发送', time: String(config.otpExpiryMinutes) };
     const result = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users WHERE username=$1 AND active=true`, [username]);
     const user = result.rows[0];
-    if (!user || !user.email) {
+    if (!user) {
       await audit('auth.otp.request', 'unknown_user', undefined, undefined, { username });
-      return generic;
+      return reply.status(404).send({ error: '该用户不存在' });
+    }
+    if (!user.email) {
+      await audit('auth.otp.request', 'no_email', user.id, undefined, { username });
+      return reply.status(400).send({ error: '该用户未绑定邮箱' });
     }
     const email = normalizeEmail(user.email);
     const recent = await db.query<{ created_at: Date }>('SELECT created_at FROM auth_otps WHERE email=$1 ORDER BY created_at DESC LIMIT 1', [email]);
@@ -167,10 +171,10 @@ export async function createApp(services: AppServices = {}) {
     await db.query('INSERT INTO auth_otps (id, user_id, email, code_hash, expires_at) VALUES ($1,$2,$3,$4,$5)', [randomUUID(), user.id, email, await argon2.hash(passcode), expiresAt]);
     await audit('auth.otp.request', 'success', user.id, undefined, { username, email });
     if (config.otpExposeForClientDelivery) {
-      return { ...generic, passcode, deliveryEmail: email };
+      return { ...sent, passcode, deliveryEmail: email };
     }
     app.log.warn({ userId: user.id }, 'OTP created but no server-side delivery provider is configured');
-    return generic;
+    return sent;
   });
   app.post('/api/auth/verify-otp', async (request, reply) => {
     const body = object(request.body); const username = string(body?.username, 'username'); const passcode = string(body?.passcode, 'passcode');

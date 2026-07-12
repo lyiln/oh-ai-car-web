@@ -792,6 +792,101 @@ h1, h2, p { margin: 0; } h1 { font-size: 28px; font-weight: 700; } h2 { font-siz
   border-radius: var(--radius-input);
   background: linear-gradient(145deg, #eef1fb, #f8f9fc 55%, #e8ecf7);
 }
+.map-page .global-map-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.7fr) minmax(280px, 0.9fr);
+  gap: 16px;
+  margin-top: 16px;
+  align-items: stretch;
+}
+.global-map {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 560px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card, 12px);
+  background: var(--panel, #fff);
+  overflow: hidden;
+}
+.global-map-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  color: var(--text-muted);
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.global-map-canvas {
+  min-height: 520px;
+  height: 100%;
+  background: linear-gradient(145deg, #eef1fb, #f8f9fc 55%, #e8ecf7);
+}
+.global-map-side {
+  max-height: 620px;
+  overflow: auto;
+}
+.zone-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.zone-list li {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+.zone-list-item {
+  display: grid;
+  justify-items: start;
+  gap: 2px;
+  text-align: left;
+  background: transparent;
+  border: 1px solid var(--border);
+}
+.zone-list-active .zone-list-item {
+  border-color: #3b82f6;
+  background: #eff6ff;
+}
+.map-violation-drawer {
+  position: fixed;
+  right: 24px;
+  top: 96px;
+  width: min(360px, calc(100vw - 48px));
+  z-index: 40;
+  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.18);
+}
+.amap-waypoint-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #2563eb;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.35);
+}
+.amap-violation-dot {
+  min-width: 36px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: #dc2626;
+  color: #fff;
+  font-size: 11px;
+  line-height: 1.4;
+  text-align: center;
+  box-shadow: 0 2px 8px rgba(220, 38, 38, 0.35);
+}
+@media (max-width: 960px) {
+  .map-page .global-map-layout {
+    grid-template-columns: 1fr;
+  }
+  .global-map-canvas {
+    min-height: 360px;
+  }
+}
 .page-tabs { margin-top: 16px; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); }
 .review-grid,
 .report-grid {

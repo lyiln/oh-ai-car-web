@@ -19,7 +19,6 @@ export function LoginPage({ onLogin }: { onLogin: (user: PlatformUser) => void }
   const [passcode, setPasscode] = useState('');
   const [remember, setRemember] = useState(true);
   const [error, setError] = useState('');
-  const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
   const [cooldown, setCooldown] = useState(0);
 
@@ -32,7 +31,6 @@ export function LoginPage({ onLogin }: { onLogin: (user: PlatformUser) => void }
   const switchTab = (next: LoginTab) => {
     setTab(next);
     setError('');
-    setNotice('');
   };
 
   const submitPassword = async (event: React.FormEvent) => {
@@ -52,14 +50,12 @@ export function LoginPage({ onLogin }: { onLogin: (user: PlatformUser) => void }
     try {
       setBusy(true);
       setError('');
-      setNotice('');
       if (!username.trim()) throw new Error('请输入用户名');
       if (!isEmailJsConfigured()) throw new Error('邮件服务未配置');
       const result = await client.requestOtp(username.trim());
       if (result.passcode && result.deliveryEmail) {
         await sendLoginPasscode(result.deliveryEmail, result.passcode, result.time);
       }
-      setNotice(result.message);
       setCooldown(60);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '获取验证码失败');
@@ -156,7 +152,6 @@ export function LoginPage({ onLogin }: { onLogin: (user: PlatformUser) => void }
                   {cooldown > 0 ? `${cooldown}s` : '获取验证码'}
                 </button>
               </div>
-              {notice && <p className="notice login-notice">{notice}</p>}
               {error && <p className="error">{error}</p>}
               <button type="submit" className="login-submit" disabled={busy || passcode.length !== 6}>登 录</button>
             </form>

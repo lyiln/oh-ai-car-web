@@ -24,17 +24,33 @@ async function login(username: string, password: string) {
   const response = await app.inject({ method: 'POST', url: '/api/auth/login', headers: { origin }, payload: { username, password } });
   expect(response.statusCode).toBe(200); return cookie(response);
 }
-async function waitForVehicleLock(vehicleId: string): Promise<void> {
+async function waitForWhitelistLock(whitelistId: string): Promise<void> {
   for (let attempt = 0; attempt < 50; attempt++) {
     try {
-      await db.transaction((client) => client.query('SELECT id FROM vehicles WHERE id=$1 FOR UPDATE NOWAIT', [vehicleId]));
+      await db.transaction((client) => client.query('SELECT id FROM whitelist_imports WHERE id=$1 FOR UPDATE NOWAIT', [whitelistId]));
     } catch (error) {
       if ((error as { code?: string }).code === '55P03') return;
       throw error;
     }
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  throw new Error('Timed out waiting for whitelist import to lock the vehicle');
+  throw new Error('Timed out waiting for global whitelist lock');
+}
+
+async function resetGlobalWhitelist(entries: Array<{ plate: string; owner?: string; building?: string; category?: 'private' | 'visitor' }> = []): Promise<string> {
+  await db.query('UPDATE whitelist_imports SET is_snapshot=true WHERE vehicle_id IS NULL AND is_snapshot=false');
+  const whitelistId = randomUUID();
+  await db.query(
+    'INSERT INTO whitelist_imports (id,vehicle_id,name,created_by_user_id,is_snapshot) VALUES ($1,NULL,$2,$3,false)',
+    [whitelistId, '测试全局白名单', ids.admin],
+  );
+  for (const entry of entries) {
+    await db.query(
+      'INSERT INTO whitelist_entries (id,whitelist_id,plate,owner_name,building,category) VALUES ($1,$2,$3,$4,$5,$6)',
+      [randomUUID(), whitelistId, entry.plate, entry.owner ?? '测试', entry.building ?? '1号楼', entry.category ?? 'private'],
+    );
+  }
+  return whitelistId;
 }
 
 beforeAll(async () => {
@@ -82,24 +98,23 @@ describe('platform API against PostGIS', () => {
     expect(track.statusCode).toBe(200); expect(track.json<{ points: unknown[] }>().points).toHaveLength(1);
   });
 
-  it('supports username OTP login without leaking unregistered accounts', async () => {
+  it('rejects OTP requests for unknown usernames', async () => {
     const unknown = await app.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'nobody' } });
-    expect(unknown.statusCode).toBe(200);
-    expect(unknown.json()).toMatchObject({ ok: true, message: '若账号已登记将收到验证码', time: '5' });
-    expect(unknown.json<{ passcode?: string; deliveryEmail?: string }>().passcode).toBeUndefined();
-    expect(unknown.json<{ deliveryEmail?: string }>().deliveryEmail).toBeUndefined();
+    expect(unknown.statusCode).toBe(404);
+    expect(unknown.json<{ error?: string }>().error).toBe('该用户不存在');
 
     const noEmailId = randomUUID();
     await db.query('INSERT INTO users (id,username,display_name,password_hash,role,email) VALUES ($1,$2,$3,$4,$5,$6)', [
       noEmailId, 'no-email-user', 'no-email-user', await argon2.hash('password'), 'operator', null,
     ]);
     const noEmail = await app.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'no-email-user' } });
-    expect(noEmail.statusCode).toBe(200);
-    expect(noEmail.json<{ passcode?: string }>().passcode).toBeUndefined();
+    expect(noEmail.statusCode).toBe(400);
+    expect(noEmail.json<{ error?: string }>().error).toBe('该用户未绑定邮箱');
 
     const requested = await app.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'operator-a' } });
     expect(requested.statusCode).toBe(200);
-    const body = requested.json<{ passcode?: string; deliveryEmail?: string }>();
+    const body = requested.json<{ passcode?: string; deliveryEmail?: string; message?: string }>();
+    expect(body.message).toBe('验证码已发送');
     expect(body.passcode).toBeUndefined();
     expect(body.deliveryEmail).toBeUndefined();
 
@@ -161,11 +176,9 @@ describe('platform API against PostGIS', () => {
     const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
     await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA] } });
     const routeId = randomUUID();
-    const whitelistId = randomUUID();
     await db.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [routeId, vehicleId, '安全路线', 'v1', 'generated', ids.admin]);
     for (const [ordinal, name] of ['起点', '中点', '终点'].entries()) await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [randomUUID(), routeId, ordinal, name, ordinal, ordinal, 0, 8]);
-    await db.query('INSERT INTO whitelist_imports (id,vehicle_id,name,created_by_user_id) VALUES ($1,$2,$3,$4)', [whitelistId, vehicleId, '安全白名单', ids.admin]);
-    await db.query("INSERT INTO whitelist_entries (id,whitelist_id,plate,owner_name,building,category) VALUES ($1,$2,'A12345','测试','1号楼','private')", [randomUUID(), whitelistId]);
+    await resetGlobalWhitelist([{ plate: 'A12345', owner: '测试', building: '1号楼' }]);
 
     const lease = await app.inject({ method: 'POST', url: `/api/vehicles/${vehicleId}/control-lease`, headers: { origin, cookie: operatorCookie } });
     expect(lease.statusCode).toBe(200);
@@ -192,13 +205,13 @@ describe('platform API against PostGIS', () => {
     const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-OBS', name: '观测巡检车', host: '192.168.1.23', tcpPort: 6000, videoPort: 6500 } });
     const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
     await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA] } });
-    const routeId = randomUUID(); const waypointId = randomUUID(); const whitelistId = randomUUID();
+    const routeId = randomUUID(); const waypointId = randomUUID();
     await db.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [routeId, vehicleId, '观测路线', 'v1', 'generated', ids.admin]);
     await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds,no_parking_roi) VALUES ($1,$2,0,$3,0,0,0,8,$4)', [waypointId, routeId, '识别点', JSON.stringify([0.1, 0.1, 0.5, 0.5])]);
     for (const ordinal of [1, 2]) await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,$3,$4,0,0,0,8)', [randomUUID(), routeId, ordinal, `点${ordinal}`]);
-    await db.query('INSERT INTO whitelist_imports (id,vehicle_id,name,created_by_user_id) VALUES ($1,$2,$3,$4)', [whitelistId, vehicleId, '观测白名单', ids.admin]);
+    await resetGlobalWhitelist([]);
     expect((await app.inject({ method: 'POST', url: '/api/patrol/start', headers: { origin, cookie: operatorCookie }, payload: { deviceId: vehicleId, routeId, shift: 'morning' } })).statusCode).toBe(409);
-    await db.query("INSERT INTO whitelist_entries (id,whitelist_id,plate,owner_name,building,category) VALUES ($1,$2,'A12345','测试','1号楼','private')", [randomUUID(), whitelistId]);
+    await resetGlobalWhitelist([{ plate: 'A12345', owner: '测试', building: '1号楼' }]);
     const started = await app.inject({ method: 'POST', url: '/api/patrol/start', headers: { origin, cookie: operatorCookie }, payload: { deviceId: vehicleId, routeId, shift: 'morning' } });
     expect(started.statusCode).toBe(200);
     const taskId = started.json<{ task: { id: string } }>().task.id;
@@ -228,9 +241,7 @@ describe('platform API against PostGIS', () => {
     await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,0,$3,0,0,0,8)', [waypointId, routeId, '审核点']);
     for (const ordinal of [1, 2]) await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,$3,$4,0,0,0,8)', [randomUUID(), routeId, ordinal, `点${ordinal}`]);
     // Seed live whitelist, start patrol (creates immutable snapshot)
-    const whitelistId = randomUUID();
-    await db.query('INSERT INTO whitelist_imports (id,vehicle_id,name,created_by_user_id) VALUES ($1,$2,$3,$4)', [whitelistId, vehicleId, '审核白名单', ids.admin]);
-    await db.query("INSERT INTO whitelist_entries (id,whitelist_id,plate,owner_name,building,category) VALUES ($1,$2,'X99999','测试','3号楼','private')", [randomUUID(), whitelistId]);
+    await resetGlobalWhitelist([{ plate: 'X99999', owner: '测试', building: '3号楼' }]);
     const started = await app.inject({ method: 'POST', url: '/api/patrol/start', headers: { origin, cookie: operatorCookie }, payload: { deviceId: vehicleId, routeId, shift: 'morning' } });
     expect(started.statusCode).toBe(200);
     const taskId = started.json<{ task: { id: string } }>().task.id;
@@ -238,7 +249,7 @@ describe('platform API against PostGIS', () => {
     const token = credential.json<{ credential: { token: string } }>().credential.token;
     await app.inject({ method: 'GET', url: '/device/v1/patrol/tasks/next', headers: { authorization: `Bearer ${token}` } });
     // Mutate live whitelist after task start — snapshot must stay isolated
-    await app.inject({ method: 'POST', url: '/api/whitelist/import', headers: { origin, cookie: adminCookie }, payload: { deviceId: vehicleId, rows: [{ plate: 'X99999', owner: '篡改', building: '99号楼', vehicleType: 'visitor' }] } });
+    await app.inject({ method: 'POST', url: '/api/whitelist/import', headers: { origin, cookie: adminCookie }, payload: { rows: [{ plate: 'X99999', owner: '篡改', building: '99号楼', vehicleType: 'visitor' }] } });
     // Low-confidence observation → pending_review → must create patrol_event + review
     const lowConf = await app.inject({ method: 'POST', url: `/device/v1/patrol/tasks/${taskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { type: 'observation', waypointId, occurredAt: '2026-07-11T03:00:00.000Z', plate: 'B99998', confidence: 0.5 } });
     expect(lowConf.statusCode).toBe(200);
@@ -267,12 +278,11 @@ describe('platform API against PostGIS', () => {
     await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA] } });
     const destination = await app.inject({ method: 'POST', url: '/api/resident-destinations', headers: { origin, cookie: adminCookie }, payload: { vehicleId, building: '1号楼', displayName: '1号楼一层门口', mapVersion: 'v-door', x: 4, y: 5, yaw: 0 } });
     expect(destination.statusCode).toBe(200);
-    const routeId = randomUUID(); const waypointId = randomUUID(); const whitelistId = randomUUID();
+    const routeId = randomUUID(); const waypointId = randomUUID();
     await db.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [routeId, vehicleId, '上门路线', 'v-door', 'generated', ids.admin]);
     await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds,no_parking_roi) VALUES ($1,$2,0,$3,0,0,0,8,$4)', [waypointId, routeId, '东门禁停点', JSON.stringify([0.1, 0.1, 0.5, 0.5])]);
     for (const ordinal of [1, 2]) await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,$3,$4,0,0,0,8)', [randomUUID(), routeId, ordinal, `点${ordinal}`]);
-    await db.query('INSERT INTO whitelist_imports (id,vehicle_id,name,created_by_user_id) VALUES ($1,$2,$3,$4)', [whitelistId, vehicleId, '上门白名单', ids.admin]);
-    await db.query("INSERT INTO whitelist_entries (id,whitelist_id,plate,owner_name,building,category) VALUES ($1,$2,'D12345','住户甲','1号楼','private')", [randomUUID(), whitelistId]);
+    await resetGlobalWhitelist([{ plate: 'D12345', owner: '住户甲', building: '1号楼' }]);
     const started = await app.inject({ method: 'POST', url: '/api/patrol/start', headers: { origin, cookie: operatorCookie }, payload: { deviceId: vehicleId, routeId, shift: 'morning' } });
     const patrolTaskId = started.json<{ task: { id: string } }>().task.id;
     const credential = await app.inject({ method: 'POST', url: `/api/vehicles/${vehicleId}/device-credentials`, headers: { origin, cookie: adminCookie } });
@@ -321,15 +331,13 @@ describe('platform API against PostGIS', () => {
     expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${cancelTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'cancelled-failure', type: 'failed' } })).statusCode).toBe(409);
   });
 
-  it('scopes operational records and whitelist changes to the authorised vehicle', async () => {
+  it('allows admin to manage global whitelist while operators can only read', async () => {
     const adminCookie = await login('admin', 'new-password');
     const operatorACookie = await login('operator-a', 'password');
-    const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-PRIVATE', name: '私有巡检车', host: '192.168.1.24', tcpPort: 6000, videoPort: 6500 } });
-    const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
-    await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorB] } });
-    expect((await app.inject({ method: 'POST', url: '/api/whitelist', headers: { origin, cookie: adminCookie }, payload: { deviceId: vehicleId, plate: 'B12345', vehicleType: 'commercial' } })).statusCode).toBe(400);
-    expect((await app.inject({ method: 'POST', url: '/api/whitelist', headers: { origin, cookie: adminCookie }, payload: { deviceId: vehicleId, plate: 'B12345', owner: '乙', building: '2号楼', vehicleType: 'visitor' } })).statusCode).toBe(200);
-    expect((await app.inject({ method: 'GET', url: `/api/whitelist?deviceId=${vehicleId}`, headers: { origin, cookie: operatorACookie } })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'POST', url: '/api/whitelist', headers: { origin, cookie: adminCookie }, payload: { plate: 'B12345', vehicleType: 'commercial' } })).statusCode).toBe(400);
+    expect((await app.inject({ method: 'POST', url: '/api/whitelist', headers: { origin, cookie: adminCookie }, payload: { plate: 'B12345', owner: '乙', building: '2号楼', vehicleType: 'visitor' } })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'POST', url: '/api/whitelist', headers: { origin, cookie: operatorACookie }, payload: { plate: 'B99999', owner: '丙', building: '3号楼', vehicleType: 'private' } })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'GET', url: '/api/whitelist', headers: { origin, cookie: operatorACookie } })).statusCode).toBe(200);
   });
 
   it('serializes a blocked whitelist import with patrol snapshot creation', async () => {
@@ -341,9 +349,7 @@ describe('platform API against PostGIS', () => {
     const routeId = randomUUID();
     await db.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [routeId, vehicleId, '锁测试路线', 'v1', 'generated', ids.admin]);
     for (const ordinal of [0, 1, 2]) await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,$3,$4,0,0,0,8)', [randomUUID(), routeId, ordinal, `点${ordinal}`]);
-    const whitelistId = randomUUID();
-    await db.query('INSERT INTO whitelist_imports (id,vehicle_id,name,created_by_user_id) VALUES ($1,$2,$3,$4)', [whitelistId, vehicleId, '锁测试白名单', ids.admin]);
-    await db.query("INSERT INTO whitelist_entries (id,whitelist_id,plate,owner_name,building,category) VALUES ($1,$2,'B10001','旧业主','1号楼','private')", [randomUUID(), whitelistId]);
+    const whitelistId = await resetGlobalWhitelist([{ plate: 'B10001', owner: '旧业主', building: '1号楼' }]);
 
     const blocker = await db.pool.connect();
     let blockerTransactionOpen = false;
@@ -356,14 +362,13 @@ describe('platform API against PostGIS', () => {
         url: '/api/whitelist/import',
         headers: { origin, cookie: adminCookie },
         payload: {
-          deviceId: vehicleId,
           rows: [
             { plate: 'N10001', owner: '新业主', building: '2号楼', vehicleType: 'private' },
             { plate: 'B10001', owner: '更新业主', building: '3号楼', vehicleType: 'visitor' },
           ],
         },
       });
-      await waitForVehicleLock(vehicleId);
+      await waitForWhitelistLock(whitelistId);
 
       const starting = app.inject({ method: 'POST', url: '/api/patrol/start', headers: { origin, cookie: operatorCookie }, payload: { deviceId: vehicleId, routeId, shift: 'morning' } });
       await blocker.query('COMMIT');
@@ -391,16 +396,89 @@ describe('platform API against PostGIS', () => {
     }
   });
 
-  it('keeps one live whitelist when two first writes race for the same vehicle', async () => {
+  it('keeps one live global whitelist when two first writes race', async () => {
     const adminCookie = await login('admin', 'new-password');
-    const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-WL-UNIQUE', name: '白名单唯一性测试车', host: '192.168.1.27', tcpPort: 6000, videoPort: 6500 } });
-    const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
+    await db.query('UPDATE whitelist_imports SET is_snapshot=true WHERE vehicle_id IS NULL AND is_snapshot=false');
     const writes = await Promise.all([
-      app.inject({ method: 'POST', url: '/api/whitelist', headers: { origin, cookie: adminCookie }, payload: { deviceId: vehicleId, plate: 'C10001', owner: '甲', building: '1号楼', vehicleType: 'private' } }),
-      app.inject({ method: 'POST', url: '/api/whitelist', headers: { origin, cookie: adminCookie }, payload: { deviceId: vehicleId, plate: 'C10002', owner: '乙', building: '2号楼', vehicleType: 'visitor' } }),
+      app.inject({ method: 'POST', url: '/api/whitelist', headers: { origin, cookie: adminCookie }, payload: { plate: 'C10001', owner: '甲', building: '1号楼', vehicleType: 'private' } }),
+      app.inject({ method: 'POST', url: '/api/whitelist', headers: { origin, cookie: adminCookie }, payload: { plate: 'C10002', owner: '乙', building: '2号楼', vehicleType: 'visitor' } }),
     ]);
     expect(writes.map((response) => response.statusCode)).toEqual([200, 200]);
-    const live = await db.query<{ c: number }>('SELECT count(*)::int AS c FROM whitelist_imports WHERE vehicle_id=$1 AND is_snapshot=false', [vehicleId]);
+    const live = await db.query<{ c: number }>('SELECT count(*)::int AS c FROM whitelist_imports WHERE vehicle_id IS NULL AND is_snapshot=false');
     expect(live.rows[0].c).toBe(1);
+  });
+
+  it('supports whitelist CRUD fields, fuzzy search, and role checks', async () => {
+    const adminCookie = await login('admin', 'new-password');
+    const operatorCookie = await login('operator-a', 'password');
+    await resetGlobalWhitelist([]);
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/whitelist',
+      headers: { origin, cookie: adminCookie },
+      payload: {
+        plate: '京A·F0236',
+        owner: '苏有鹏',
+        building: '12号楼2单位301',
+        parkingSpot: 'B-12-301',
+        vehicleType: 'private',
+        validUntil: '2027-12-31',
+      },
+    });
+    expect(created.statusCode).toBe(200);
+    const entry = created.json<{ entry: { id: string; plate: string; parkingSpot: string; validUntil: string | null; vehicleType: string } }>().entry;
+    expect(entry).toMatchObject({
+      plate: '京A·F0236',
+      parkingSpot: 'B-12-301',
+      vehicleType: 'private',
+    });
+    expect(entry.validUntil).toContain('2027-12-31');
+
+    const listed = await app.inject({ method: 'GET', url: '/api/whitelist', headers: { origin, cookie: operatorCookie } });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json<{ entries: Array<{ plate: string; parkingSpot: string }> }>().entries).toEqual(
+      expect.arrayContaining([expect.objectContaining({ plate: '京A·F0236', parkingSpot: 'B-12-301' })]),
+    );
+
+    const searched = await app.inject({ method: 'GET', url: `/api/whitelist?q=${encodeURIComponent('苏')}`, headers: { origin, cookie: operatorCookie } });
+    expect(searched.statusCode).toBe(200);
+    expect(searched.json<{ entries: Array<{ owner: string }> }>().entries).toEqual([
+      expect.objectContaining({ owner: '苏有鹏' }),
+    ]);
+
+    const updated = await app.inject({
+      method: 'PUT',
+      url: `/api/whitelist/${entry.id}`,
+      headers: { origin, cookie: adminCookie },
+      payload: { building: '8号楼', parkingSpot: 'A-01' },
+    });
+    expect(updated.statusCode).toBe(200);
+    expect(updated.json<{ entry: { building: string; parkingSpot: string } }>().entry).toMatchObject({
+      building: '8号楼',
+      parkingSpot: 'A-01',
+    });
+
+    expect((await app.inject({
+      method: 'PUT',
+      url: `/api/whitelist/${entry.id}`,
+      headers: { origin, cookie: operatorCookie },
+      payload: { building: 'hack' },
+    })).statusCode).toBe(403);
+
+    expect((await app.inject({
+      method: 'DELETE',
+      url: `/api/whitelist/${entry.id}`,
+      headers: { origin, cookie: operatorCookie },
+    })).statusCode).toBe(403);
+
+    expect((await app.inject({
+      method: 'DELETE',
+      url: `/api/whitelist/${entry.id}`,
+      headers: { origin, cookie: adminCookie },
+    })).statusCode).toBe(200);
+
+    const afterDelete = await app.inject({ method: 'GET', url: '/api/whitelist', headers: { origin, cookie: adminCookie } });
+    expect(afterDelete.json<{ entries: Array<{ id: string }> }>().entries.find((item) => item.id === entry.id)).toBeUndefined();
   });
 });

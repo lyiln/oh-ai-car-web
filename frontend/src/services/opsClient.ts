@@ -55,23 +55,36 @@ export async function resolveReview(
   });
 }
 
-export async function whitelist(deviceId: string): Promise<WhitelistEntry[]> {
-  const result = await apiRequest<{ entries: WhitelistEntry[] }>(`/api/whitelist?deviceId=${encodeURIComponent(deviceId)}`);
+export async function whitelist(q?: string): Promise<WhitelistEntry[]> {
+  const search = q?.trim() ? `?q=${encodeURIComponent(q.trim())}` : '';
+  const result = await apiRequest<{ entries: WhitelistEntry[] }>(`/api/whitelist${search}`);
   return result.entries ?? [];
 }
 
-export async function addWhitelist(deviceId: string, entry: Omit<WhitelistEntry, 'id'> & { id?: string }): Promise<WhitelistEntry> {
+export async function addWhitelist(entry: Omit<WhitelistEntry, 'id'> & { id?: string }): Promise<WhitelistEntry> {
   const result = await apiRequest<{ entry: WhitelistEntry }>('/api/whitelist', {
     method: 'POST',
-    body: JSON.stringify({ ...entry, deviceId }),
+    body: JSON.stringify(entry),
   });
   return result.entry;
 }
 
-export async function importWhitelist(deviceId: string, csv: string): Promise<{ imported: number; failed: number; errors?: string[] }> {
+export async function updateWhitelist(id: string, entry: Partial<Omit<WhitelistEntry, 'id'>>): Promise<WhitelistEntry> {
+  const result = await apiRequest<{ entry: WhitelistEntry }>(`/api/whitelist/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(entry),
+  });
+  return result.entry;
+}
+
+export async function deleteWhitelist(id: string): Promise<{ ok: true }> {
+  return apiRequest<{ ok: true }>(`/api/whitelist/${id}`, { method: 'DELETE' });
+}
+
+export async function importWhitelist(csv: string): Promise<{ imported: number; failed: number; errors?: string[] }> {
   return apiRequest('/api/whitelist/import', {
     method: 'POST',
-    body: JSON.stringify({ deviceId, csv }),
+    body: JSON.stringify({ csv }),
   });
 }
 

@@ -10,12 +10,12 @@ if (existsSync(sharedEnv)) config({ path: sharedEnv });
 if (existsSync(localEnv)) config({ path: localEnv, override: true });
 
 if (!process.env.DATABASE_URL && process.env.DATABASE_HOST && process.env.DATABASE_USER && process.env.DATABASE_NAME) {
-  const password = process.env.NEON_PASSWORD ?? process.env.DATABASE_PASSWORD;
+  const password = (process.env.NEON_PASSWORD ?? process.env.DATABASE_PASSWORD)?.trim();
   if (password) {
-    const host = process.env.DATABASE_HOST;
-    const port = process.env.DATABASE_PORT ?? '5432';
-    const user = encodeURIComponent(process.env.DATABASE_USER);
-    const db = process.env.DATABASE_NAME;
+    const host = process.env.DATABASE_HOST.trim();
+    const port = (process.env.DATABASE_PORT ?? '5432').trim();
+    const user = encodeURIComponent(process.env.DATABASE_USER.trim());
+    const db = process.env.DATABASE_NAME.trim();
     process.env.DATABASE_URL = `postgresql://${user}:${encodeURIComponent(password)}@${host}:${port}/${db}?sslmode=require`;
   }
 }

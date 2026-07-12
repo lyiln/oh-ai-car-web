@@ -26,5 +26,5 @@ const envLines = lines
 envLines.push(`NEON_PASSWORD=${databasePassword}`);
 envLines.push(`BOOTSTRAP_ADMIN_PASSWORD=${adminPassword}`);
 envLines.push(`SESSION_SECRET=${randomBytes(32).toString('hex')}`);
-writeFileSync(outputPath, `${envLines.join('\n')}\n`, 'utf8');
+writeFileSync(outputPath, `${envLines.join('\n')}\n`, { encoding: 'utf8' });
 console.log(`Wrote ${outputPath}`);

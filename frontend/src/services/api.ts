@@ -66,6 +66,8 @@ export interface Violation {
   evidenceUrl?: string | null;
   priority?: 'high' | 'normal' | 'low' | string;
   status?: 'pending' | 'confirmed' | 'false_positive' | 'resolved' | string;
+  longitude?: number | null;
+  latitude?: number | null;
 }
 
 export interface Review {
