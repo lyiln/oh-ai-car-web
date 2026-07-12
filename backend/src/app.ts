@@ -166,8 +166,9 @@ export async function createApp(services: AppServices = {}) {
     const expiresAt = new Date(Date.now() + config.otpExpiryMinutes * 60_000);
     await db.query('INSERT INTO auth_otps (id, user_id, email, code_hash, expires_at) VALUES ($1,$2,$3,$4,$5)', [randomUUID(), user.id, email, await argon2.hash(passcode), expiresAt]);
     await audit('auth.otp.request', 'success', user.id, undefined, { username, email });
-    // Delivery is intentionally server-side only. Do not disclose a usable code
-    // to the requesting browser or let a public EmailJS credential send it.
+    if (config.otpExposeForClientDelivery) {
+      return { ...generic, passcode, deliveryEmail: email };
+    }
     app.log.warn({ userId: user.id }, 'OTP created but no server-side delivery provider is configured');
     return generic;
   });

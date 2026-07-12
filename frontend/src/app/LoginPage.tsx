@@ -1,7 +1,9 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Car, FileText, MapPinned, ScanLine, ShieldCheck } from 'lucide-react';
+import { isEmailJsConfigured, sendLoginPasscode } from '../services/emailService.js';
 import { PlatformClient, type PlatformUser } from '../services/platformClient.js';
 
+type LoginTab = 'password' | 'otp';
 const client = new PlatformClient();
 
 const FEATURES = [
@@ -11,11 +13,27 @@ const FEATURES = [
 ] as const;
 
 export function LoginPage({ onLogin }: { onLogin: (user: PlatformUser) => void }) {
+  const [tab, setTab] = useState<LoginTab>('password');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [passcode, setPasscode] = useState('');
   const [remember, setRemember] = useState(true);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
+  const [cooldown, setCooldown] = useState(0);
+
+  useEffect(() => {
+    if (cooldown <= 0) return;
+    const timer = window.setTimeout(() => setCooldown((value) => value - 1), 1000);
+    return () => window.clearTimeout(timer);
+  }, [cooldown]);
+
+  const switchTab = (next: LoginTab) => {
+    setTab(next);
+    setError('');
+    setNotice('');
+  };
 
   const submitPassword = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -23,6 +41,39 @@ export function LoginPage({ onLogin }: { onLogin: (user: PlatformUser) => void }
       setBusy(true);
       setError('');
       onLogin((await client.login(username, password)).user);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '登录失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const requestCode = async () => {
+    try {
+      setBusy(true);
+      setError('');
+      setNotice('');
+      if (!username.trim()) throw new Error('请输入用户名');
+      if (!isEmailJsConfigured()) throw new Error('邮件服务未配置');
+      const result = await client.requestOtp(username.trim());
+      if (result.passcode && result.deliveryEmail) {
+        await sendLoginPasscode(result.deliveryEmail, result.passcode, result.time);
+      }
+      setNotice(result.message);
+      setCooldown(60);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '获取验证码失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitOtp = async (event: React.FormEvent) => {
+    event.preventDefault();
+    try {
+      setBusy(true);
+      setError('');
+      onLogin((await client.verifyOtp(username.trim(), passcode)).user);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '登录失败');
     } finally {
@@ -65,7 +116,13 @@ export function LoginPage({ onLogin }: { onLogin: (user: PlatformUser) => void }
             <p className="login-subtitle">请使用管理员账号登录系统</p>
           </header>
 
-          <form className="login-form" onSubmit={submitPassword}>
+          <div className="login-tabs" role="tablist" aria-label="登录方式">
+            <button type="button" role="tab" className={tab === 'password' ? 'login-tab-active' : undefined} aria-selected={tab === 'password'} onClick={() => switchTab('password')}>账号登录</button>
+            <button type="button" role="tab" className={tab === 'otp' ? 'login-tab-active' : undefined} aria-selected={tab === 'otp'} onClick={() => switchTab('otp')}>邮箱登录</button>
+          </div>
+
+          {tab === 'password' ? (
+            <form className="login-form" onSubmit={submitPassword}>
               <label>
                 用户名
                 <input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" placeholder="请输入用户名" required />
@@ -83,7 +140,27 @@ export function LoginPage({ onLogin }: { onLogin: (user: PlatformUser) => void }
               </div>
               {error && <p className="error">{error}</p>}
               <button type="submit" className="login-submit" disabled={busy}>登 录</button>
-          </form>
+            </form>
+          ) : (
+            <form className="login-form" onSubmit={submitOtp}>
+              <label>
+                用户名
+                <input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" placeholder="请输入已绑定邮箱的账号" required />
+              </label>
+              <div className="otp-row">
+                <label className="otp-field">
+                  邮箱验证码
+                  <input className="otp-input" value={passcode} onChange={(event) => setPasscode(event.target.value.replace(/\D/g, '').slice(0, 6))} inputMode="numeric" autoComplete="one-time-code" maxLength={6} placeholder="6 位验证码" required />
+                </label>
+                <button type="button" className="login-otp-btn" disabled={busy || cooldown > 0 || !username.trim()} onClick={() => void requestCode()}>
+                  {cooldown > 0 ? `${cooldown}s` : '获取验证码'}
+                </button>
+              </div>
+              {notice && <p className="notice login-notice">{notice}</p>}
+              {error && <p className="error">{error}</p>}
+              <button type="submit" className="login-submit" disabled={busy || passcode.length !== 6}>登 录</button>
+            </form>
+          )}
 
           <p className="login-legal">登录即表示同意《用户协议》和《隐私政策》</p>
           <p className="login-footer">© 2026 巡牌通 · PatrolPlate</p>

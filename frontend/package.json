@@ -10,6 +10,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@emailjs/browser": "^4.4.1",
     "@oh-ai-car-web/shared": "file:../shared",
     "lucide-react": "^0.468.0",
     "react": "^19.1.0",
