@@ -1,9 +1,10 @@
 import { createReadStream, existsSync } from 'node:fs';
-import { createServer, type IncomingMessage, type Server } from 'node:http';
+import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import type { GatewayEnvelope } from '@oh-ai-car-web/shared';
+import { fetchCarVideoSnapshot, SnapshotError } from '../http/video-snapshot.js';
 import { CarTcpClient } from '../tcp/car-tcp-client.js';
 import { CommandError, dispatch, parseCommand, parseConnectionConfig, probeTarget, stopCommand, type ParsedCommand } from './command-dispatcher.js';
 import type { ProbeResult } from '@oh-ai-car-web/shared';
@@ -38,14 +39,7 @@ export class ControlServer {
     this.allowedOrigins = new Set(options.allowedOrigins ?? DEFAULT_ALLOWED_ORIGINS);
     this.leaseVerifier = options.leaseVerifier;
     this.http = createServer((request, response) => {
-      const requested = request.url === '/' ? 'index.html' : request.url?.replace(/^\//, '') ?? 'index.html';
-      const file = path.resolve(staticDir, requested);
-      if (!file.startsWith(path.resolve(staticDir)) || !existsSync(file)) {
-        response.writeHead(404).end('Not found');
-        return;
-      }
-      response.writeHead(200, { 'Content-Type': file.endsWith('.html') ? 'text/html' : file.endsWith('.js') ? 'text/javascript' : 'text/css' });
-      createReadStream(file).pipe(response);
+      void this.handleHttp(request, response, staticDir);
     });
     this.http.on('upgrade', (request, socket, head) => {
       if (request.url !== '/control' || !this.isAllowedOrigin(request)) { this.rejectUpgrade(socket); return; }
@@ -95,6 +89,80 @@ export class ControlServer {
   private isAllowedOrigin(request: IncomingMessage): boolean {
     const origin = request.headers.origin;
     return typeof origin === 'string' && this.allowedOrigins.has(origin);
+  }
+
+  /** Allow same-origin / no-origin for local img tags; require Origin when present. */
+  private isAllowedHttpOrigin(request: IncomingMessage): boolean {
+    const origin = request.headers.origin;
+    if (origin === undefined) return true;
+    return this.allowedOrigins.has(origin);
+  }
+
+  private async handleHttp(request: IncomingMessage, response: ServerResponse, staticDir: string): Promise<void> {
+    const url = new URL(request.url ?? '/', `http://127.0.0.1`);
+    if (url.pathname === '/api/video/snapshot') {
+      await this.handleVideoSnapshot(request, response, url);
+      return;
+    }
+
+    const requested = url.pathname === '/' ? 'index.html' : url.pathname.replace(/^\//, '');
+    const file = path.resolve(staticDir, requested);
+    if (!file.startsWith(path.resolve(staticDir)) || !existsSync(file)) {
+      response.writeHead(404).end('Not found');
+      return;
+    }
+    response.writeHead(200, { 'Content-Type': file.endsWith('.html') ? 'text/html' : file.endsWith('.js') ? 'text/javascript' : 'text/css' });
+    createReadStream(file).pipe(response);
+  }
+
+  private async handleVideoSnapshot(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      response.writeHead(405, { Allow: 'GET, HEAD' }).end('Method not allowed');
+      return;
+    }
+    if (!this.isAllowedHttpOrigin(request)) {
+      response.writeHead(403).end('Forbidden origin');
+      return;
+    }
+
+    const host = url.searchParams.get('host')?.trim() ?? '';
+    const portRaw = url.searchParams.get('port') ?? '6500';
+    const videoPort = Number(portRaw);
+    if (!host || !Number.isInteger(videoPort) || videoPort < 1 || videoPort > 65535) {
+      response.writeHead(400).end('host and port query params are required');
+      return;
+    }
+
+    const target = this.client.currentTarget;
+    if (!this.client.isConnected || !target) {
+      response.writeHead(403).end('TCP not connected; connect the gateway before requesting a video snapshot');
+      return;
+    }
+    if (target.host !== host || target.videoPort !== videoPort) {
+      response.writeHead(403).end('host/port must match the currently connected vehicle video target');
+      return;
+    }
+
+    try {
+      const jpeg = await fetchCarVideoSnapshot({ host, videoPort });
+      response.writeHead(200, {
+        'Content-Type': 'image/jpeg',
+        'Cache-Control': 'no-store',
+        'Content-Length': jpeg.length,
+        'Access-Control-Allow-Origin': request.headers.origin ?? 'http://127.0.0.1:5173',
+      });
+      if (request.method === 'HEAD') {
+        response.end();
+        return;
+      }
+      response.end(jpeg);
+    } catch (error) {
+      if (error instanceof SnapshotError) {
+        response.writeHead(error.statusCode).end(error.message);
+        return;
+      }
+      response.writeHead(502).end(error instanceof Error ? error.message : 'Snapshot failed');
+    }
   }
 
   private rejectUpgrade(socket: import('node:stream').Duplex): void {

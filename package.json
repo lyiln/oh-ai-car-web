@@ -14,6 +14,9 @@
     "dev:backend": "npm run dev --workspace=@oh-ai-car-web/backend",
     "dev:stack": "node scripts/print-dev-stack.mjs",
     "setup:env": "node scripts/setup-env.mjs",
+    "setup:yolo": "python scripts/setup-yolo-plate.py",
+    "dev:plate-api": "python scripts/start-plate-web-api.py",
+    "test:edge-plate": "python edge-agent/tests/test_plate_adapter.py",
     "start": "npm run build && npm run start --workspace=@oh-ai-car-web/gateway"
   }
 }

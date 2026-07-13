@@ -3,6 +3,7 @@ import { Navigate } from 'react-router-dom';
 import type { ProbeResult, StateEnvelope } from '@oh-ai-car-web/shared';
 import { LiveMap } from '../../components/map/LiveMap.js';
 import { VideoPanel } from '../../components/VideoPanel.js';
+import { PlateScanPanel } from '../../components/plate/PlateScanPanel.js';
 import { ButtonControl } from '../../controls/ButtonControl.js';
 import { MediaControls } from '../../controls/MediaControls.js';
 import { RockerControl } from '../../controls/RockerControl.js';
@@ -378,6 +379,7 @@ export function ConsolePage() {
             </div>
           </section>
           <VideoPanel host={host} port={videoPort} />
+          <PlateScanPanel host={host} videoPort={videoPort} disabled={disabled} />
           <MediaControls
             disabled={disabled}
             pending={mediaPending}
