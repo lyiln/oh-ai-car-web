@@ -1,4 +1,4 @@
-import type { HealthResponse, InferResponse } from '../types/plateInference.js';
+import type { HealthResponse, InferResponse, VideoInferResponse } from '../types/plateInference.js';
 
 const PLATE_API_BASE = '/plate-api';
 const GATEWAY_API_BASE = '/gateway-api';
@@ -20,6 +20,17 @@ export function rewriteInferImageUrls(result: InferResponse): InferResponse {
       plateVisualUrl: rewritePlateAssetUrl(result.imageUrls.plateVisualUrl),
       plateCropUrl: rewritePlateAssetUrl(result.imageUrls.plateCropUrl),
     },
+  };
+}
+
+export function rewriteVideoInferResult(result: VideoInferResponse): VideoInferResponse {
+  return {
+    ...result,
+    uploadedVideoUrl: rewritePlateAssetUrl(result.uploadedVideoUrl),
+    matchedFrames: result.matchedFrames.map((frame) => ({
+      ...frame,
+      imageUrls: rewriteInferImageUrls(frame).imageUrls,
+    })),
   };
 }
 
@@ -54,6 +65,28 @@ export async function inferPlateImage(image: Blob, filename = 'frame.jpg'): Prom
     throw new Error(detail || `Plate infer failed (${response.status})`);
   }
   return rewriteInferImageUrls(payload as InferResponse);
+}
+
+export async function inferPlateVideo(
+  video: Blob,
+  filename = 'video.mp4',
+  options?: { sampleFps?: number; maxFrames?: number },
+): Promise<VideoInferResponse> {
+  const formData = new FormData();
+  formData.append('video', video, filename);
+  formData.append('sample_fps', String(options?.sampleFps ?? 1));
+  formData.append('max_frames', String(options?.maxFrames ?? 20));
+
+  const response = await fetch(`${PLATE_API_BASE}/api/infer-video`, {
+    method: 'POST',
+    body: formData,
+  });
+  const payload = (await response.json()) as VideoInferResponse | { detail?: string };
+  if (!response.ok) {
+    const detail = 'detail' in payload ? payload.detail : undefined;
+    throw new Error(detail || `Plate video infer failed (${response.status})`);
+  }
+  return rewriteVideoInferResult(payload as VideoInferResponse);
 }
 
 export function normalizePlateText(value: string | null | undefined): string {

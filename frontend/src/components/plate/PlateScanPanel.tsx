@@ -1,13 +1,22 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   fetchPlateHealth,
   fetchVideoSnapshot,
   inferPlateImage,
+  inferPlateVideo,
   normalizePlateText,
 } from '../../services/plateClient.js';
-import type { HealthResponse, InferResponse, PlateHit } from '../../types/plateInference.js';
+import type {
+  HealthResponse,
+  InferResponse,
+  PlateHit,
+  VideoInferResponse,
+  VideoMatchedFrame,
+} from '../../types/plateInference.js';
 
 const DEFAULT_INTERVAL_SEC = 2;
+const DEFAULT_VIDEO_SAMPLE_FPS = 1;
+const DEFAULT_VIDEO_MAX_FRAMES = 20;
 
 type PlateScanPanelProps = {
   host: string;
@@ -15,10 +24,30 @@ type PlateScanPanelProps = {
   disabled: boolean;
 };
 
+type PlatePanelTab = 'live' | 'image' | 'video' | 'camera';
+
+type CameraHit = PlateHit & {
+  frameNumber: number;
+};
+
+const TAB_LABELS: Record<PlatePanelTab, string> = {
+  live: '实时快照',
+  image: '本地图片',
+  video: '本地视频',
+  camera: '浏览器摄像头',
+};
+
 export function PlateScanPanel({ host, videoPort, disabled }: PlateScanPanelProps) {
   const processingRef = useRef(false);
+  const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
+  const cameraCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
+  const cameraProcessingRef = useRef(false);
+
+  const [tab, setTab] = useState<PlatePanelTab>('live');
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
+
   const [scanning, setScanning] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -27,6 +56,35 @@ export function PlateScanPanel({ host, videoPort, disabled }: PlateScanPanelProp
   const [lastLatencySec, setLastLatencySec] = useState<number | null>(null);
   const [hits, setHits] = useState<PlateHit[]>([]);
   const [framesScanned, setFramesScanned] = useState(0);
+  const [activeLiveHitId, setActiveLiveHitId] = useState<string | null>(null);
+
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
+  const [imageBusy, setImageBusy] = useState(false);
+  const [imageError, setImageError] = useState<string | null>(null);
+  const [imageResult, setImageResult] = useState<InferResponse | null>(null);
+
+  const [videoFile, setVideoFile] = useState<File | null>(null);
+  const [videoLocalUrl, setVideoLocalUrl] = useState<string | null>(null);
+  const [videoBusy, setVideoBusy] = useState(false);
+  const [videoError, setVideoError] = useState<string | null>(null);
+  const [videoResult, setVideoResult] = useState<VideoInferResponse | null>(null);
+  const [videoSampleFps, setVideoSampleFps] = useState(DEFAULT_VIDEO_SAMPLE_FPS);
+  const [videoMaxFrames, setVideoMaxFrames] = useState(DEFAULT_VIDEO_MAX_FRAMES);
+  const [activeVideoFrameKey, setActiveVideoFrameKey] = useState<string | null>(null);
+
+  const [cameraReady, setCameraReady] = useState(false);
+  const [cameraStarting, setCameraStarting] = useState(false);
+  const [cameraScanning, setCameraScanning] = useState(false);
+  const [cameraBusy, setCameraBusy] = useState(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [cameraStatus, setCameraStatus] = useState('摄像头未开启');
+  const [cameraLatest, setCameraLatest] = useState<InferResponse | null>(null);
+  const [cameraFrameUrl, setCameraFrameUrl] = useState<string | null>(null);
+  const [cameraFramesScanned, setCameraFramesScanned] = useState(0);
+  const [cameraLastLatencySec, setCameraLastLatencySec] = useState<number | null>(null);
+  const [cameraHits, setCameraHits] = useState<CameraHit[]>([]);
+  const [activeCameraHitId, setActiveCameraHitId] = useState<string | null>(null);
 
   const refreshHealth = useCallback(async () => {
     try {
@@ -52,8 +110,84 @@ export function PlateScanPanel({ host, videoPort, disabled }: PlateScanPanelProp
   useEffect(() => {
     return () => {
       if (previewUrl) URL.revokeObjectURL(previewUrl);
+      if (imagePreviewUrl) URL.revokeObjectURL(imagePreviewUrl);
+      if (videoLocalUrl) URL.revokeObjectURL(videoLocalUrl);
+      if (cameraFrameUrl) URL.revokeObjectURL(cameraFrameUrl);
+      cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
     };
-  }, [previewUrl]);
+  }, [previewUrl, imagePreviewUrl, videoLocalUrl, cameraFrameUrl]);
+
+  const activeLiveHit = useMemo(
+    () => hits.find((item) => item.id === activeLiveHitId) ?? hits[0] ?? null,
+    [activeLiveHitId, hits],
+  );
+  const activeCameraHit = useMemo(
+    () => cameraHits.find((item) => item.id === activeCameraHitId) ?? cameraHits[0] ?? null,
+    [activeCameraHitId, cameraHits],
+  );
+  const activeVideoFrame = useMemo<VideoMatchedFrame | null>(() => {
+    if (!videoResult?.matchedFrames.length) return null;
+    return (
+      videoResult.matchedFrames.find(
+        (frame) => `${frame.sampleIndex}-${frame.frameIndex}` === activeVideoFrameKey,
+      ) ?? videoResult.matchedFrames[0]
+    );
+  }, [activeVideoFrameKey, videoResult]);
+
+  useEffect(() => {
+    if (!hits.length) {
+      setActiveLiveHitId(null);
+      return;
+    }
+    setActiveLiveHitId((current) => current ?? hits[0].id);
+  }, [hits]);
+
+  useEffect(() => {
+    if (!cameraHits.length) {
+      setActiveCameraHitId(null);
+      return;
+    }
+    setActiveCameraHitId((current) => current ?? cameraHits[0].id);
+  }, [cameraHits]);
+
+  useEffect(() => {
+    if (!videoResult?.matchedFrames.length) {
+      setActiveVideoFrameKey(null);
+      return;
+    }
+    const first = videoResult.matchedFrames[0];
+    setActiveVideoFrameKey(`${first.sampleIndex}-${first.frameIndex}`);
+  }, [videoResult]);
+
+  useEffect(() => {
+    if (!imageFile) {
+      setImagePreviewUrl((previous) => {
+        if (previous) URL.revokeObjectURL(previous);
+        return null;
+      });
+      return;
+    }
+    const next = URL.createObjectURL(imageFile);
+    setImagePreviewUrl((previous) => {
+      if (previous) URL.revokeObjectURL(previous);
+      return next;
+    });
+  }, [imageFile]);
+
+  useEffect(() => {
+    if (!videoFile) {
+      setVideoLocalUrl((previous) => {
+        if (previous) URL.revokeObjectURL(previous);
+        return null;
+      });
+      return;
+    }
+    const next = URL.createObjectURL(videoFile);
+    setVideoLocalUrl((previous) => {
+      if (previous) URL.revokeObjectURL(previous);
+      return next;
+    });
+  }, [videoFile]);
 
   const runOnce = useCallback(async () => {
     if (disabled || processingRef.current) return;
@@ -77,7 +211,7 @@ export function PlateScanPanel({ host, videoPort, disabled }: PlateScanPanelProp
           id: crypto.randomUUID(),
           capturedAt: new Date().toISOString(),
         };
-        setHits((prev) => [hit, ...prev].slice(0, 8));
+        setHits((prev) => [hit, ...prev].slice(0, 10));
       }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '识别失败');
@@ -105,9 +239,161 @@ export function PlateScanPanel({ host, videoPort, disabled }: PlateScanPanelProp
     };
   }, [scanning, disabled, runOnce]);
 
-  const plateText = normalizePlateText(latest?.bestPlateResult?.plate_text);
-  const ocrConf = latest?.bestPlateResult?.ocr_confidence;
-  const visualUrl =
+  const handleImageInfer = useCallback(async () => {
+    if (!imageFile) {
+      setImageError('请先选择一张图片。');
+      return;
+    }
+    setImageBusy(true);
+    setImageError(null);
+    try {
+      const result = await inferPlateImage(imageFile, imageFile.name);
+      setImageResult(result);
+    } catch (reason) {
+      setImageError(reason instanceof Error ? reason.message : '图片识别失败');
+    } finally {
+      setImageBusy(false);
+    }
+  }, [imageFile]);
+
+  const handleVideoInfer = useCallback(async () => {
+    if (!videoFile) {
+      setVideoError('请先选择一个视频。');
+      return;
+    }
+    setVideoBusy(true);
+    setVideoError(null);
+    try {
+      const result = await inferPlateVideo(videoFile, videoFile.name, {
+        sampleFps: videoSampleFps,
+        maxFrames: videoMaxFrames,
+      });
+      setVideoResult(result);
+    } catch (reason) {
+      setVideoError(reason instanceof Error ? reason.message : '视频识别失败');
+    } finally {
+      setVideoBusy(false);
+    }
+  }, [videoFile, videoMaxFrames, videoSampleFps]);
+
+  const stopBrowserCamera = useCallback(() => {
+    setCameraScanning(false);
+    cameraProcessingRef.current = false;
+    cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
+    cameraStreamRef.current = null;
+    if (cameraVideoRef.current) {
+      cameraVideoRef.current.srcObject = null;
+    }
+    setCameraReady(false);
+    setCameraStatus('摄像头未开启');
+  }, []);
+
+  const startBrowserCamera = useCallback(async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setCameraError('当前浏览器不支持摄像头采集。');
+      return;
+    }
+    setCameraStarting(true);
+    setCameraError(null);
+    setCameraStatus('正在请求摄像头权限...');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' } },
+        audio: false,
+      });
+      cameraStreamRef.current = stream;
+      if (cameraVideoRef.current) {
+        cameraVideoRef.current.srcObject = stream;
+        await cameraVideoRef.current.play();
+      }
+      setCameraReady(true);
+      setCameraStatus(stream.getVideoTracks()[0]?.label || '摄像头已连接');
+    } catch (reason) {
+      stopBrowserCamera();
+      setCameraError(reason instanceof Error ? reason.message : '无法打开摄像头');
+    } finally {
+      setCameraStarting(false);
+    }
+  }, [stopBrowserCamera]);
+
+  const scanBrowserCameraFrame = useCallback(async () => {
+    if (!cameraVideoRef.current || !cameraCanvasRef.current || cameraProcessingRef.current) {
+      return;
+    }
+    if (cameraVideoRef.current.videoWidth <= 0 || cameraVideoRef.current.videoHeight <= 0) {
+      return;
+    }
+
+    cameraProcessingRef.current = true;
+    setCameraBusy(true);
+    setCameraError(null);
+    const startedAt = performance.now();
+    try {
+      const video = cameraVideoRef.current;
+      const canvas = cameraCanvasRef.current;
+      const nextFrameNumber = cameraFramesScanned + 1;
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const context = canvas.getContext('2d');
+      if (!context) {
+        throw new Error('无法创建摄像头画布上下文。');
+      }
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob((value) => {
+          if (value) {
+            resolve(value);
+            return;
+          }
+          reject(new Error('摄像头帧导出失败。'));
+        }, 'image/jpeg', 0.92);
+      });
+      setCameraFrameUrl((previous) => {
+        if (previous) URL.revokeObjectURL(previous);
+        return URL.createObjectURL(blob);
+      });
+      const result = await inferPlateImage(blob, `camera_${Date.now()}.jpg`);
+      setCameraLatest(result);
+      setCameraFramesScanned(nextFrameNumber);
+      setCameraLastLatencySec((performance.now() - startedAt) / 1000);
+      if (result.carDetected && result.plateDetected) {
+        setCameraHits((previous) => [
+          {
+            ...result,
+            id: crypto.randomUUID(),
+            capturedAt: new Date().toISOString(),
+            frameNumber: nextFrameNumber,
+          },
+          ...previous,
+        ].slice(0, 10));
+      }
+    } catch (reason) {
+      setCameraError(reason instanceof Error ? reason.message : '浏览器摄像头识别失败');
+      setCameraScanning(false);
+    } finally {
+      cameraProcessingRef.current = false;
+      setCameraBusy(false);
+    }
+  }, [cameraFramesScanned]);
+
+  useEffect(() => {
+    if (!cameraReady || !cameraScanning) return;
+    let cancelled = false;
+    let timerId: number | null = null;
+    const loop = async () => {
+      if (cancelled) return;
+      await scanBrowserCameraFrame();
+      if (cancelled) return;
+      timerId = window.setTimeout(loop, DEFAULT_INTERVAL_SEC * 1000);
+    };
+    void loop();
+    return () => {
+      cancelled = true;
+      if (timerId != null) window.clearTimeout(timerId);
+    };
+  }, [cameraReady, cameraScanning, scanBrowserCameraFrame]);
+
+  const liveVisualUrl =
     latest?.imageUrls.primaryCarVisualUrl
     ?? latest?.imageUrls.plateVisualUrl
     ?? latest?.imageUrls.uploadedImageUrl
@@ -116,10 +402,15 @@ export function PlateScanPanel({ host, videoPort, disabled }: PlateScanPanelProp
   return (
     <section className="panel plate-scan-panel">
       <div className="panel-heading">
-        <h3>车牌识别</h3>
-        <span className="muted">
-          {health?.ok ? `YOLO 就绪 (${health.runtimeDevice ?? 'auto'})` : (healthError ?? '检测 YOLO…')}
-        </span>
+        <div>
+          <h2>车牌识别工作台</h2>
+          <p className="muted">
+            {health?.ok ? `YOLO 就绪 (${health.runtimeDevice ?? 'auto'})` : (healthError ?? '检测 YOLO…')}
+          </p>
+        </div>
+        <button type="button" className="secondary" onClick={() => void refreshHealth()}>
+          刷新健康检查
+        </button>
       </div>
 
       {!health?.ok && (
@@ -129,61 +420,410 @@ export function PlateScanPanel({ host, videoPort, disabled }: PlateScanPanelProp
         </p>
       )}
 
-      <div className="plate-scan-actions">
-        <button type="button" disabled={disabled || busy || !health?.ok} onClick={() => void runOnce()}>
-          {busy ? '识别中…' : '识别当前帧'}
-        </button>
-        <button
-          type="button"
-          className={scanning ? 'danger' : 'secondary'}
-          disabled={disabled || !health?.ok}
-          onClick={() => setScanning((value) => !value)}
-        >
-          {scanning ? '停止扫描' : '开始定时扫描'}
-        </button>
-        <button type="button" className="secondary" onClick={() => void refreshHealth()}>
-          刷新健康检查
-        </button>
+      <div className="plate-scan-tabs" role="tablist" aria-label="车牌识别模式">
+        {(Object.keys(TAB_LABELS) as PlatePanelTab[]).map((key) => (
+          <button
+            key={key}
+            type="button"
+            className={tab === key ? 'plate-tab-active' : 'secondary'}
+            onClick={() => setTab(key)}
+          >
+            {TAB_LABELS[key]}
+          </button>
+        ))}
       </div>
 
-      <dl className="plate-scan-metrics">
-        <div><dt>已扫描</dt><dd>{framesScanned}</dd></div>
-        <div><dt>命中</dt><dd>{hits.length}</dd></div>
-        <div><dt>间隔</dt><dd>{DEFAULT_INTERVAL_SEC}s</dd></div>
-        <div><dt>耗时</dt><dd>{lastLatencySec != null ? `${lastLatencySec.toFixed(2)}s` : '—'}</dd></div>
-      </dl>
+      {tab === 'live' && (
+        <div className="plate-tab-section">
+          <div className="plate-scan-actions">
+            <button type="button" disabled={disabled || busy || !health?.ok} onClick={() => void runOnce()}>
+              {busy ? '识别中…' : '识别当前帧'}
+            </button>
+            <button
+              type="button"
+              className={scanning ? 'danger' : 'secondary'}
+              disabled={disabled || !health?.ok}
+              onClick={() => setScanning((value) => !value)}
+            >
+              {scanning ? '停止扫描' : '开始定时扫描'}
+            </button>
+          </div>
 
-      {error && <p className="error-text">{error}</p>}
+          <StatGrid
+            items={[
+              ['已扫描', String(framesScanned)],
+              ['命中', String(hits.length)],
+              ['间隔', `${DEFAULT_INTERVAL_SEC}s`],
+              ['耗时', lastLatencySec != null ? `${lastLatencySec.toFixed(2)}s` : '—'],
+            ]}
+          />
 
-      {latest && (
-        <div className="plate-scan-result">
-          <p>
-            <strong>车牌：</strong>
-            {plateText || '未识别'}
-            {ocrConf != null ? `（OCR ${(ocrConf * 100).toFixed(0)}%）` : ''}
-          </p>
-          <p className="muted">
-            车辆 {latest.carDetected ? '✓' : '✗'} · 车牌框 {latest.plateDetected ? '✓' : '✗'} · {latest.status}
-          </p>
-          {visualUrl && (
-            <img className="plate-scan-preview" src={visualUrl} alt="plate-infer-visual" />
-          )}
+          {error && <p className="error-text">{error}</p>}
+
+          <div className="plate-summary-grid">
+            <article className="plate-visual-card">
+              <h3>当前识别结果</h3>
+              {liveVisualUrl ? (
+                <img className="plate-scan-preview" src={liveVisualUrl} alt="plate-live-visual" />
+              ) : (
+                <EmptyBlock text="点击“识别当前帧”后，这里会显示当前快照与识别结果。" />
+              )}
+              {latest && (
+                <div className="plate-detail-list">
+                  <DetailRow label="车牌文本" value={normalizePlateText(latest.bestPlateResult?.plate_text) || '未识别'} />
+                  <DetailRow label="流程状态" value={latest.status} />
+                  <DetailRow label="车辆门控" value={latest.carDetected ? '已通过' : '未通过'} />
+                  <DetailRow label="OCR 置信度" value={formatRatio(latest.bestPlateResult?.ocr_confidence)} />
+                </div>
+              )}
+            </article>
+
+            <article className="plate-hit-card">
+              <h3>命中帧复核</h3>
+              {hits.length ? (
+                <div className="plate-hit-layout">
+                  <div className="plate-hit-list">
+                    {hits.map((hit) => (
+                      <button
+                        key={hit.id}
+                        type="button"
+                        className={activeLiveHit?.id === hit.id ? 'plate-hit-item-active' : 'plate-hit-item'}
+                        onClick={() => setActiveLiveHitId(hit.id)}
+                      >
+                        <strong>{normalizePlateText(hit.bestPlateResult?.plate_text) || '未识别'}</strong>
+                        <small>{new Date(hit.capturedAt).toLocaleTimeString()}</small>
+                      </button>
+                    ))}
+                  </div>
+                  <FrameReviewDetail result={activeLiveHit} />
+                </div>
+              ) : (
+                <EmptyBlock text="只有“检测到车辆且识别出有效车牌文本”的结果会进入命中列表。" />
+              )}
+            </article>
+          </div>
         </div>
       )}
 
-      {hits.length > 0 && (
-        <div className="plate-scan-hits">
-          <h4>最近命中</h4>
-          <ul>
-            {hits.map((hit) => (
-              <li key={hit.id}>
-                <span>{normalizePlateText(hit.bestPlateResult?.plate_text) || '—'}</span>
-                <small>{new Date(hit.capturedAt).toLocaleTimeString()}</small>
-              </li>
-            ))}
-          </ul>
+      {tab === 'image' && (
+        <div className="plate-tab-section">
+          <div className="plate-upload-toolbar">
+            <input
+              type="file"
+              accept="image/*"
+              onChange={(event) => {
+                setImageError(null);
+                setImageResult(null);
+                setImageFile(event.target.files?.[0] ?? null);
+              }}
+            />
+            <button type="button" disabled={!health?.ok || imageBusy} onClick={() => void handleImageInfer()}>
+              {imageBusy ? '识别中…' : '识别图片'}
+            </button>
+          </div>
+          {imageError && <p className="error-text">{imageError}</p>}
+          <div className="plate-summary-grid">
+            <article className="plate-visual-card">
+              <h3>原始图片</h3>
+              {imagePreviewUrl ? (
+                <img className="plate-scan-preview" src={imagePreviewUrl} alt="plate-upload-preview" />
+              ) : (
+                <EmptyBlock text="选择图片后，这里会显示原始预览。" />
+              )}
+            </article>
+            <article className="plate-hit-card">
+              <h3>识别结果</h3>
+              {imageResult ? (
+                <FrameReviewDetail result={imageResult} />
+              ) : (
+                <EmptyBlock text="识别完成后，这里会展示主体车可视化、ROI 与车牌裁剪图。" />
+              )}
+            </article>
+          </div>
+        </div>
+      )}
+
+      {tab === 'video' && (
+        <div className="plate-tab-section">
+          <div className="plate-upload-toolbar plate-upload-toolbar-wide">
+            <input
+              type="file"
+              accept="video/*"
+              onChange={(event) => {
+                setVideoError(null);
+                setVideoResult(null);
+                setVideoFile(event.target.files?.[0] ?? null);
+              }}
+            />
+            <label>
+              抽帧 FPS
+              <input
+                type="number"
+                min="0.2"
+                max="5"
+                step="0.2"
+                value={videoSampleFps}
+                onChange={(event) => setVideoSampleFps(Number(event.target.value) || DEFAULT_VIDEO_SAMPLE_FPS)}
+              />
+            </label>
+            <label>
+              最大帧数
+              <input
+                type="number"
+                min="1"
+                max="60"
+                step="1"
+                value={videoMaxFrames}
+                onChange={(event) => setVideoMaxFrames(Number(event.target.value) || DEFAULT_VIDEO_MAX_FRAMES)}
+              />
+            </label>
+            <button type="button" disabled={!health?.ok || videoBusy} onClick={() => void handleVideoInfer()}>
+              {videoBusy ? '扫描中…' : '开始视频扫描'}
+            </button>
+          </div>
+          {videoError && <p className="error-text">{videoError}</p>}
+
+          <div className="plate-summary-grid">
+            <article className="plate-visual-card">
+              <h3>原始视频预览</h3>
+              {videoResult?.uploadedVideoUrl || videoLocalUrl ? (
+                <video
+                  className="plate-scan-video"
+                  src={videoResult?.uploadedVideoUrl ?? videoLocalUrl ?? undefined}
+                  controls
+                  preload="metadata"
+                />
+              ) : (
+                <EmptyBlock text="选择视频后，这里会显示原始视频预览。" />
+              )}
+              {videoResult && (
+                <>
+                  <StatGrid
+                    items={[
+                      ['原始帧', String(videoResult.sampling.frameCount)],
+                      ['抽样帧', String(videoResult.sampling.sampledFrameCount)],
+                      ['命中帧', String(videoResult.matchedFrameCount)],
+                      ['总耗时', `${videoResult.aggregateTimings.totalPipelineSec.toFixed(2)}s`],
+                    ]}
+                  />
+                  <div className="plate-detail-list">
+                    <DetailRow label="视频摘要" value={videoResult.summary} />
+                    <DetailRow label="采样 FPS" value={videoResult.sampling.sampleFps.toFixed(2)} />
+                    <DetailRow label="帧步长" value={String(videoResult.sampling.frameStride)} />
+                    <DetailRow label="OCR 尝试帧数" value={String(videoResult.frameGateStats?.ocrAttemptFrameCount ?? 0)} />
+                  </div>
+                </>
+              )}
+            </article>
+
+            <article className="plate-hit-card">
+              <h3>命中帧列表与详情</h3>
+              {videoResult?.matchedFrames.length ? (
+                <div className="plate-hit-layout">
+                  <div className="plate-hit-list">
+                    {videoResult.matchedFrames.map((frame) => {
+                      const key = `${frame.sampleIndex}-${frame.frameIndex}`;
+                      return (
+                        <button
+                          key={key}
+                          type="button"
+                          className={activeVideoFrameKey === key ? 'plate-hit-item-active' : 'plate-hit-item'}
+                          onClick={() => setActiveVideoFrameKey(key)}
+                        >
+                          <strong>{normalizePlateText(frame.bestPlateResult?.plate_text) || '未识别'}</strong>
+                          <small>#{frame.sampleIndex} · {frame.timestampSec.toFixed(2)}s</small>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <FrameReviewDetail
+                    result={activeVideoFrame}
+                    meta={[
+                      ['原始帧号', String(activeVideoFrame?.frameIndex ?? '—')],
+                      ['采样序号', String(activeVideoFrame?.sampleIndex ?? '—')],
+                      ['命中时间点', activeVideoFrame ? `${activeVideoFrame.timestampSec.toFixed(2)}s` : '—'],
+                    ]}
+                  />
+                </div>
+              ) : (
+                <EmptyBlock text="视频结果只会保留“车辆存在且识别出有效大陆车牌文本”的命中帧。" />
+              )}
+            </article>
+          </div>
+        </div>
+      )}
+
+      {tab === 'camera' && (
+        <div className="plate-tab-section">
+          <div className="plate-scan-actions">
+            <button type="button" disabled={cameraReady || cameraStarting} onClick={() => void startBrowserCamera()}>
+              {cameraStarting ? '打开中…' : '打开摄像头'}
+            </button>
+            <button
+              type="button"
+              className={cameraScanning ? 'danger' : 'secondary'}
+              disabled={!cameraReady || !health?.ok}
+              onClick={() => setCameraScanning((value) => !value)}
+            >
+              {cameraScanning ? '停止扫描' : '开始实时扫描'}
+            </button>
+            <button type="button" className="secondary" disabled={!cameraReady} onClick={stopBrowserCamera}>
+              关闭摄像头
+            </button>
+          </div>
+
+          <StatGrid
+            items={[
+              ['状态', cameraStatus],
+              ['已扫描', String(cameraFramesScanned)],
+              ['命中', String(cameraHits.length)],
+              ['耗时', cameraLastLatencySec != null ? `${cameraLastLatencySec.toFixed(2)}s` : '—'],
+            ]}
+          />
+
+          {cameraError && <p className="error-text">{cameraError}</p>}
+
+          <div className="plate-summary-grid">
+            <article className="plate-visual-card">
+              <h3>浏览器摄像头画面</h3>
+              <video
+                ref={cameraVideoRef}
+                className={`plate-scan-video ${cameraReady ? '' : 'plate-video-hidden'}`}
+                muted
+                playsInline
+              />
+              {!cameraReady && <EmptyBlock text="打开浏览器摄像头后，系统会定时抓帧并送入 YOLO 流程。" />}
+              <canvas ref={cameraCanvasRef} className="plate-hidden-canvas" />
+              {cameraFrameUrl && (
+                <>
+                  <h4>最近抓帧</h4>
+                  <img className="plate-scan-preview" src={cameraFrameUrl} alt="browser-camera-frame" />
+                </>
+              )}
+            </article>
+
+            <article className="plate-hit-card">
+              <h3>摄像头命中结果</h3>
+              {cameraBusy && <p className="muted">正在处理当前抓帧…</p>}
+              {cameraHits.length ? (
+                <div className="plate-hit-layout">
+                  <div className="plate-hit-list">
+                    {cameraHits.map((hit) => (
+                      <button
+                        key={hit.id}
+                        type="button"
+                        className={activeCameraHit?.id === hit.id ? 'plate-hit-item-active' : 'plate-hit-item'}
+                        onClick={() => setActiveCameraHitId(hit.id)}
+                      >
+                        <strong>{normalizePlateText(hit.bestPlateResult?.plate_text) || '未识别'}</strong>
+                        <small>第 {hit.frameNumber} 帧</small>
+                      </button>
+                    ))}
+                  </div>
+                  <FrameReviewDetail result={activeCameraHit ?? cameraLatest} />
+                </div>
+              ) : (
+                <EmptyBlock text="只有通过车辆门控且输出有效大陆车牌文本的抓帧才会留在这里。" />
+              )}
+            </article>
+          </div>
         </div>
       )}
     </section>
+  );
+}
+
+function StatGrid({ items }: { items: Array<[string, string]> }) {
+  return (
+    <dl className="plate-scan-metrics">
+      {items.map(([label, value]) => (
+        <div key={label}>
+          <dt>{label}</dt>
+          <dd>{value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function DetailRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="plate-detail-row">
+      <dt>{label}</dt>
+      <dd>{value}</dd>
+    </div>
+  );
+}
+
+function EmptyBlock({ text }: { text: string }) {
+  return <div className="plate-empty-block">{text}</div>;
+}
+
+function formatRatio(value: number | null | undefined): string {
+  if (value == null || Number.isNaN(value)) return '—';
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+function FrameReviewDetail({
+  result,
+  meta,
+}: {
+  result: InferResponse | VideoMatchedFrame | PlateHit | CameraHit | null;
+  meta?: Array<[string, string]>;
+}) {
+  if (!result) {
+    return <EmptyBlock text="选择左侧命中项后，这里会展示详情、主体车 ROI 和车牌裁剪图。" />;
+  }
+
+  return (
+    <div className="plate-review-detail">
+      {result.imageUrls.primaryCarVisualUrl || result.imageUrls.uploadedImageUrl ? (
+        <img
+          className="plate-scan-preview"
+          src={result.imageUrls.primaryCarVisualUrl || result.imageUrls.uploadedImageUrl || undefined}
+          alt="plate-hit-detail"
+        />
+      ) : null}
+
+      <div className="plate-detail-list">
+        {meta?.map(([label, value]) => <DetailRow key={label} label={label} value={value} />)}
+        <DetailRow label="车牌文本" value={normalizePlateText(result.bestPlateResult?.plate_text) || '未识别'} />
+        <DetailRow label="OCR 置信度" value={formatRatio(result.bestPlateResult?.ocr_confidence)} />
+        <DetailRow label="主体车置信度" value={formatRatio(result.primaryCar?.confidence)} />
+        <DetailRow label="流程状态" value={result.status} />
+        <DetailRow label="车辆门控" value={result.carDetected ? '已通过' : '未通过'} />
+        <DetailRow
+          label="门控后车牌候选数"
+          value={String(result.stageTimings?.gated_plate_candidate_count ?? 0)}
+        />
+        <DetailRow
+          label="OCR 尝试次数"
+          value={String(result.stageTimings?.ocr_attempt_count ?? 0)}
+        />
+        <DetailRow
+          label="总耗时"
+          value={result.stageTimings?.total_pipeline_sec != null ? `${result.stageTimings.total_pipeline_sec.toFixed(2)}s` : '—'}
+        />
+      </div>
+
+      <div className="plate-image-pair">
+        <figure>
+          <figcaption>主体车 ROI</figcaption>
+          {result.imageUrls.primaryCarCropUrl ? (
+            <img className="plate-small-preview" src={result.imageUrls.primaryCarCropUrl} alt="primary-car-roi" />
+          ) : (
+            <EmptyBlock text="暂无主体车 ROI" />
+          )}
+        </figure>
+        <figure>
+          <figcaption>车牌裁剪图</figcaption>
+          {result.imageUrls.plateCropUrl ? (
+            <img className="plate-small-preview" src={result.imageUrls.plateCropUrl} alt="plate-crop" />
+          ) : (
+            <EmptyBlock text="暂无车牌裁剪图" />
+          )}
+        </figure>
+      </div>
+    </div>
   );
 }

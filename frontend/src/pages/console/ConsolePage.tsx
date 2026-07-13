@@ -354,7 +354,6 @@ export function ConsolePage() {
             </div>
           </section>
           <VideoPanel host={host} port={videoPort} />
-          <PlateScanPanel host={host} videoPort={videoPort} disabled={disabled} />
           <MediaControls
             disabled={disabled}
             pending={mediaPending}
@@ -384,6 +383,9 @@ export function ConsolePage() {
             <p className="muted">松开方向键 / 窗口失焦自动停止（对齐 APP）</p>
           </section>
         </aside>
+      </div>
+      <div className="console-plate-section">
+        <PlateScanPanel host={host} videoPort={videoPort} disabled={disabled} />
       </div>
     </div>
   );
