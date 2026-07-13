@@ -39,7 +39,7 @@ typecheck / unit tests      integration + Compose smoke test
 | --- | --- | --- |
 | 根目录 | npm workspaces，Node.js `>=22` | `npm ci` 使用 `package-lock.json`，并缓存 npm 下载目录 |
 | `shared/` | TypeScript 协议类型和编码器 | 类型检查和 Vitest 单元测试 |
-| `frontend/` | React + Vite Web 前端 | TypeScript/Vite 构建由 `npm run typecheck` 和测试覆盖 |
+| `frontend/` | React + Vite Web 前端 | `npm run build` 运行 TypeScript 编译和 Vite 生产构建；另有单元测试 |
 | `backend/` | TypeScript + Fastify + PostgreSQL/PostGIS | 单元测试；另以 Testcontainers 启动临时 PostGIS 运行集成测试 |
 | `gateway/` | Node.js 本机 WebSocket/TCP 网关 | TypeScript 和 Fake TCP 自动化测试；不连接真实小车 |
 | `edge-agent/` | Python ROS2/遥测/视觉适配代码 | 只运行 mock 模式、无模型依赖的 `unittest`；YOLO 权重/外部仓库相关测试会跳过 |
@@ -62,8 +62,9 @@ typecheck / unit tests      integration + Compose smoke test
 
 1. `npm ci`
 2. `npm run typecheck`：会先构建 shared，再对每个 workspace 执行类型检查。
-3. `npm test`：运行 shared、frontend、backend、gateway 的 Vitest 测试。
-4. `python -m unittest discover -s edge-agent/tests -p 'test_*.py'`：运行 mock 适配器和纯映射测试。
+3. `npm run build`：构建 shared、backend、frontend（Vite）和 gateway。
+4. `npm test`：运行 shared、frontend、backend、gateway 的 Vitest 测试。
+5. `python -m unittest discover -s edge-agent/tests -p 'test_*.py'`：运行 mock 适配器和纯映射测试。
 
 所有写入日志的命令都启用 `pipefail`，因此测试命令失败时不会被 `tee` 掩盖。
 

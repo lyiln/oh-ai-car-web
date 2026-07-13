@@ -70,7 +70,7 @@ beforeAll(async () => {
   await waitForDatabase(firstMigrator);
   await Promise.all([firstMigrator.migrate(), secondMigrator.migrate()]);
   const migrations = await firstMigrator.query<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version');
-  expect(migrations.rows).toHaveLength(10);
+  expect(migrations.rows).toHaveLength(12);
   await secondMigrator.close();
   db = firstMigrator;
   for (const [name, id, role, email] of [

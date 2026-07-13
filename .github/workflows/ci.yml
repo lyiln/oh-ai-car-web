@@ -47,6 +47,13 @@ jobs:
           set -o pipefail
           npm run typecheck | tee typecheck.log
 
+      # Type-checking builds only shared; build every workspace explicitly so
+      # TypeScript emit and the Vite production bundle are verified on each PR.
+      - name: Build all workspaces
+        run: |
+          set -o pipefail
+          npm run build | tee build.log
+
       - name: Run JavaScript unit tests
         run: |
           set -o pipefail
@@ -66,6 +73,7 @@ jobs:
           name: quality-logs-${{ github.run_id }}
           path: |
             typecheck.log
+            build.log
             unit-tests.log
             edge-agent-tests.log
           if-no-files-found: ignore
