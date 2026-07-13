@@ -254,7 +254,7 @@ describe('platform API against PostGIS', () => {
   });
 
   it('accepts Chinese-province plate text from YOLO OCR observations', async () => {
-    const adminCookie = await login('admin', 'new-password');
+    const adminCookie = await login('admin', defaultPassword);
     const operatorCookie = await login('operator-a', 'password');
     const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-CN-PLATE', name: '中文车牌车', host: '192.168.1.26', tcpPort: 6000, videoPort: 6500 } });
     const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
