@@ -213,17 +213,29 @@ async function ensureDefaultRoute(db: Database, vehicleId: string, userId: strin
   const existing = await db.query<{ id: string }>('SELECT id FROM patrol_routes WHERE vehicle_id=$1 ORDER BY created_at LIMIT 1', [vehicleId]);
   if (existing.rows[0]) return existing.rows[0].id;
   const routeId = randomUUID();
+  const routeCode = `route-${routeId.slice(0, 8)}`;
+  try {
+    await db.query(
+      `INSERT INTO patrol_routes (id, vehicle_id, name, code, map_version, source_yaml, created_by_user_id)
+       VALUES ($1,$2,'默认巡检路线',$4,'platform-default','generated for the selected device',$3)`,
+      [routeId, vehicleId, userId, routeCode],
+    );
+  } catch {
+    await db.query(
+      `INSERT INTO patrol_routes (id, vehicle_id, name, map_version, source_yaml, created_by_user_id)
+       VALUES ($1,$2,'默认巡检路线','platform-default','generated for the selected device',$3)`,
+      [routeId, vehicleId, userId],
+    );
+  }
+  const wp1 = randomUUID();
+  const wp2 = randomUUID();
+  const wp3 = randomUUID();
   await db.query(
-    `INSERT INTO patrol_routes (id, vehicle_id, name, map_version, source_yaml, created_by_user_id)
-     VALUES ($1,$2,'默认巡检路线','platform-default','generated for the selected device',$3)`,
-    [routeId, vehicleId, userId],
-  );
-  await db.query(
-    `INSERT INTO patrol_waypoints (id, route_id, ordinal, name, x, y, yaw, dwell_seconds) VALUES
-      ($1,$4,0,'起点',0,0,0,8),
-      ($2,$4,1,'巡检点',1,1,0,8),
-      ($3,$4,2,'终点',2,2,0,8)`,
-    [randomUUID(), randomUUID(), randomUUID(), routeId],
+    `INSERT INTO patrol_waypoints (id, route_id, ordinal, name, x, y, yaw, dwell_seconds, no_parking_roi) VALUES
+      ($1,$4,0,'起点',0,0,0,8,$5::jsonb),
+      ($2,$4,1,'巡检点',1,1,0,8,NULL),
+      ($3,$4,2,'终点',2,2,0,8,NULL)`,
+    [wp1, wp2, wp3, routeId, JSON.stringify([0.1, 0.1, 0.5, 0.5])],
   );
   return routeId;
 }

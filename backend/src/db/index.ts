@@ -1,5 +1,5 @@
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
-import { migration001, migration002, migration003, migration004, migration005, migration006, migration007, migration008, migration009, migration010, migration011 } from './schema.js';
+import { migration001, migration002, migration003, migration004, migration005, migration006, migration007, migration008, migration009, migration010, migration011, migration012 } from './schema.js';
 
 export class Database {
   readonly pool: Pool;
@@ -30,7 +30,8 @@ export class Database {
         { version: '008-doorstep-response-safety', sql: migration008 },
         { version: '009-global-whitelist', sql: migration009 },
         { version: '010-whitelist-entry-fields', sql: migration010 },
-        { version: '011-patrol-rule-snapshots', sql: migration011 },
+        { version: '011-patrol-event-details', sql: migration011 },
+        { version: '012-patrol-rule-snapshots', sql: migration012 },
       ]) {
         await client.query('BEGIN');
         try {

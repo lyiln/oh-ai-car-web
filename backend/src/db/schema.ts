@@ -526,6 +526,13 @@ END $$;
 `;
 
 export const migration011 = `
+ALTER TABLE patrol_events ADD COLUMN IF NOT EXISTS details jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE patrol_events ADD COLUMN IF NOT EXISTS waypoint_id uuid REFERENCES patrol_waypoints(id);
+ALTER TABLE patrol_routes ADD COLUMN IF NOT EXISTS code text;
+UPDATE patrol_routes SET code = 'route-' || substr(id::text, 1, 8) WHERE code IS NULL;
+`;
+
+export const migration012 = `
 ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS review_confidence_threshold double precision NOT NULL DEFAULT 0.75
   CHECK (review_confidence_threshold >= 0 AND review_confidence_threshold <= 1);
 ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS dedupe_window_sec integer NOT NULL DEFAULT 1800

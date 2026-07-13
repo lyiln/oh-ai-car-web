@@ -50,3 +50,4 @@
 - 观测去重保留坐标：`backend/src/app.ts`
 - 违规查询回填：`backend/src/routes/patrol-platform.ts`（`GET /api/violations`）
 - 真实设备的 ROS/GPS 运行时恢复：按 `NEXT_SESSION.md` 的阶段 1.5 门禁单独审批
+- Jetson GPS 遥测部署：`docs/deployment/jetson-gps-setup.md`

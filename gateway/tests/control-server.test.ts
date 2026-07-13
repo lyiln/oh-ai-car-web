@@ -208,7 +208,6 @@ describe('localhost control gateway', () => {
       payload: { host: '127.0.0.1', tcpPort: fake.port, videoPort: 6500, vehicleId: 'vehicle-1' },
     });
     expect(missingLease).toMatchObject({ type: 'error', code: 'PLATFORM_AUTH_REQUIRED' });
-
     const refused = await request(ws, {
       type: 'command',
       requestId: 'probe-refused',
@@ -223,7 +222,6 @@ describe('localhost control gateway', () => {
       payload: { host: '127.0.0.1', tcpPort: 1, videoPort: 6500, vehicleId: 'vehicle-1', leaseToken: 'lease-token' },
     });
     expect(mismatched).toMatchObject({ type: 'error', code: 'PLATFORM_AUTH_REQUIRED' });
-
     ws.close();
     await fake.close();
   });
@@ -253,5 +251,70 @@ describe('localhost control gateway', () => {
 
     ws.close();
     await fake.close();
+  });
+  it('rejects video snapshot when TCP is not connected', async () => {
+    const server = new ControlServer({ port: 0 }); servers.push(server);
+    const port = await server.listen();
+    const response = await fetch(`http://127.0.0.1:${port}/api/video/snapshot?host=127.0.0.1&port=6500`, {
+      headers: { Origin: ORIGIN },
+    });
+    expect(response.status).toBe(403);
+  });
+
+  it('rejects video snapshot when host/port do not match connected target', async () => {
+    const fake = await createFakeCarTcpServer();
+    const server = new ControlServer({ port: 0 }); servers.push(server);
+    const port = await server.listen();
+    const ws = await open(port);
+    expect((await connect(ws, fake.port)).type).toBe('result');
+    const response = await fetch(`http://127.0.0.1:${port}/api/video/snapshot?host=10.0.0.9&port=6500`, {
+      headers: { Origin: ORIGIN },
+    });
+    expect(response.status).toBe(403);
+    ws.close();
+    await fake.close();
+  });
+
+  it('proxies a JPEG snapshot from the connected vehicle video port', async () => {
+    const { createServer } = await import('node:http');
+    // Minimal JPEG (1x1 pixel)
+    const jpeg = Buffer.from(
+      '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAn/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAX/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAGfAP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAQUCf//EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQMBAT8Bf//EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQIBAT8Bf//Z',
+      'base64',
+    );
+    const videoHttp = createServer((req, res) => {
+      if (req.url?.startsWith('/snapshot')) {
+        res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': jpeg.length });
+        res.end(jpeg);
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => videoHttp.listen(0, '127.0.0.1', resolve));
+    const videoPort = (videoHttp.address() as { port: number }).port;
+
+    const fake = await createFakeCarTcpServer();
+    const server = new ControlServer({ port: 0 }); servers.push(server);
+    const port = await server.listen();
+    const ws = await open(port);
+    expect((await request(ws, {
+      type: 'command',
+      requestId: 'connect-video',
+      command: 'connect',
+      payload: { host: '127.0.0.1', tcpPort: fake.port, videoPort },
+    })).type).toBe('result');
+
+    const response = await fetch(`http://127.0.0.1:${port}/api/video/snapshot?host=127.0.0.1&port=${videoPort}`, {
+      headers: { Origin: ORIGIN },
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toMatch(/image\/jpeg/);
+    const body = Buffer.from(await response.arrayBuffer());
+    expect(body[0]).toBe(0xff);
+    expect(body[1]).toBe(0xd8);
+
+    ws.close();
+    await fake.close();
+    await new Promise<void>((resolve) => videoHttp.close(() => resolve()));
   });
 });

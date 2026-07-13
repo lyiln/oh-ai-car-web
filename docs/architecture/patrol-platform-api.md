@@ -79,6 +79,14 @@
 
 详见 [乱停车违停定位说明](../flows/illegal-parking-localization.md)。
 
+违规列表与详情额外返回：
+
+- `longitude` / `latitude`：优先观测直传，否则用巡检车在 `occurred_at` ±60s 内最近遥测点回填
+- `coordinateSource`：`observation` | `telemetry` | `none`
+- `ownerName` / `building` / `parkingSpot` / `confidence`：来自任务白名单快照与观测
+
+详见 [乱停车违停定位说明](../flows/illegal-parking-localization.md)。
+
 ## 白名单 / 报告 / 设置
 
 | 方法 | 路径 |

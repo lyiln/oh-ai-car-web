@@ -1,0 +1,13 @@
+# Optional plate vision dependencies (Jetson / dev GPU machine).
+# Base telemetry still uses edge-agent/requirements.txt (rclpy only).
+opencv-python-headless>=4.8
+numpy>=1.24
+paddleocr>=2.7
+# CPU wheel for x86_64; on Jetson install a matching paddlepaddle wheel separately.
+paddlepaddle>=2.5; platform_machine == "x86_64" or platform_machine == "AMD64"
+# Install PyTorch separately for your CUDA/Jetson build, then:
+# torch>=1.13
+# torchvision>=0.14
+#
+# Jetson Ubuntu runtime (reference):
+#   bash yolo-v5/oh-ai-car-YOLOv5/scripts/ubuntu/setup_plate_runtime.sh

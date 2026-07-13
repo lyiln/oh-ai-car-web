@@ -24,7 +24,8 @@
 4. Run `PLATFORM_API_URL=http://<server>:8080 DEVICE_CREDENTIAL=<credential>
    python3 telemetry_agent.py` in an approved ROS2 environment with `/gps/fix`
    available. Hardware-specific deployment and ROS runtime recovery require a
-   separate stage 1.5 approval.
+   separate stage 1.5 approval. For the approved Jetson GPS setup procedure,
+   see [jetson-gps-setup.md](./jetson-gps-setup.md).
 5. On each operator machine, run the local gateway with
    `PLATFORM_API_URL=http://<server>:8080 npm run dev:gateway`. The gateway then
    rejects control connections without a live platform lease.

@@ -253,6 +253,40 @@ describe('platform API against PostGIS', () => {
     expect(report.json<{ report: { stats: { observationCount: number; registeredPrivate: number; noParkingCount: number } } }>().report.stats).toMatchObject({ observationCount: 1, registeredPrivate: 1, noParkingCount: 1 });
   });
 
+  it('accepts Chinese-province plate text from YOLO OCR observations', async () => {
+    const adminCookie = await login('admin', 'new-password');
+    const operatorCookie = await login('operator-a', 'password');
+    const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-CN-PLATE', name: '中文车牌车', host: '192.168.1.26', tcpPort: 6000, videoPort: 6500 } });
+    const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
+    await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA] } });
+    const routeId = randomUUID(); const waypointId = randomUUID();
+    await db.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [routeId, vehicleId, '中文车牌路线', 'v1', 'generated', ids.admin]);
+    await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds,no_parking_roi) VALUES ($1,$2,0,$3,0,0,0,8,$4)', [waypointId, routeId, '识别点', JSON.stringify([0.1, 0.1, 0.5, 0.5])]);
+    for (const ordinal of [1, 2]) await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,$3,$4,0,0,0,8)', [randomUUID(), routeId, ordinal, `点${ordinal}`]);
+    await resetGlobalWhitelist([{ plate: '皖A12345', owner: '中文住户', building: '2号楼' }]);
+    const started = await app.inject({ method: 'POST', url: '/api/patrol/start', headers: { origin, cookie: operatorCookie }, payload: { deviceId: vehicleId, routeId, shift: 'morning' } });
+    expect(started.statusCode).toBe(200);
+    const taskId = started.json<{ task: { id: string } }>().task.id;
+    const credential = await app.inject({ method: 'POST', url: `/api/vehicles/${vehicleId}/device-credentials`, headers: { origin, cookie: adminCookie } });
+    const token = credential.json<{ credential: { token: string } }>().credential.token;
+    await app.inject({ method: 'GET', url: '/device/v1/patrol/tasks/next', headers: { authorization: `Bearer ${token}` } });
+    const observation = {
+      type: 'observation',
+      waypointId,
+      occurredAt: '2026-07-11T02:01:00.000Z',
+      plate: '皖A·12345',
+      confidence: 0.93,
+      vehicleBox: [0.2, 0.2, 0.2, 0.2],
+    };
+    const posted = await app.inject({ method: 'POST', url: `/device/v1/patrol/tasks/${taskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: observation });
+    expect(posted.statusCode).toBe(200);
+    expect(posted.json()).toMatchObject({ classification: 'registered_private', noParking: true, deduplicated: false });
+    const events = await app.inject({ method: 'GET', url: `/api/patrol/tasks/${taskId}/events`, headers: { origin, cookie: operatorCookie } });
+    expect(events.json<{ observations: Array<{ plate: string; classification: string }> }>().observations).toEqual([
+      expect.objectContaining({ plate: '皖A12345', classification: 'registered_private' }),
+    ]);
+  });
+
   it('creates patrol_events and reviews for pending-review observations, and whitelist snapshot is immutable', async () => {
     const adminCookie = await login('admin', defaultPassword);
     const operatorCookie = await login('operator-a', 'password');

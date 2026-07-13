@@ -39,7 +39,14 @@ const USER_SELECT = 'id, username, display_name, password_hash, role, active, em
 function object(value: unknown): Record<string, unknown> | null { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null; }
 function string(value: unknown, field: string): string { if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} is required`); return value.trim(); }
 function number(value: unknown, field: string, min: number, max: number): number { if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) throw new Error(`${field} is invalid`); return value; }
-function normalisePlate(value: unknown): string { const plate = string(value, 'plate').replace(/[\s-]/g, '').toUpperCase(); if (!/^[A-Z0-9]{5,10}$/.test(plate)) throw new Error('plate is invalid'); return plate; }
+function normalisePlate(value: unknown): string {
+  // Strip spaces / hyphens / middle-dots; keep Chinese province prefix when present.
+  const plate = string(value, 'plate').replace(/[\s\-·・.]/g, '').toUpperCase();
+  const chinese = /^[\u4e00-\u9fa5][A-Z][A-Z0-9]{5,7}$/.test(plate);
+  const ascii = /^[A-Z0-9]{5,10}$/.test(plate);
+  if (!chinese && !ascii) throw new Error('plate is invalid');
+  return plate;
+}
 function bboxIntersectsRoi(box: unknown, roi: unknown): boolean {
   if (!Array.isArray(box) || !Array.isArray(roi) || box.length !== 4 || roi.length !== 4 || !box.every((value) => typeof value === 'number' && value >= 0 && value <= 1)) return false;
   const [x, y, width, height] = box as number[]; const [roiX, roiY, roiWidth, roiHeight] = roi as number[];
