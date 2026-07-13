@@ -68,6 +68,11 @@ export interface Violation {
   status?: 'pending' | 'confirmed' | 'false_positive' | 'resolved' | string;
   longitude?: number | null;
   latitude?: number | null;
+  coordinateSource?: 'observation' | 'telemetry' | 'none' | string;
+  ownerName?: string | null;
+  building?: string | null;
+  parkingSpot?: string | null;
+  confidence?: number | null;
 }
 
 export interface Review {
@@ -196,10 +201,15 @@ export interface ResponseTask {
 const baseUrl = () => import.meta.env.VITE_PLATFORM_API_URL ?? window.location.origin;
 
 export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(init.headers);
+  const hasBody = init.body !== undefined && init.body !== null;
+  if (hasBody && !headers.has('content-type')) {
+    headers.set('content-type', 'application/json');
+  }
   const response = await fetch(new URL(path, baseUrl()), {
     credentials: 'include',
-    headers: { 'content-type': 'application/json', ...(init.headers ?? {}) },
     ...init,
+    headers,
   });
   const value = await response.json().catch(() => ({})) as T & { error?: string };
   if (!response.ok) throw new Error(value.error ?? `请求失败 (${response.status})`);

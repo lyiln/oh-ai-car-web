@@ -85,9 +85,9 @@ Fastify 应用入口是 `backend/src/app.ts`；启动时 `backend/src/index.ts` 
 1. 操作员登录平台，后端在 HttpOnly Cookie 中保存签名会话。
 2. 前端只读取该操作员被授权的车辆档案，得到已保存的 TCP 和视频配置。
 3. 操作员点击连接。前端请求 `POST /api/vehicles/:id/control-lease`，后端在事务中拒绝其他用户的有效租约，或签发/延长自己的 60 秒租约。
-4. 前端把车辆 ID、租约令牌与保存的连接配置提交给本机 `ws://127.0.0.1:8787/control` 网关。
-5. 当网关设置了 `PLATFORM_API_URL` 时，会调用后端 `/internal/control-lease/verify`。只有令牌、用户、车辆、未过期租约及连接配置完全一致，且该车没有活动或待确认停止的巡检任务时，网关才允许 TCP 连接。
-6. 前端每 20 秒续约，并把新令牌以 `leaseRefresh` 更新给网关。更新失败或租约到期时，网关沿用既有安全路径：先尝试发送 Stop，再关闭 TCP。
+4. 前端先以车辆 ID、租约令牌与保存的连接配置请求 probe；网关只探测与租约完全一致的目标，且 probe 不占用控制会话。
+5. 前端仅在 probe 可达后把相同配置提交给本机 `ws://127.0.0.1:8787/control` 网关。当网关设置了 `PLATFORM_API_URL` 时，会调用后端 `/internal/control-lease/verify`；只有令牌、用户、车辆、未过期租约及连接配置完全一致，且该车没有活动或待确认停止的巡检任务时，网关才允许 TCP 连接。
+6. 前端每 20 秒续约，并把新令牌以 `leaseRefresh` 更新给网关。更新失败或租约到期时，网关沿用既有安全路径：先尝试发送 Stop，再关闭 TCP。TCP 意外断开时，网关不会自动重连或重发运动命令，操作员必须重新连接。
 
 这套机制不会改变当前已知但尚未真车确认的小车 TCP 编码。有关协议风险请始终查看 [PROTOCOL_STATUS.md](../../PROTOCOL_STATUS.md)。
 

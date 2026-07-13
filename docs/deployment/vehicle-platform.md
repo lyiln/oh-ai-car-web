@@ -22,7 +22,9 @@
    Store each returned one-time credential on the ROS2 companion computer as
    `DEVICE_CREDENTIAL`.
 4. Run `PLATFORM_API_URL=http://<server>:8080 DEVICE_CREDENTIAL=<credential>
-   python3 telemetry_agent.py` in a ROS2 environment with `/gps/fix` available.
+   python3 telemetry_agent.py` in an approved ROS2 environment with `/gps/fix`
+   available. Hardware-specific deployment and ROS runtime recovery require a
+   separate stage 1.5 approval.
 5. On each operator machine, run the local gateway with
    `PLATFORM_API_URL=http://<server>:8080 npm run dev:gateway`. The gateway then
    rejects control connections without a live platform lease.
@@ -35,7 +37,21 @@ production deployment definition. Production must terminate HTTPS and run with
 start if any of these gates is absent. Production also requires
 `SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`, and `SMTP_FROM`; verify delivery to
 the bootstrap administrator before enabling email-login-only operations. Do not
-expose the local gateway beyond the operator machine. Run
+expose the local gateway beyond the operator machine.
+
+## Local three-process stack
+
+The browser uses a localhost gateway for TCP safety. An operator computer must
+be on the same LAN as the registered vehicle; the browser never sends raw TCP.
+Run the backend, frontend, and a gateway configured with `PLATFORM_API_URL`.
+The console requests a vehicle-bound control lease, probes that approved target,
+then connects. Device IP and ports are managed by administrators and are not
+overridable from the control session.
+
+Protocol encoding remains an unconfirmed source-compatibility assumption; see
+`PROTOCOL_STATUS.md` and the real-car validation flow before vehicle operation.
+
+Run
 `npm run test:integration --workspace=@oh-ai-car-web/backend` in a Docker-ready
 environment before deployment; it starts a temporary PostGIS database and does
 not use the deployment data volume.

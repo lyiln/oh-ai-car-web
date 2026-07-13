@@ -175,4 +175,83 @@ describe('localhost control gateway', () => {
     await firstCar.close();
     await secondCar.close();
   });
+
+  it('probes TCP reachability without claiming the controller session', async () => {
+    const fake = await createFakeCarTcpServer();
+    const server = new ControlServer({
+      port: 0,
+      leaseVerifier: {
+        verify: async (token, vehicleId) => {
+          if (token !== 'lease-token') return null;
+          if (vehicleId === 'vehicle-1') return { vehicle: { host: '127.0.0.1', tcpPort: fake.port, videoPort: 6500 }, expiresAt: '2099-01-01T00:00:00.000Z' };
+          if (vehicleId === 'refused') return { vehicle: { host: '127.0.0.1', tcpPort: 1, videoPort: 6500 }, expiresAt: '2099-01-01T00:00:00.000Z' };
+          return null;
+        },
+      },
+    }); servers.push(server);
+    const port = await server.listen();
+    const ws = await open(port);
+    const reachable = await request(ws, {
+      type: 'command',
+      requestId: 'probe-ok',
+      command: 'probe',
+      payload: { host: '127.0.0.1', tcpPort: fake.port, videoPort: 6500, vehicleId: 'vehicle-1', leaseToken: 'lease-token', timeoutMs: 1000 },
+    });
+    expect(reachable).toMatchObject({
+      type: 'result',
+      probe: { status: 'REACHABLE', host: '127.0.0.1', tcpPort: fake.port },
+    });
+    expect(server.client.isConnected).toBe(false);
+
+    const missingLease = await request(ws, {
+      type: 'command', requestId: 'probe-missing-lease', command: 'probe',
+      payload: { host: '127.0.0.1', tcpPort: fake.port, videoPort: 6500, vehicleId: 'vehicle-1' },
+    });
+    expect(missingLease).toMatchObject({ type: 'error', code: 'PLATFORM_AUTH_REQUIRED' });
+
+    const refused = await request(ws, {
+      type: 'command',
+      requestId: 'probe-refused',
+      command: 'probe',
+      payload: { host: '127.0.0.1', tcpPort: 1, videoPort: 6500, vehicleId: 'refused', leaseToken: 'lease-token', timeoutMs: 500 },
+    });
+    expect(refused.type).toBe('result');
+    expect((refused.probe as { status: string }).status).toMatch(/REFUSED|TIMEOUT|ERROR/);
+
+    const mismatched = await request(ws, {
+      type: 'command', requestId: 'probe-mismatch', command: 'probe',
+      payload: { host: '127.0.0.1', tcpPort: 1, videoPort: 6500, vehicleId: 'vehicle-1', leaseToken: 'lease-token' },
+    });
+    expect(mismatched).toMatchObject({ type: 'error', code: 'PLATFORM_AUTH_REQUIRED' });
+
+    ws.close();
+    await fake.close();
+  });
+
+  it('rejects movement after an unexpected TCP close without reconnecting or resending', async () => {
+    const fake = await createFakeCarTcpServer();
+    const server = new ControlServer({ port: 0 }); servers.push(server);
+    const port = await server.listen();
+    const ws = await open(port);
+    expect((await connect(ws, fake.port)).type).toBe('result');
+
+    const internal = server.client as unknown as { socket: { destroy: () => void } | null };
+    expect(internal.socket).toBeTruthy();
+    internal.socket!.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const response = await request(ws, {
+      type: 'command',
+      requestId: 'after-drop',
+      command: 'button',
+      payload: { direction: 'Front' },
+    });
+    expect(response).toMatchObject({ type: 'error', code: 'NOT_CONNECTED' });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(fake.messages).not.toContain('$011504011B#');
+    expect(fake.connections()).toBe(1);
+
+    ws.close();
+    await fake.close();
+  });
 });

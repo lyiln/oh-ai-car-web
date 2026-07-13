@@ -400,6 +400,148 @@ describe('platform API against PostGIS', () => {
     expect((await app.inject({ method: 'POST', url: `/api/response-tasks/${offlineTaskId}/assign`, headers: { origin, cookie: operatorCookie }, payload: {} })).json()).toMatchObject({ assignedVehicleId: backupId, deduplicated: false });
   });
 
+  it('resolves violation coordinates from observation or nearest telemetry and enriches owner info', async () => {
+    const adminCookie = await login('admin', defaultPassword);
+    const operatorCookie = await login('operator-a', 'password');
+    const vehicle = await app.inject({
+      method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie },
+      payload: { code: 'CAR-LOC', name: '定位测试车', host: '192.168.1.40', tcpPort: 6000, videoPort: 6500 },
+    });
+    const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
+    await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA] } });
+    await app.inject({
+      method: 'POST', url: '/api/resident-destinations', headers: { origin, cookie: adminCookie },
+      payload: { vehicleId, building: '5号楼', displayName: '5号楼门口', mapVersion: 'v-loc', x: 1, y: 2, yaw: 0 },
+    });
+    const routeId = randomUUID();
+    const waypointId = randomUUID();
+    await db.query(
+      'INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)',
+      [routeId, vehicleId, '定位路线', 'v-loc', 'generated', ids.admin],
+    );
+    await db.query(
+      'INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds,no_parking_roi) VALUES ($1,$2,0,$3,0,0,0,8,$4)',
+      [waypointId, routeId, '定位禁停点', JSON.stringify([0.1, 0.1, 0.5, 0.5])],
+    );
+    for (const ordinal of [1, 2]) {
+      await db.query(
+        'INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,$3,$4,0,0,0,8)',
+        [randomUUID(), routeId, ordinal, `点${ordinal}`],
+      );
+    }
+    await resetGlobalWhitelist([{ plate: 'G12345', owner: '定位住户', building: '5号楼' }]);
+    await db.query(
+      `UPDATE whitelist_entries SET parking_spot='B-05-12'
+       WHERE plate='G12345' AND whitelist_id IN (SELECT id FROM whitelist_imports WHERE vehicle_id IS NULL AND is_snapshot=false)`,
+    );
+    const started = await app.inject({
+      method: 'POST', url: '/api/patrol/start', headers: { origin, cookie: operatorCookie },
+      payload: { deviceId: vehicleId, routeId, shift: 'morning' },
+    });
+    expect(started.statusCode).toBe(200);
+    const patrolTaskId = started.json<{ task: { id: string } }>().task.id;
+    const credential = await app.inject({
+      method: 'POST', url: `/api/vehicles/${vehicleId}/device-credentials`, headers: { origin, cookie: adminCookie },
+    });
+    const token = credential.json<{ credential: { token: string } }>().credential.token;
+    await app.inject({ method: 'GET', url: '/device/v1/patrol/tasks/next', headers: { authorization: `Bearer ${token}` } });
+
+    await db.query(
+      `INSERT INTO telemetry_points (id,vehicle_id,occurred_at,longitude,latitude)
+       VALUES ($1,$2,'2026-07-11T06:00:00.000Z',116.401111,39.910222)`,
+      [randomUUID(), vehicleId],
+    );
+    const telemObs = await app.inject({
+      method: 'POST', url: `/device/v1/patrol/tasks/${patrolTaskId}/events`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        type: 'observation', waypointId, occurredAt: '2026-07-11T06:00:02.000Z', plate: 'G12345', confidence: 0.94,
+        vehicleBox: [0.2, 0.2, 0.2, 0.2], evidenceImageUrl: 'https://evidence.invalid/telem.jpg',
+      },
+    });
+    expect(telemObs.statusCode).toBe(200);
+    expect(telemObs.json()).toMatchObject({ responseEligible: true });
+
+    const listed = await app.inject({ method: 'GET', url: '/api/violations', headers: { origin, cookie: operatorCookie } });
+    expect(listed.statusCode).toBe(200);
+    const telemViolation = listed.json<{
+      violations: Array<{
+        plate: string; longitude: number; latitude: number; coordinateSource: string;
+        ownerName: string; building: string; parkingSpot: string; confidence: number; id: string;
+      }>;
+    }>().violations.find((row) => row.plate === 'G12345');
+    expect(telemViolation).toMatchObject({
+      longitude: 116.401111,
+      latitude: 39.910222,
+      coordinateSource: 'telemetry',
+      ownerName: '定位住户',
+      building: '5号楼',
+      parkingSpot: 'B-05-12',
+      confidence: 0.94,
+    });
+
+    const detail = await app.inject({
+      method: 'GET', url: `/api/violations/${telemViolation!.id}`, headers: { origin, cookie: operatorCookie },
+    });
+    expect(detail.json<{ violation: { coordinateSource: string; parkingSpot: string } }>().violation).toMatchObject({
+      coordinateSource: 'telemetry',
+      parkingSpot: 'B-05-12',
+    });
+
+    await resetGlobalWhitelist([{ plate: 'H67890', owner: '直传住户', building: '5号楼' }]);
+    await db.query(
+      `UPDATE whitelist_entries SET parking_spot='C-01'
+       WHERE plate='H67890' AND whitelist_id IN (SELECT id FROM whitelist_imports WHERE vehicle_id IS NULL AND is_snapshot=false)`,
+    );
+    await db.query("UPDATE patrol_tasks SET status='completed', finished_at=now() WHERE id=$1", [patrolTaskId]);
+    const routeId2 = randomUUID();
+    const waypointId2 = randomUUID();
+    await db.query(
+      'INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)',
+      [routeId2, vehicleId, '直传路线', 'v-loc', 'generated', ids.admin],
+    );
+    await db.query(
+      'INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds,no_parking_roi) VALUES ($1,$2,0,$3,0,0,0,8,$4)',
+      [waypointId2, routeId2, '直传禁停点', JSON.stringify([0.1, 0.1, 0.5, 0.5])],
+    );
+    for (const ordinal of [1, 2]) {
+      await db.query(
+        'INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,$3,$4,0,0,0,8)',
+        [randomUUID(), routeId2, ordinal, `点${ordinal}`],
+      );
+    }
+    const started2 = await app.inject({
+      method: 'POST', url: '/api/patrol/start', headers: { origin, cookie: operatorCookie },
+      payload: { deviceId: vehicleId, routeId: routeId2, shift: 'afternoon' },
+    });
+    expect(started2.statusCode).toBe(200);
+    const patrolTaskId2 = started2.json<{ task: { id: string } }>().task.id;
+    await app.inject({ method: 'GET', url: '/device/v1/patrol/tasks/next', headers: { authorization: `Bearer ${token}` } });
+
+    const directObs = await app.inject({
+      method: 'POST', url: `/device/v1/patrol/tasks/${patrolTaskId2}/events`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        type: 'observation', waypointId: waypointId2, occurredAt: '2026-07-11T07:00:00.000Z',
+        plate: 'H67890', confidence: 0.97,
+        vehicleBox: [0.2, 0.2, 0.2, 0.2], evidenceImageUrl: 'https://evidence.invalid/direct.jpg',
+        longitude: 116.405555, latitude: 39.915555,
+      },
+    });
+    expect(directObs.statusCode).toBe(200);
+
+    const listed2 = await app.inject({ method: 'GET', url: '/api/violations', headers: { origin, cookie: operatorCookie } });
+    const directViolation = listed2.json<{
+      violations: Array<{ plate: string; longitude: number; latitude: number; coordinateSource: string; ownerName: string }>;
+    }>().violations.find((row) => row.plate === 'H67890');
+    expect(directViolation).toMatchObject({
+      longitude: 116.405555,
+      latitude: 39.915555,
+      coordinateSource: 'observation',
+      ownerName: '直传住户',
+    });
+  });
+
   it('allows only administrators to manage global whitelist', async () => {
     const adminCookie = await login('admin', defaultPassword);
     const operatorACookie = await login('operator-a', 'password');
@@ -635,5 +777,88 @@ describe('platform API against PostGIS', () => {
       owner_name: '新车主', building: '2号楼', category: 'visitor', parking_spot: 'B-02',
     })]);
     expect(migrated.rows[0]?.valid_until.toISOString()).toContain('2028-02-02');
+  });
+
+  it('supports device search, update, archive delete, and rejects operator delete', async () => {
+    const adminCookie = await login('admin', defaultPassword);
+    const operatorCookie = await login('operator-a', 'password');
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/devices',
+      headers: { origin, cookie: adminCookie },
+      payload: {
+        code: 'JETSON-SEARCH',
+        name: 'Jetson巡检车-搜索',
+        host: '10.82.66.200',
+        tcpPort: 6000,
+        videoPort: 6500,
+        description: '定位测试设备',
+      },
+    });
+    expect(created.statusCode).toBe(200);
+    const deviceId = created.json<{ device: { id: string } }>().device.id;
+
+    const searched = await app.inject({
+      method: 'GET',
+      url: '/api/devices?q=JETSON-SEARCH',
+      headers: { origin, cookie: adminCookie },
+    });
+    expect(searched.statusCode).toBe(200);
+    expect(searched.json<{ devices: Array<{ code: string }> }>().devices).toEqual(
+      expect.arrayContaining([expect.objectContaining({ code: 'JETSON-SEARCH' })]),
+    );
+
+    const byHost = await app.inject({
+      method: 'GET',
+      url: '/api/devices?q=10.82.66.200',
+      headers: { origin, cookie: adminCookie },
+    });
+    expect(byHost.json<{ devices: Array<{ id: string }> }>().devices.some((row) => row.id === deviceId)).toBe(true);
+
+    const updated = await app.inject({
+      method: 'PUT',
+      url: `/api/devices/${deviceId}`,
+      headers: { origin, cookie: adminCookie },
+      payload: { name: 'Jetson巡检车-已改', host: '10.82.66.201', tcpPort: 6001 },
+    });
+    expect(updated.statusCode).toBe(200);
+    expect(updated.json<{ device: { name: string; host: string; tcpPort: number } }>().device).toMatchObject({
+      name: 'Jetson巡检车-已改',
+      host: '10.82.66.201',
+      tcpPort: 6001,
+    });
+
+    expect((await app.inject({
+      method: 'DELETE',
+      url: `/api/devices/${deviceId}`,
+      headers: { origin, cookie: operatorCookie },
+    })).statusCode).toBe(403);
+
+    expect((await app.inject({
+      method: 'DELETE',
+      url: `/api/devices/${deviceId}`,
+      headers: { origin, cookie: adminCookie },
+    })).statusCode).toBe(200);
+
+    const listed = await app.inject({ method: 'GET', url: '/api/devices', headers: { origin, cookie: adminCookie } });
+    expect(listed.json<{ devices: Array<{ id: string }> }>().devices.find((row) => row.id === deviceId)).toBeUndefined();
+
+    const archivedPatch = await app.inject({
+      method: 'POST',
+      url: '/api/devices',
+      headers: { origin, cookie: adminCookie },
+      payload: { code: 'JETSON-ARCH', name: '待归档车', host: '10.82.66.202', tcpPort: 6000, videoPort: 6500 },
+    });
+    const archiveId = archivedPatch.json<{ device: { id: string } }>().device.id;
+    expect((await app.inject({
+      method: 'PATCH',
+      url: `/api/vehicles/${archiveId}`,
+      headers: { origin, cookie: adminCookie },
+      payload: { archived: true, description: 'archived via patch' },
+    })).statusCode).toBe(200);
+    expect(
+      (await app.inject({ method: 'GET', url: '/api/devices', headers: { origin, cookie: adminCookie } }))
+        .json<{ devices: Array<{ id: string }> }>().devices.find((row) => row.id === archiveId),
+    ).toBeUndefined();
   });
 });

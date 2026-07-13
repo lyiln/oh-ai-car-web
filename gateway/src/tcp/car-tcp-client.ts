@@ -1,5 +1,7 @@
 import net from 'node:net';
-import type { ConnectionConfig } from '@oh-ai-car-web/shared';
+import type { ConnectionConfig, ProbeResult } from '@oh-ai-car-web/shared';
+
+const DEFAULT_PROBE_TIMEOUT_MS = 2000;
 
 export class CarTcpClient {
   private socket: net.Socket | null = null;
@@ -63,8 +65,41 @@ export class CarTcpClient {
 
   async write(message: string): Promise<void> {
     if (!this.socket || !this.connected || this.socket.destroyed) throw new Error('TCP socket is not connected');
-    await new Promise<void>((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
       this.socket?.write(message, (error) => error ? reject(error) : resolve());
+    });
+  }
+
+  /** Short TCP reachability check without claiming the control session. */
+  static async probe(host: string, tcpPort: number, timeoutMs = DEFAULT_PROBE_TIMEOUT_MS): Promise<ProbeResult> {
+    const trimmed = host.trim();
+    return new Promise((resolve) => {
+      const socket = new net.Socket();
+      let settled = false;
+      const finish = (result: ProbeResult) => {
+        if (settled) return;
+        settled = true;
+        socket.removeAllListeners();
+        socket.destroy();
+        resolve(result);
+      };
+      socket.setTimeout(timeoutMs, () => finish({
+        status: 'TIMEOUT',
+        host: trimmed,
+        tcpPort,
+        message: `TCP probe timed out after ${timeoutMs}ms`,
+      }));
+      socket.once('error', (error: NodeJS.ErrnoException) => {
+        const refused = error.code === 'ECONNREFUSED';
+        finish({
+          status: refused ? 'REFUSED' : 'ERROR',
+          host: trimmed,
+          tcpPort,
+          message: error.message,
+        });
+      });
+      socket.once('connect', () => finish({ status: 'REACHABLE', host: trimmed, tcpPort }));
+      socket.connect(tcpPort, trimmed);
     });
   }
 

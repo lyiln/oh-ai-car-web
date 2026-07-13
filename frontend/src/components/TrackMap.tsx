@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { loadAmap, locateToUser, MAP_CLOSEUP_ZOOM, MAP_FALLBACK_CENTER } from '../lib/amap.js';
+import { loadAmap, locateToUser, convertGpsTrack, MAP_CLOSEUP_ZOOM, MAP_FALLBACK_CENTER } from '../lib/amap.js';
 import type { TrackPoint } from '../services/platformClient.js';
 
 export function TrackMap({ points }: { points: TrackPoint[] }) {
@@ -67,23 +67,25 @@ export function TrackMap({ points }: { points: TrackPoint[] }) {
       return;
     }
 
-    AMap.convertFrom(
+    void convertGpsTrack(
+      AMap,
       points.map((point) => [point.longitude, point.latitude]),
-      'gps',
-      (status, result) => {
-        if (cancelled || status !== 'complete') {
-          setMessage('GPS 坐标转换失败，未显示可能偏移的轨迹。');
-          return;
-        }
-        const path = result.locations.map((location) => [location.lng, location.lat]);
-        const polyline = new AMap.Polyline({ path, strokeColor: '#2577e3', strokeWeight: 6, showDir: true });
-        const marker = new AMap.Marker({ position: path.at(-1), title: `最新点：${points.at(-1)?.occurredAt}` });
-        map.clearMap();
-        map.add([polyline, marker]);
-        map.setFitView();
-        setMessage(`已显示 ${points.length} 个 WGS-84 GPS 轨迹点。`);
-      },
-    );
+    ).then(({ path, converted }) => {
+      if (cancelled || path.length === 0) {
+        setMessage('GPS 坐标转换失败，未显示可能偏移的轨迹。');
+        return;
+      }
+      const polyline = new AMap.Polyline({ path, strokeColor: '#2577e3', strokeWeight: 6, showDir: true });
+      const marker = new AMap.Marker({ position: path.at(-1), title: `最新点：${points.at(-1)?.occurredAt}` });
+      map.clearMap();
+      map.add([polyline, marker]);
+      map.setFitView();
+      setMessage(
+        converted
+          ? `已显示 ${points.length} 个 WGS-84 GPS 轨迹点。`
+          : '高德坐标转换不可用，轨迹已按原始 GPS 显示（可能有偏移）。',
+      );
+    });
 
     return () => {
       cancelled = true;

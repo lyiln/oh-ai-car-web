@@ -249,11 +249,25 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
   // --- Devices (vehicle aliases) ---
   app.get('/api/devices', async (request) => {
     const user = await requireUser(request);
+    const q = typeof (request.query as { q?: unknown }).q === 'string'
+      ? (request.query as { q: string }).q.trim()
+      : '';
+    const pattern = q ? `%${q}%` : null;
     const result = user.role === 'admin'
-      ? await db.query<DeviceRow>('SELECT * FROM vehicles WHERE archived=false ORDER BY name')
+      ? await db.query<DeviceRow>(
+        `SELECT * FROM vehicles
+         WHERE archived=false
+           AND ($1::text IS NULL OR name ILIKE $1 OR code ILIKE $1 OR tcp_host ILIKE $1 OR description ILIKE $1)
+         ORDER BY name`,
+        [pattern],
+      )
       : await db.query<DeviceRow>(
-        'SELECT v.* FROM vehicles v JOIN vehicle_members m ON m.vehicle_id=v.id WHERE m.user_id=$1 AND v.archived=false ORDER BY v.name',
-        [user.id],
+        `SELECT v.* FROM vehicles v
+         JOIN vehicle_members m ON m.vehicle_id=v.id
+         WHERE m.user_id=$1 AND v.archived=false
+           AND ($2::text IS NULL OR v.name ILIKE $2 OR v.code ILIKE $2 OR v.tcp_host ILIKE $2 OR v.description ILIKE $2)
+         ORDER BY v.name`,
+        [user.id, pattern],
       );
     return { devices: result.rows.map(deviceDto) };
   });
@@ -907,6 +921,42 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
   });
 
   // --- Violations ---
+  // Observation coords preferred; else nearest telemetry within ±60s of violation time.
+  const VIOLATION_FROM = `
+       FROM violations v
+       LEFT JOIN map_zones z ON z.id = v.zone_id
+       LEFT JOIN response_tasks rt ON rt.violation_id = v.id
+       LEFT JOIN plate_observations po ON po.id = COALESCE(rt.observation_id, (
+         SELECT po2.id FROM plate_observations po2
+         WHERE po2.task_id = v.task_id AND (v.plate IS NULL OR po2.plate = v.plate)
+         ORDER BY po2.occurred_at DESC LIMIT 1
+       ))
+       LEFT JOIN patrol_tasks pt ON pt.id = v.task_id
+       LEFT JOIN whitelist_entries we ON we.whitelist_id = pt.whitelist_id
+         AND v.plate IS NOT NULL AND we.plate = v.plate
+       LEFT JOIN LATERAL (
+         SELECT t.longitude, t.latitude
+         FROM telemetry_points t
+         WHERE t.vehicle_id = v.vehicle_id
+           AND t.occurred_at BETWEEN v.occurred_at - interval '60 seconds'
+                                AND v.occurred_at + interval '60 seconds'
+         ORDER BY ABS(EXTRACT(EPOCH FROM (t.occurred_at - v.occurred_at)))
+         LIMIT 1
+       ) tp ON true`;
+  const VIOLATION_SELECT = `
+       SELECT v.id, v.plate, v.violation_type AS type, v.waypoint, v.priority, v.disposition AS status,
+              v.evidence_url AS "evidenceUrl", v.occurred_at AS "occurredAt",
+              v.task_id AS "taskId", v.vehicle_id AS "deviceId", z.name AS "zoneName",
+              COALESCE(po.longitude, tp.longitude) AS longitude,
+              COALESCE(po.latitude, tp.latitude) AS latitude,
+              CASE
+                WHEN po.longitude IS NOT NULL AND po.latitude IS NOT NULL THEN 'observation'
+                WHEN tp.longitude IS NOT NULL AND tp.latitude IS NOT NULL THEN 'telemetry'
+                ELSE 'none'
+              END AS "coordinateSource",
+              we.owner_name AS "ownerName", we.building, we.parking_spot AS "parkingSpot",
+              po.confidence`;
+
   app.get('/api/violations', async (request) => {
     const user = await requireUser(request);
     const query = request.query as {
@@ -933,23 +983,8 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     if (user.role !== 'admin') push('EXISTS (SELECT 1 FROM vehicle_members vm WHERE vm.vehicle_id=v.vehicle_id AND vm.user_id=?)', user.id);
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     const result = await db.query(
-      `SELECT v.id, v.plate, v.violation_type AS type, v.waypoint, v.priority, v.disposition AS status,
-              v.evidence_url AS "evidenceUrl", v.occurred_at AS "occurredAt",
-              v.task_id AS "taskId", v.vehicle_id AS "deviceId", z.name AS "zoneName",
-              po.longitude, po.latitude
-       FROM violations v
-       LEFT JOIN map_zones z ON z.id = v.zone_id
-       LEFT JOIN LATERAL (
-         SELECT po2.longitude, po2.latitude
-         FROM plate_observations po2
-         WHERE po2.id = COALESCE(
-           (SELECT rt.observation_id FROM response_tasks rt WHERE rt.violation_id=v.id ORDER BY rt.created_at DESC LIMIT 1),
-           (SELECT po3.id FROM plate_observations po3
-            WHERE po3.task_id=v.task_id AND (v.plate IS NULL OR po3.plate=v.plate)
-            ORDER BY po3.occurred_at DESC LIMIT 1)
-         )
-         LIMIT 1
-       ) po ON true
+      `${VIOLATION_SELECT}
+       ${VIOLATION_FROM}
        ${where}
        ORDER BY v.occurred_at DESC
        LIMIT 200`,
@@ -962,23 +997,9 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     const user = await requireUser(request);
     const eventId = (request.params as { event_id: string }).event_id;
     const result = await db.query(
-      `SELECT v.id, v.plate, v.violation_type AS type, v.waypoint, v.priority, v.disposition AS status,
-              v.evidence_url AS "evidenceUrl", v.occurred_at AS "occurredAt",
-              v.task_id AS "taskId", v.vehicle_id AS "deviceId", v.event_id AS "eventId",
-              z.name AS "zoneName", po.longitude, po.latitude
-       FROM violations v
-       LEFT JOIN map_zones z ON z.id = v.zone_id
-       LEFT JOIN LATERAL (
-         SELECT po2.longitude, po2.latitude
-         FROM plate_observations po2
-         WHERE po2.id = COALESCE(
-           (SELECT rt.observation_id FROM response_tasks rt WHERE rt.violation_id=v.id ORDER BY rt.created_at DESC LIMIT 1),
-           (SELECT po3.id FROM plate_observations po3
-            WHERE po3.task_id=v.task_id AND (v.plate IS NULL OR po3.plate=v.plate)
-            ORDER BY po3.occurred_at DESC LIMIT 1)
-         )
-         LIMIT 1
-       ) po ON true
+      `${VIOLATION_SELECT},
+              v.event_id AS "eventId"
+       ${VIOLATION_FROM}
        WHERE (v.id=$1 OR v.event_id=$1)
          AND ($2::uuid IS NULL OR EXISTS (SELECT 1 FROM vehicle_members vm WHERE vm.vehicle_id=v.vehicle_id AND vm.user_id=$2))
        LIMIT 1`,

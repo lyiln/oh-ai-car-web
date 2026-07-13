@@ -1,5 +1,32 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { locateToUser, resolveFallbackCenter } from '../src/lib/amap.js';
+import { convertGpsTrack, locateToUser, resolveFallbackCenter } from '../src/lib/amap.js';
+
+describe('convertGpsTrack', () => {
+  it('falls back to raw GPS when convertFrom is unavailable', async () => {
+    const result = await convertGpsTrack({} as NonNullable<typeof window.AMap>, [[116.4, 39.9]]);
+    expect(result).toEqual({ path: [[116.4, 39.9]], converted: false });
+  });
+
+  it('uses convertFrom when the API succeeds', async () => {
+    const AMap = {
+      convertFrom: (_points: unknown, _type: string, done: (status: string, result: { locations: Array<{ lng: number; lat: number }> }) => void) => {
+        done('complete', { locations: [{ lng: 116.41, lat: 39.91 }] });
+      },
+    } as NonNullable<typeof window.AMap>;
+    const result = await convertGpsTrack(AMap, [[116.4, 39.9]]);
+    expect(result).toEqual({ path: [[116.41, 39.91]], converted: true });
+  });
+
+  it('falls back when convertFrom returns a non-complete status', async () => {
+    const AMap = {
+      convertFrom: (_points: unknown, _type: string, done: (status: string, result: unknown) => void) => {
+        done('error', {});
+      },
+    } as NonNullable<typeof window.AMap>;
+    const result = await convertGpsTrack(AMap, [[116.4, 39.9]]);
+    expect(result).toEqual({ path: [[116.4, 39.9]], converted: false });
+  });
+});
 
 describe('resolveFallbackCenter', () => {
   it('parses lng,lat pairs', () => {

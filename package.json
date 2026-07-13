@@ -12,6 +12,7 @@
     "dev:gateway": "npm run build --workspace=@oh-ai-car-web/shared && npm run dev --workspace=@oh-ai-car-web/gateway",
     "dev:frontend": "npm run dev --workspace=@oh-ai-car-web/frontend",
     "dev:backend": "npm run dev --workspace=@oh-ai-car-web/backend",
+    "dev:stack": "node scripts/print-dev-stack.mjs",
     "setup:env": "node scripts/setup-env.mjs",
     "test:deploy-live": "node deploy/tests/live-websocket.mjs",
     "start": "npm run build && npm run start --workspace=@oh-ai-car-web/gateway"

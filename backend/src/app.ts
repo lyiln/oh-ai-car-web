@@ -295,7 +295,24 @@ export async function createApp(services: AppServices = {}) {
   });
 
   app.get('/api/vehicles', async (request) => {
-    const user = await requireUser(request); const result = user.role === 'admin' ? await db.query<VehicleRow>('SELECT * FROM vehicles WHERE archived=false ORDER BY name') : await db.query<VehicleRow>('SELECT v.* FROM vehicles v JOIN vehicle_members m ON m.vehicle_id=v.id WHERE m.user_id=$1 AND v.archived=false ORDER BY v.name', [user.id]);
+    const user = await requireUser(request);
+    const q = typeof (request.query as { q?: unknown }).q === 'string' ? (request.query as { q: string }).q.trim() : '';
+    const pattern = q ? `%${q}%` : null;
+    const result = user.role === 'admin'
+      ? await db.query<VehicleRow>(
+        `SELECT * FROM vehicles
+         WHERE archived=false
+           AND ($1::text IS NULL OR name ILIKE $1 OR code ILIKE $1 OR tcp_host ILIKE $1 OR description ILIKE $1)
+         ORDER BY name`,
+        [pattern],
+      )
+      : await db.query<VehicleRow>(
+        `SELECT v.* FROM vehicles v JOIN vehicle_members m ON m.vehicle_id=v.id
+         WHERE m.user_id=$1 AND v.archived=false
+           AND ($2::text IS NULL OR v.name ILIKE $2 OR v.code ILIKE $2 OR v.tcp_host ILIKE $2 OR v.description ILIKE $2)
+         ORDER BY v.name`,
+        [user.id, pattern],
+      );
     return { vehicles: result.rows.map(vehicleDto) };
   });
   app.post('/api/vehicles', async (request) => {
@@ -303,7 +320,24 @@ export async function createApp(services: AppServices = {}) {
     await db.query('INSERT INTO vehicles (id,code,name,description,tcp_host,tcp_port,video_port,bridge_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [id, code, name, description, host, tcpPort, videoPort, bridgeUrl]); await audit('vehicle.create', 'success', admin.id, id); return { vehicle: { id, code, name, description, host, tcpPort, videoPort, bridgeUrl, lastSeenAt: null, lastPatrolAt: null, archived: false } };
   });
   app.get('/api/vehicles/:id', async (request) => { const user = await requireUser(request); const id = (request.params as { id: string }).id; if (!await canAccessVehicle(user, id)) throw Object.assign(new Error('Vehicle access denied'), { statusCode: 403 }); const result = await db.query<VehicleRow>('SELECT * FROM vehicles WHERE id=$1', [id]); if (!result.rows[0]) throw Object.assign(new Error('Vehicle not found'), { statusCode: 404 }); return { vehicle: vehicleDto(result.rows[0]) }; });
-  app.patch('/api/vehicles/:id', async (request) => { const admin = await requireAdmin(request); const id = (request.params as { id: string }).id; const body = object(request.body); const description = typeof body?.description === 'string' ? body.description : ''; await db.query('UPDATE vehicles SET name=COALESCE($1,name),description=$2,updated_at=now() WHERE id=$3', [typeof body?.name === 'string' ? body.name.trim() : null, description, id]); await audit('vehicle.update', 'success', admin.id, id); return { ok: true }; });
+  app.patch('/api/vehicles/:id', async (request) => {
+    const admin = await requireAdmin(request);
+    const id = (request.params as { id: string }).id;
+    const body = object(request.body);
+    const description = typeof body?.description === 'string' ? body.description : '';
+    const archive = body?.archived === true;
+    await db.query(
+      `UPDATE vehicles SET
+         name=COALESCE($1,name),
+         description=$2,
+         archived=CASE WHEN $3 THEN true ELSE archived END,
+         updated_at=now()
+       WHERE id=$4`,
+      [typeof body?.name === 'string' ? body.name.trim() : null, description, archive, id],
+    );
+    await audit(archive ? 'vehicle.archive' : 'vehicle.update', 'success', admin.id, id);
+    return { ok: true };
+  });
   app.put('/api/vehicles/:id/members', async (request) => { const admin = await requireAdmin(request); const vehicleId = (request.params as { id: string }).id; const body = object(request.body); if (!Array.isArray(body?.userIds) || !body.userIds.every((id) => typeof id === 'string')) throw new Error('userIds must be strings'); await db.transaction(async (client) => { await client.query('DELETE FROM vehicle_members WHERE vehicle_id=$1', [vehicleId]); for (const userId of body.userIds as string[]) await client.query('INSERT INTO vehicle_members (vehicle_id,user_id) VALUES ($1,$2)', [vehicleId, userId]); }); await audit('vehicle.members.update', 'success', admin.id, vehicleId); return { ok: true }; });
   app.post('/api/vehicles/:id/device-credentials', async (request) => { const admin = await requireAdmin(request); const vehicleId = (request.params as { id: string }).id; const id = randomUUID(); const secret = randomSecret(); await db.transaction(async (client) => { await client.query('UPDATE device_credentials SET active=false,revoked_at=now() WHERE vehicle_id=$1 AND active=true', [vehicleId]); await client.query('INSERT INTO device_credentials (id,vehicle_id,secret_hash) VALUES ($1,$2,$3)', [id, vehicleId, hashSecret(secret)]); }); await audit('device-credential.rotate', 'success', admin.id, vehicleId); return { credential: { id, token: `${id}.${secret}` } }; });
 
@@ -401,7 +435,9 @@ export async function createApp(services: AppServices = {}) {
              classification=CASE WHEN EXCLUDED.confidence >= plate_observations.confidence THEN EXCLUDED.classification ELSE plate_observations.classification END,
              no_parking=plate_observations.no_parking OR EXCLUDED.no_parking,
              evidence_image_url=COALESCE(EXCLUDED.evidence_image_url, plate_observations.evidence_image_url),
-             annotated_image_url=COALESCE(EXCLUDED.annotated_image_url, plate_observations.annotated_image_url)
+             annotated_image_url=COALESCE(EXCLUDED.annotated_image_url, plate_observations.annotated_image_url),
+             longitude=COALESCE(EXCLUDED.longitude, plate_observations.longitude),
+             latitude=COALESCE(EXCLUDED.latitude, plate_observations.latitude)
            RETURNING id,observation_count`,
           [randomUUID(), taskId, waypointId, occurred.toISOString(), bucket, dedupeKey, plate, confidence, classification, noParking, typeof body.evidenceImageUrl === 'string' ? body.evidenceImageUrl : null, typeof body.annotatedImageUrl === 'string' ? body.annotatedImageUrl : null, longitude, latitude],
         );

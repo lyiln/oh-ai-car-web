@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { loadAmap, loadPlugins, locateToUser, MAP_CLOSEUP_ZOOM, MAP_FALLBACK_CENTER } from '../../lib/amap.js';
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
+import { loadAmap, loadPlugins, locateToUser, convertGpsTrack, MAP_CLOSEUP_ZOOM, MAP_FALLBACK_CENTER } from '../../lib/amap.js';
 import type { MapZone, TrackPoint, Violation, Waypoint } from '../../services/api.js';
 
 function pathToCoordinates(path: Array<{ lng: number; lat: number } | number[]>): Array<[number, number]> {
@@ -26,6 +26,10 @@ export type MapLayers = {
 
 export type GlobalMapMode = 'view' | 'draw' | 'edit';
 
+export type GlobalMapHandle = {
+  focusPosition: (longitude: number, latitude: number, zoom?: number) => void;
+};
+
 type Props = {
   zones: MapZone[];
   waypoints: Waypoint[];
@@ -41,7 +45,7 @@ type Props = {
   onViolationClick?: (violation: Violation) => void;
 };
 
-export function GlobalMap({
+export const GlobalMap = forwardRef<GlobalMapHandle, Props>(function GlobalMap({
   zones,
   waypoints,
   violations = [],
@@ -54,7 +58,7 @@ export function GlobalMap({
   onZoneEdited,
   onZoneSelect,
   onViolationClick,
-}: Props) {
+}, ref) {
   const node = useRef<HTMLDivElement>(null);
   const mapRef = useRef<AMapMapInstance | null>(null);
   const AMapRef = useRef<NonNullable<typeof window.AMap> | null>(null);
@@ -68,6 +72,16 @@ export function GlobalMap({
 
   const callbacksRef = useRef({ onZoneDrawn, onZoneEdited, onZoneSelect, onViolationClick, onModeChange });
   callbacksRef.current = { onZoneDrawn, onZoneEdited, onZoneSelect, onViolationClick, onModeChange };
+
+  useImperativeHandle(ref, () => ({
+    focusPosition(longitude: number, latitude: number, zoom = MAP_CLOSEUP_ZOOM) {
+      const map = mapRef.current;
+      if (!map || !Number.isFinite(longitude) || !Number.isFinite(latitude)) return;
+      map.setCenter?.([longitude, latitude]);
+      map.setZoom?.(zoom);
+      setMessage(`已定位到违停点 ${longitude.toFixed(6)}, ${latitude.toFixed(6)}`);
+    },
+  }), []);
 
   const runLocate = useCallback(async (force = false) => {
     const map = mapRef.current;
@@ -202,10 +216,15 @@ export function GlobalMap({
       for (const violation of violations) {
         if (violation.longitude == null || violation.latitude == null) continue;
         if (!Number.isFinite(violation.longitude) || !Number.isFinite(violation.latitude)) continue;
+        const tipParts = [
+          violation.plate || '未识别车牌',
+          violation.building,
+          `${violation.longitude.toFixed(5)},${violation.latitude.toFixed(5)}`,
+        ].filter(Boolean);
         const marker = new AMap.Marker({
           position: [violation.longitude, violation.latitude],
-          title: violation.plate,
-          content: createMapMarkerContent('amap-violation-dot', violation.plate || '违', violation.plate || '违'),
+          title: tipParts.join(' · '),
+          content: createMapMarkerContent('amap-violation-dot', violation.plate || '违', tipParts.join(' · ')),
           offset: [-18, -12],
         });
         marker.on?.('click', () => callbacksRef.current.onViolationClick?.(violation));
@@ -214,34 +233,39 @@ export function GlobalMap({
       }
     }
 
+    let trackCancelled = false;
     if (layers.track && trackPoints.length > 0) {
-      AMap.convertFrom(
+      void convertGpsTrack(
+        AMap,
         trackPoints.map((point) => [point.longitude, point.latitude]),
-        'gps',
-        (status, result) => {
-          if (status !== 'complete' || !mapRef.current) return;
-          const path = result.locations.map((location) => [location.lng, location.lat]);
-          const polyline = new AMap.Polyline({
-            path,
-            strokeColor: '#3d4fb8',
-            strokeWeight: 5,
-            strokeStyle: 'dashed',
-            showDir: true,
-          });
-          mapRef.current.add(polyline);
-          if (path.at(-1)) {
-            mapRef.current.add(new AMap.Marker({ position: path.at(-1), title: '最新位置' }));
-          }
-        },
-      );
+      ).then(({ path, converted }) => {
+        if (trackCancelled || !mapRef.current || path.length === 0) return;
+        const polyline = new AMap.Polyline({
+          path,
+          strokeColor: '#3d4fb8',
+          strokeWeight: 5,
+          strokeStyle: 'dashed',
+          showDir: true,
+        });
+        mapRef.current.add(polyline);
+        if (path.at(-1)) {
+          mapRef.current.add(new AMap.Marker({ position: path.at(-1), title: '最新位置' }));
+        }
+        if (!converted) {
+          setMessage('高德坐标转换不可用，轨迹已按原始 GPS 显示（可能有偏移）');
+        }
+      });
     }
 
     if (fitTargets.length > 0) {
       map.setFitView(fitTargets);
-      return;
+    } else {
+      void runLocate(false);
     }
 
-    void runLocate(false);
+    return () => {
+      trackCancelled = true;
+    };
   }, [ready, zones, waypoints, violations, trackPoints, layers, selectedZoneId, runLocate]);
 
   useEffect(() => {
@@ -317,4 +341,4 @@ export function GlobalMap({
       <div ref={node} className="global-map-canvas" aria-label="全局运营地图" />
     </section>
   );
-}
+});

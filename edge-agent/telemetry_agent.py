@@ -69,11 +69,17 @@ class TelemetryAgent(Node):
         request = urllib.request.Request(self.api_url, data=json.dumps({"points": [value for _, value in rows]}).encode(), headers={"content-type": "application/json", "authorization": f"Bearer {self.token}"}, method='POST')
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
+                body = response.read()
                 if response.status // 100 != 2:
                     raise urllib.error.HTTPError(self.api_url, response.status, 'Telemetry upload failed', response.headers, None)
             self.outbox.remove([timestamp for timestamp, _ in rows])
+            message = f'Telemetry uploaded {len(rows)} point(s): {body.decode(errors="replace")}'
+            self.get_logger().info(message)
+            print(message, flush=True)
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as error:
-            self.get_logger().warning(f'Telemetry upload deferred: {error}')
+            message = f'Telemetry upload deferred: {error}'
+            self.get_logger().warning(message)
+            print(message, flush=True)
 
 
 def main() -> None:
