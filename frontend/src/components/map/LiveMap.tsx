@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { loadAmap, locateToUser, MAP_CLOSEUP_ZOOM, MAP_FALLBACK_CENTER } from '../../lib/amap.js';
+import { loadAmap, locateToUser, convertGpsTrack, MAP_CLOSEUP_ZOOM, MAP_FALLBACK_CENTER } from '../../lib/amap.js';
 import type { TrackPoint } from '../../services/api.js';
 
 export function LiveMap({
@@ -76,34 +76,34 @@ export function LiveMap({
       return;
     }
 
-    AMap.convertFrom(
+    void convertGpsTrack(
+      AMap,
       points.map((point) => [point.longitude, point.latitude]),
-      'gps',
-      (status, result) => {
-        if (cancelled || status !== 'complete') {
-          setMessage('GPS 坐标转换失败');
-          return;
-        }
-        const path = result.locations.map((location) => [location.lng, location.lat]);
-        const polyline = new AMap.Polyline({
-          path,
-          strokeColor: '#3d4fb8',
-          strokeWeight: 5,
-          strokeStyle: 'dashed',
-          showDir: true,
-        });
-        const marker = new AMap.Marker({ position: path.at(-1), title: '当前位置' });
-        map.clearMap();
-        map.add([polyline, marker]);
-        if (followMode && path.at(-1)) {
-          map.setCenter(path.at(-1)!);
-          map.setZoom(MAP_CLOSEUP_ZOOM);
-        } else {
-          map.setFitView();
-        }
-        setMessage(`已显示 ${points.length} 个轨迹点`);
-      },
-    );
+    ).then(({ path, converted }) => {
+      if (cancelled || path.length === 0) {
+        setMessage('GPS 坐标转换失败');
+        return;
+      }
+      const polyline = new AMap.Polyline({
+        path,
+        strokeColor: '#3d4fb8',
+        strokeWeight: 5,
+        strokeStyle: 'dashed',
+        showDir: true,
+      });
+      const marker = new AMap.Marker({ position: path.at(-1), title: '当前位置' });
+      map.clearMap();
+      map.add([polyline, marker]);
+      if (followMode && path.at(-1)) {
+        map.setCenter(path.at(-1)!);
+        map.setZoom(MAP_CLOSEUP_ZOOM);
+      }
+      setMessage(
+        converted
+          ? `已显示 ${points.length} 个轨迹点`
+          : '高德坐标转换不可用，轨迹已按原始 GPS 显示（可能有偏移）',
+      );
+    });
 
     return () => {
       cancelled = true;

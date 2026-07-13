@@ -1,6 +1,19 @@
 import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import type { Violation } from '../../services/api.js';
 import * as opsClient from '../../services/opsClient.js';
+
+function formatCoordPair(item: Violation): string {
+  if (
+    item.longitude == null ||
+    item.latitude == null ||
+    !Number.isFinite(item.longitude) ||
+    !Number.isFinite(item.latitude)
+  ) {
+    return '-';
+  }
+  return `${item.longitude.toFixed(6)}, ${item.latitude.toFixed(6)}`;
+}
 
 export function ViolationsPage() {
   const [items, setItems] = useState<Violation[]>([]);
@@ -49,11 +62,13 @@ export function ViolationsPage() {
                 <th>车牌</th>
                 <th>类型</th>
                 <th>位置/航点</th>
+                <th>坐标</th>
+                <th>车主/楼栋</th>
                 <th>禁停区</th>
                 <th>发现时间</th>
-                <th>任务</th>
                 <th>优先级</th>
                 <th>状态</th>
+                <th>地图</th>
               </tr>
             </thead>
             <tbody>
@@ -62,15 +77,25 @@ export function ViolationsPage() {
                   <td>{item.plate}</td>
                   <td>{item.type}</td>
                   <td>{item.location ?? item.waypoint ?? '-'}</td>
+                  <td>
+                    <span title={item.coordinateSource === 'telemetry' ? '巡检车遥测回填' : item.coordinateSource === 'observation' ? '观测直传' : '暂无坐标'}>
+                      {formatCoordPair(item)}
+                    </span>
+                  </td>
+                  <td>
+                    {[item.ownerName, item.building, item.parkingSpot].filter(Boolean).join(' · ') || '-'}
+                  </td>
                   <td>{item.zoneName ?? '-'}</td>
                   <td>{new Date(item.occurredAt).toLocaleString()}</td>
-                  <td>{item.taskId?.slice(0, 8) ?? '-'}</td>
                   <td>
                     <span className={item.priority === 'high' ? 'tag tag-danger' : 'tag tag-warning'}>
                       {item.priority === 'high' ? '高' : '普通'}
                     </span>
                   </td>
                   <td>{item.status ?? 'pending'}</td>
+                  <td>
+                    <Link to={`/map?violationId=${encodeURIComponent(item.id)}`}>定位</Link>
+                  </td>
                 </tr>
               ))}
             </tbody>

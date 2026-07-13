@@ -10,10 +10,10 @@
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/devices` | 设备列表（映射 `vehicles`） |
+| GET | `/api/devices` | 设备列表（映射 `vehicles`）；可选 `?q=` 按名称/编号/IP/备注模糊搜索 |
 | POST | `/api/devices` | 管理员创建 |
-| PUT | `/api/devices/:id` | 管理员更新 |
-| DELETE | `/api/devices/:id` | 软删除（archived） |
+| PUT | `/api/devices/:id` | 管理员更新（名称、IP、端口、Bridge、备注；编号不可改） |
+| DELETE | `/api/devices/:id` | 软删除（archived）；仅管理员 |
 | POST | `/api/devices/:id/connect` | 申请 control lease |
 | GET | `/api/devices/:id/status` | 在线/租约状态 |
 | GET | `/api/devices/:id/pose` | 最新 GPS 点 |
@@ -70,6 +70,14 @@
 | POST | `/api/reviews/:event_id/resolve` |
 
 管理员可访问所有车辆；操作员只能读取或处理 `vehicle_members` 授权车辆的违规、审核、报告和工作台统计。无权的单条违规或报告返回 404。
+
+违规列表与详情额外返回：
+
+- `longitude` / `latitude`：优先观测直传，否则用巡检车在 `occurred_at` ±60s 内最近遥测点回填
+- `coordinateSource`：`observation` | `telemetry` | `none`
+- `ownerName` / `building` / `parkingSpot` / `confidence`：来自任务白名单快照与观测
+
+详见 [乱停车违停定位说明](../flows/illegal-parking-localization.md)。
 
 ## 白名单 / 报告 / 设置
 

@@ -5,3 +5,5 @@ coverage/
 *.log
 .env*
 !.env.example
+scripts/.local-jetson-gps.json
+scripts/.local/

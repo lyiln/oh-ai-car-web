@@ -15,12 +15,17 @@ function vehicleToDevice(vehicle: Vehicle): Device {
   };
 }
 
-export async function devices(): Promise<Device[]> {
+export async function devices(q?: string): Promise<Device[]> {
+  const search = new URLSearchParams();
+  const trimmed = q?.trim();
+  if (trimmed) search.set('q', trimmed);
+  const qs = search.toString();
+  const suffix = qs ? `?${qs}` : '';
   try {
-    const result = await apiRequest<{ devices: Device[] }>('/api/devices');
+    const result = await apiRequest<{ devices: Device[] }>(`/api/devices${suffix}`);
     return result.devices ?? [];
   } catch {
-    const result = await apiRequest<{ vehicles: Vehicle[] }>('/api/vehicles');
+    const result = await apiRequest<{ vehicles: Vehicle[] }>(`/api/vehicles${suffix}`);
     return (result.vehicles ?? []).map(vehicleToDevice);
   }
 }
@@ -64,33 +69,19 @@ export async function createDevice(input: {
   }
 }
 
-export async function updateDevice(id: string, patch: Partial<Device>): Promise<Device | { ok: true }> {
-  try {
-    const result = await apiRequest<{ device?: Device; ok?: true }>(`/api/devices/${id}`, {
-      method: 'PUT',
-      body: JSON.stringify(patch),
-    });
-    return result.device ?? { ok: true };
-  } catch {
-    return apiRequest<{ ok: true }>(`/api/vehicles/${id}`, {
-      method: 'PATCH',
-      body: JSON.stringify({
-        name: patch.name,
-        description: patch.description ?? '',
-      }),
-    });
-  }
+export async function updateDevice(
+  id: string,
+  patch: Partial<Pick<Device, 'name' | 'host' | 'tcpPort' | 'videoPort' | 'bridgeUrl' | 'description'>>,
+): Promise<Device> {
+  const result = await apiRequest<{ device: Device }>(`/api/devices/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(patch),
+  });
+  return result.device;
 }
 
 export async function deleteDevice(id: string): Promise<{ ok: true }> {
-  try {
-    return await apiRequest<{ ok: true }>(`/api/devices/${id}`, { method: 'DELETE' });
-  } catch {
-    return apiRequest<{ ok: true }>(`/api/vehicles/${id}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ archived: true }),
-    });
-  }
+  return apiRequest<{ ok: true }>(`/api/devices/${id}`, { method: 'DELETE' });
 }
 
 export async function connectDevice(id: string): Promise<{
@@ -102,11 +93,11 @@ export async function connectDevice(id: string): Promise<{
   expiresAt?: string;
 }> {
   try {
-    return await apiRequest(`/api/devices/${id}/connect`, { method: 'POST' });
+    return await apiRequest(`/api/devices/${id}/connect`, { method: 'POST', body: '{}' });
   } catch {
     const lease = await apiRequest<{ leaseId: string; expiresAt: string; gatewayToken: string }>(
       `/api/vehicles/${id}/control-lease`,
-      { method: 'POST' },
+      { method: 'POST', body: '{}' },
     );
     const list = await devices();
     const device = list.find((entry) => entry.id === id);

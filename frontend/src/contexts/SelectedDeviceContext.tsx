@@ -9,7 +9,7 @@ interface SelectedDeviceContextValue {
   setSelectedId: (id: string | null) => void;
   devices: Device[];
   selectedDevice: Device | null;
-  refreshDevices: () => Promise<Device[]>;
+  refreshDevices: (q?: string) => Promise<Device[]>;
   loading: boolean;
   error: string | null;
 }
@@ -28,15 +28,17 @@ export function SelectedDeviceProvider({ children }: { children: ReactNode }) {
     else localStorage.removeItem(STORAGE_KEY);
   }, []);
 
-  const refreshDevices = useCallback(async () => {
+  const refreshDevices = useCallback(async (q?: string) => {
     setLoading(true);
     try {
-      const next = await deviceClient.devices();
+      const next = await deviceClient.devices(q);
       setDevices(next);
       setError(null);
       setSelectedIdState((current) => {
         const preferred = current ?? localStorage.getItem(STORAGE_KEY);
         if (preferred && next.some((device) => device.id === preferred)) return preferred;
+        // Keep selection when a search temporarily hides the current device.
+        if (q?.trim() && preferred) return preferred;
         if (next[0]) {
           localStorage.setItem(STORAGE_KEY, next[0].id);
           return next[0].id;

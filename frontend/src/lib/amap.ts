@@ -25,6 +25,50 @@ export type LocateResult = {
   message: string;
 };
 
+export type GpsCoordinate = [number, number];
+
+export type ConvertGpsResult = {
+  path: GpsCoordinate[];
+  converted: boolean;
+};
+
+const GPS_CONVERT_TIMEOUT_MS = 8000;
+
+/** Convert WGS-84 GPS track to GCJ-02 for AMap; falls back to raw coords when API/proxy is unreachable. */
+export function convertGpsTrack(
+  AMap: NonNullable<typeof window.AMap>,
+  points: GpsCoordinate[],
+): Promise<ConvertGpsResult> {
+  if (points.length === 0) return Promise.resolve({ path: [], converted: false });
+
+  const fallback = (): ConvertGpsResult => ({
+    path: points.map(([lng, lat]) => [lng, lat]),
+    converted: false,
+  });
+
+  if (!AMap.convertFrom) return Promise.resolve(fallback());
+
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(() => resolve(fallback()), GPS_CONVERT_TIMEOUT_MS);
+    try {
+      AMap.convertFrom(points, 'gps', (status, result) => {
+        window.clearTimeout(timer);
+        if (status === 'complete' && result?.locations?.length) {
+          resolve({
+            path: result.locations.map((location) => [location.lng, location.lat]),
+            converted: true,
+          });
+          return;
+        }
+        resolve(fallback());
+      });
+    } catch {
+      window.clearTimeout(timer);
+      resolve(fallback());
+    }
+  });
+}
+
 export function loadAmap(key: string): Promise<NonNullable<typeof window.AMap>> {
   if (window.AMap) return Promise.resolve(window.AMap);
   if (!amapLoading) {

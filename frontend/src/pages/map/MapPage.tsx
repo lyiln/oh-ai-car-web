@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useEffect, useRef, useState } from 'react';
+import { Link, useSearchParams } from 'react-router-dom';
 import { FormModal } from '../../components/layout/FormModal.js';
-import { GlobalMap, type GlobalMapMode, type MapLayers } from '../../components/map/GlobalMap.js';
+import { GlobalMap, type GlobalMapHandle, type GlobalMapMode, type MapLayers } from '../../components/map/GlobalMap.js';
 import type { MapZone, ResidentDestination, TrackPoint, Violation, Waypoint } from '../../services/api.js';
 import * as deviceClient from '../../services/deviceClient.js';
 import * as mapClient from '../../services/mapClient.js';
@@ -24,9 +24,21 @@ function parseCoordinates(text: string): Array<[number, number]> {
     });
 }
 
+function coordinateSourceLabel(source: string | null | undefined): string {
+  if (source === 'observation') return '观测直传';
+  if (source === 'telemetry') return '巡检车遥测回填';
+  return '暂无';
+}
+
+function formatCoord(value: number | null | undefined): string {
+  return value != null && Number.isFinite(value) ? value.toFixed(6) : '-';
+}
+
 export function MapPage() {
   const { selectedId } = useSelectedDevice();
   const { user } = useAuth();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const mapRef = useRef<GlobalMapHandle>(null);
   const [zones, setZones] = useState<MapZone[]>([]);
   const [waypoints, setWaypoints] = useState<Waypoint[]>([]);
   const [violations, setViolations] = useState<Violation[]>([]);
@@ -46,6 +58,18 @@ export function MapPage() {
   const [selectedZoneId, setSelectedZoneId] = useState<string | null>(null);
   const [selectedViolation, setSelectedViolation] = useState<Violation | null>(null);
 
+  const focusViolation = (violation: Violation) => {
+    setSelectedViolation(violation);
+    if (
+      violation.longitude != null &&
+      violation.latitude != null &&
+      Number.isFinite(violation.longitude) &&
+      Number.isFinite(violation.latitude)
+    ) {
+      mapRef.current?.focusPosition(violation.longitude, violation.latitude);
+    }
+  };
+
   const refresh = async () => {
     const [nextZones, nextWaypoints, nextDestinations, nextViolations] = await Promise.all([
       mapClient.zones(),
@@ -62,11 +86,34 @@ export function MapPage() {
     } else {
       setTrackPoints([]);
     }
+    return nextViolations;
   };
 
   useEffect(() => {
-    void refresh().catch((reason: unknown) => setMessage(reason instanceof Error ? reason.message : '加载失败'));
+    void refresh()
+      .then((nextViolations) => {
+        const violationId = searchParams.get('violationId');
+        if (!violationId) return;
+        const match = nextViolations.find((item) => item.id === violationId);
+        if (match) {
+          setSelectedViolation(match);
+          setSearchParams({}, { replace: true });
+        }
+      })
+      .catch((reason: unknown) => setMessage(reason instanceof Error ? reason.message : '加载失败'));
+    // Deep-link focus runs once after load; layers.track / selectedId refresh intentionally re-fetch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- searchParams consumed once on load path
   }, [selectedId, layers.track]);
+
+  useEffect(() => {
+    if (!selectedViolation) return;
+    const { longitude, latitude } = selectedViolation;
+    if (longitude == null || latitude == null || !Number.isFinite(longitude) || !Number.isFinite(latitude)) return;
+    const timer = window.setTimeout(() => {
+      mapRef.current?.focusPosition(longitude, latitude);
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [selectedViolation?.id, selectedViolation?.longitude, selectedViolation?.latitude]);
 
   const closeDrawer = () => {
     setAddOpen(false);
@@ -191,6 +238,7 @@ export function MapPage() {
 
       <div className="global-map-layout">
         <GlobalMap
+          ref={mapRef}
           zones={zones}
           waypoints={waypoints}
           violations={violations}
@@ -202,7 +250,7 @@ export function MapPage() {
           onZoneDrawn={openNameModal}
           onZoneEdited={(zoneId, coordinates) => void saveEditedZone(zoneId, coordinates)}
           onZoneSelect={(zoneId) => { setSelectedZoneId(zoneId); setMode('view'); }}
-          onViolationClick={setSelectedViolation}
+          onViolationClick={focusViolation}
         />
 
         <aside className="global-map-side panel">
@@ -269,13 +317,40 @@ export function MapPage() {
             <dt>时间</dt><dd>{new Date(selectedViolation.occurredAt).toLocaleString()}</dd>
             <dt>禁停区</dt><dd>{selectedViolation.zoneName ?? '-'}</dd>
             <dt>航点</dt><dd>{selectedViolation.waypoint ?? '-'}</dd>
+            <dt>经度</dt><dd>{formatCoord(selectedViolation.longitude)}</dd>
+            <dt>纬度</dt><dd>{formatCoord(selectedViolation.latitude)}</dd>
+            <dt>坐标来源</dt><dd>{coordinateSourceLabel(selectedViolation.coordinateSource)}</dd>
+            <dt>车主</dt><dd>{selectedViolation.ownerName ?? '-'}</dd>
+            <dt>楼栋</dt><dd>{selectedViolation.building ?? '-'}</dd>
+            <dt>登记车位</dt><dd>{selectedViolation.parkingSpot ?? '-'}</dd>
+            <dt>置信度</dt>
+            <dd>
+              {selectedViolation.confidence != null && Number.isFinite(selectedViolation.confidence)
+                ? `${(selectedViolation.confidence * 100).toFixed(0)}%`
+                : '-'}
+            </dd>
             <dt>优先级</dt><dd>{selectedViolation.priority ?? '-'}</dd>
             <dt>状态</dt><dd>{selectedViolation.status ?? '-'}</dd>
           </dl>
+          {selectedViolation.longitude == null || selectedViolation.latitude == null ? (
+            <p className="muted">暂无 GPS，仅显示航点/禁停区名称。</p>
+          ) : null}
           {selectedViolation.evidenceUrl && (
             <img className="review-thumb" src={selectedViolation.evidenceUrl} alt="证据截图" />
           )}
           <div className="button-row">
+            <button
+              type="button"
+              className="secondary"
+              disabled={selectedViolation.longitude == null || selectedViolation.latitude == null}
+              onClick={() => {
+                if (selectedViolation.longitude != null && selectedViolation.latitude != null) {
+                  mapRef.current?.focusPosition(selectedViolation.longitude, selectedViolation.latitude);
+                }
+              }}
+            >
+              定位到此
+            </button>
             <Link className="primary" to="/reviews">去审核</Link>
           </div>
         </aside>
