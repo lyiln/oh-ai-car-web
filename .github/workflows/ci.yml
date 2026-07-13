@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Only source checkout is needed.  The workflow never publishes images or deploys.
+permissions:
+  contents: read
+
+# A newer commit makes an in-progress run for the same branch obsolete.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: TypeScript and edge-agent tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      # package-lock.json is the dependency source of truth for all npm workspaces.
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Set up Python for dependency-free edge-agent tests
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Type-check workspaces
+        run: |
+          set -o pipefail
+          npm run typecheck | tee typecheck.log
+
+      - name: Run JavaScript unit tests
+        run: |
+          set -o pipefail
+          npm test | tee unit-tests.log
+
+      # These tests use the adapter's mock mode. They do not require a camera,
+      # Jetson, ROS 2, GPU, local YOLO checkout, or model weights.
+      - name: Run hardware-independent edge-agent tests
+        run: |
+          set -o pipefail
+          python -m unittest discover -s edge-agent/tests -p 'test_*.py' | tee edge-agent-tests.log
+
+      - name: Upload quality logs when a check fails
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: quality-logs-${{ github.run_id }}
+          path: |
+            typecheck.log
+            unit-tests.log
+            edge-agent-tests.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  container-integration:
+    name: PostGIS and Docker smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      # Testcontainers starts a disposable postgis/postgis container. No external
+      # database, cloud account, hardware device, or repository secret is used.
+      - name: Run PostGIS integration tests
+        run: |
+          set -o pipefail
+          npm run test:integration --workspace=@oh-ai-car-web/backend | tee postgis-integration.log
+
+      - name: Validate Compose configuration
+        env:
+          POSTGRES_PASSWORD: ci-postgres-password
+          SESSION_SECRET: ci-session-secret-at-least-32-characters-long
+          BOOTSTRAP_ADMIN_USERNAME: ci-admin
+          BOOTSTRAP_ADMIN_PASSWORD: ci-admin-password
+          BOOTSTRAP_ADMIN_EMAIL: ci-admin@example.test
+          SMTP_HOST: smtp.example.test
+          SMTP_USER: ci-mailer
+          SMTP_PASSWORD: ci-mailer-password
+          SMTP_FROM: CI <ci@example.test>
+          PLATFORM_PUBLIC_ORIGIN: http://127.0.0.1:8080
+          VITE_AMAP_KEY: ci-amap-key
+          AMAP_SECURITY_JS_CODE: ci-amap-security-code
+        run: |
+          set -o pipefail
+          docker compose config --quiet | tee compose-config.log
+
+      # The existing smoke test runs `docker compose up --build`, verifies the
+      # Nginx/WebSocket path, then removes its isolated containers and volumes.
+      # It is the project's Docker build and runtime verification.
+      - name: Build and smoke-test the Compose stack
+        run: |
+          set -o pipefail
+          npm run test:deploy-live | tee docker-smoke.log
+
+      - name: Collect Docker diagnostics when a container check fails
+        if: failure()
+        run: |
+          docker ps -a
+          docker images
+          docker compose logs --no-color || true
+
+      - name: Upload container logs when a check fails
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: container-logs-${{ github.run_id }}
+          path: |
+            postgis-integration.log
+            compose-config.log
+            docker-smoke.log
+          if-no-files-found: ignore
+          retention-days: 14
