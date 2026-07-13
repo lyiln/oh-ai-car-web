@@ -29,13 +29,16 @@ and [tasks/change-report-vehicle-fleet-platform-mvp.md](tasks/change-report-vehi
 
 ```sh
 npm install
-npm run dev:gateway
 npm run dev:frontend
+PLATFORM_API_URL=http://127.0.0.1:8788 npm run dev:gateway
 ```
 
 The gateway listens on `http://127.0.0.1:8787` and WebSocket endpoint
 `ws://127.0.0.1:8787/control`. The Vite development UI uses
 `http://127.0.0.1:5173`.
+
+The gateway requires `PLATFORM_API_URL` and validates a platform control lease
+before it connects to a car; unleased direct-control mode is no longer exposed.
 
 Run `npm test`, `npm run typecheck`, and `npm run build` before a review.
 

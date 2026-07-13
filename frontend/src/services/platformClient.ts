@@ -36,6 +36,8 @@ export class PlatformClient {
   logout() { return this.request<{ ok: true }>('/api/auth/logout', { method: 'POST', body: '{}' }); }
   vehicles() { return this.request<{ vehicles: Vehicle[] }>('/api/vehicles'); }
   users() { return this.request<{ users: PlatformUser[] }>('/api/users'); }
+  createUser(input: { username: string; displayName: string; password: string; role: 'admin' | 'operator'; email?: string }) { return this.request<{ user: PlatformUser }>('/api/users', { method: 'POST', body: JSON.stringify(input) }); }
+  updateUser(id: string, input: { active?: boolean; email?: string | null }) { return this.request<{ ok: true }>(`/api/users/${id}`, { method: 'PATCH', body: JSON.stringify(input) }); }
   audit() { return this.request<{ logs: AuditLog[] }>('/api/audit-logs'); }
   track(vehicleId: string, from?: string, to?: string) { const search = new URLSearchParams(); if (from) search.set('from', from); if (to) search.set('to', to); return this.request<{ points: TrackPoint[] }>(`/api/vehicles/${vehicleId}/track?${search}`); }
   acquireLease(vehicleId: string) { return this.request<Lease>(`/api/vehicles/${vehicleId}/control-lease`, { method: 'POST', body: '{}' }); }

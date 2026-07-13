@@ -5,12 +5,39 @@ import * as opsClient from '../../services/opsClient.js';
 export function ReportsPage() {
   const [reports, setReports] = useState<PatrolReport[]>([]);
   const [error, setError] = useState('');
+  const [busy, setBusy] = useState('');
 
   useEffect(() => {
     void opsClient.reports()
       .then(setReports)
       .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : '加载失败'));
   }, []);
+
+  const showHtml = (content: string) => {
+    const url = URL.createObjectURL(new Blob([content], { type: 'text/html;charset=utf-8' }));
+    window.open(url, '_blank', 'noopener,noreferrer');
+    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  };
+  const downloadCsv = (content: string, taskId: string) => {
+    const url = URL.createObjectURL(new Blob([`\uFEFF${content}`], { type: 'text/csv;charset=utf-8' }));
+    const anchor = document.createElement('a'); anchor.href = url; anchor.download = `patrol-report-${taskId.slice(0, 8)}.csv`; anchor.click();
+    URL.revokeObjectURL(url);
+  };
+  const openReport = async (report: PatrolReport, action: 'html' | 'csv') => {
+    setBusy(`${report.id}:${action}`); setError('');
+    try {
+      const detail = await opsClient.report(report.id);
+      if (!detail) throw new Error('报告不存在');
+      if (action === 'html') {
+        if (!detail.htmlContent) throw new Error('报告 HTML 内容为空');
+        showHtml(detail.htmlContent);
+      } else {
+        if (!detail.csvContent) throw new Error('报告 CSV 内容为空');
+        downloadCsv(detail.csvContent, detail.taskId);
+      }
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '报告操作失败'); }
+    finally { setBusy(''); }
+  };
 
   return (
     <div className="page">
@@ -35,9 +62,8 @@ export function ReportsPage() {
               </dl>
               {report.summary && <p>{report.summary}</p>}
               <div className="button-row">
-                {report.htmlUrl ? <a href={report.htmlUrl} target="_blank" rel="noreferrer">HTML 预览</a> : <span className="muted">无 HTML</span>}
-                {report.csvUrl && <a href={report.csvUrl}>CSV</a>}
-                {report.zipUrl && <a href={report.zipUrl}>ZIP</a>}
+                <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void openReport(report, 'html')}>HTML 预览</button>
+                <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void openReport(report, 'csv')}>下载 CSV</button>
               </div>
             </article>
           ))}

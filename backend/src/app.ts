@@ -5,6 +5,7 @@ import cors from '@fastify/cors';
 import websocket from '@fastify/websocket';
 import Fastify, { type FastifyRequest } from 'fastify';
 import type { PoolClient } from 'pg';
+import { parseDocument } from 'yaml';
 import { loadConfig, type Config } from './config.js';
 import { Database } from './db/index.js';
 import { createSmtpOtpMailer, type OtpMailer } from './otp-mailer.js';
@@ -48,6 +49,31 @@ function normalizeEmail(value: string): string { return value.trim().toLowerCase
 function isEmail(value: string): boolean { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value); }
 function userDto(user: UserRow) { return { id: user.id, username: user.username, displayName: user.display_name, role: user.role, active: user.active, email: user.email }; }
 function generatePasscode(): string { return String(Math.floor(100_000 + Math.random() * 900_000)); }
+type ImportedWaypoint = { name: string; x: number; y: number; yaw: number; dwellSeconds: number; noParkingRoi: number[] | null };
+function parsePatrolRouteYaml(source: string): ImportedWaypoint[] {
+  const document = parseDocument(source, { prettyErrors: true, uniqueKeys: true });
+  if (document.errors.length) throw Object.assign(new Error(`YAML 解析失败：${document.errors[0]?.message ?? '格式错误'}`), { statusCode: 400 });
+  const root = object(document.toJS());
+  if (!root || !Array.isArray(root.waypoints) || root.waypoints.length < 3 || root.waypoints.length > 8) {
+    throw Object.assign(new Error('waypoints 必须包含 3 到 8 个航点'), { statusCode: 400 });
+  }
+  const names = new Set<string>();
+  return root.waypoints.map((raw, index) => {
+    const point = object(raw); const name = string(point?.name, `waypoints[${index}].name`);
+    if (names.has(name)) throw Object.assign(new Error(`航点名称重复：${name}`), { statusCode: 400 });
+    names.add(name);
+    const x = number(point?.x, `waypoints[${index}].x`, -Number.MAX_VALUE, Number.MAX_VALUE);
+    const y = number(point?.y, `waypoints[${index}].y`, -Number.MAX_VALUE, Number.MAX_VALUE);
+    const yaw = number(point?.yaw, `waypoints[${index}].yaw`, -Number.MAX_VALUE, Number.MAX_VALUE);
+    const dwellSeconds = number(point?.dwellSeconds, `waypoints[${index}].dwellSeconds`, 8, 10);
+    if (!Number.isInteger(dwellSeconds)) throw Object.assign(new Error(`waypoints[${index}].dwellSeconds 必须为整数`), { statusCode: 400 });
+    const roi = point?.noParkingRoi;
+    if (roi !== undefined && (!Array.isArray(roi) || roi.length !== 4 || !roi.every((value) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1))) {
+      throw Object.assign(new Error(`waypoints[${index}].noParkingRoi 必须为 4 个 0 到 1 的数值`), { statusCode: 400 });
+    }
+    return { name, x, y, yaw, dwellSeconds, noParkingRoi: roi ? roi as number[] : null };
+  });
+}
 
 export class RealtimeHub {
   private readonly subscribers = new Map<string, Set<{ send: (value: string) => void }>>();
@@ -340,6 +366,33 @@ export async function createApp(services: AppServices = {}) {
   });
   app.put('/api/vehicles/:id/members', async (request) => { const admin = await requireAdmin(request); const vehicleId = (request.params as { id: string }).id; const body = object(request.body); if (!Array.isArray(body?.userIds) || !body.userIds.every((id) => typeof id === 'string')) throw new Error('userIds must be strings'); await db.transaction(async (client) => { await client.query('DELETE FROM vehicle_members WHERE vehicle_id=$1', [vehicleId]); for (const userId of body.userIds as string[]) await client.query('INSERT INTO vehicle_members (vehicle_id,user_id) VALUES ($1,$2)', [vehicleId, userId]); }); await audit('vehicle.members.update', 'success', admin.id, vehicleId); return { ok: true }; });
   app.post('/api/vehicles/:id/device-credentials', async (request) => { const admin = await requireAdmin(request); const vehicleId = (request.params as { id: string }).id; const id = randomUUID(); const secret = randomSecret(); await db.transaction(async (client) => { await client.query('UPDATE device_credentials SET active=false,revoked_at=now() WHERE vehicle_id=$1 AND active=true', [vehicleId]); await client.query('INSERT INTO device_credentials (id,vehicle_id,secret_hash) VALUES ($1,$2,$3)', [id, vehicleId, hashSecret(secret)]); }); await audit('device-credential.rotate', 'success', admin.id, vehicleId); return { credential: { id, token: `${id}.${secret}` } }; });
+  app.get('/api/vehicles/:id/patrol-routes', async (request) => {
+    const user = await requireUser(request); const vehicleId = (request.params as { id: string }).id;
+    if (!await canAccessVehicle(user, vehicleId)) throw Object.assign(new Error('Vehicle access denied'), { statusCode: 403 });
+    const result = await db.query<{ id: string; name: string; mapVersion: string; waypointCount: number }>(
+      `SELECT r.id,r.name,r.map_version AS "mapVersion",count(w.id)::int AS "waypointCount"
+       FROM patrol_routes r LEFT JOIN patrol_waypoints w ON w.route_id=r.id WHERE r.vehicle_id=$1
+       GROUP BY r.id ORDER BY r.created_at DESC`, [vehicleId],
+    );
+    return { routes: result.rows };
+  });
+  app.post('/api/vehicles/:id/patrol-routes', async (request) => {
+    const admin = await requireAdmin(request); const vehicleId = (request.params as { id: string }).id; const body = object(request.body);
+    const name = string(body?.name, 'name'); const mapVersion = string(body?.mapVersion, 'mapVersion'); const yaml = string(body?.yaml, 'yaml');
+    const waypoints = parsePatrolRouteYaml(yaml); const routeId = randomUUID();
+    await db.transaction(async (client) => {
+      const vehicle = await client.query('SELECT id FROM vehicles WHERE id=$1 AND archived=false FOR UPDATE', [vehicleId]);
+      if (!vehicle.rowCount) throw Object.assign(new Error('Vehicle not found'), { statusCode: 404 });
+      const duplicate = await client.query('SELECT id FROM patrol_routes WHERE vehicle_id=$1 AND name=$2 AND map_version=$3', [vehicleId, name, mapVersion]);
+      if (duplicate.rowCount) throw Object.assign(new Error('该设备已存在相同名称和地图版本的路线'), { statusCode: 409 });
+      await client.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [routeId, vehicleId, name, mapVersion, yaml, admin.id]);
+      for (const [ordinal, waypoint] of waypoints.entries()) {
+        await client.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds,no_parking_roi) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)', [randomUUID(), routeId, ordinal, waypoint.name, waypoint.x, waypoint.y, waypoint.yaw, waypoint.dwellSeconds, waypoint.noParkingRoi ? JSON.stringify(waypoint.noParkingRoi) : null]);
+      }
+    });
+    await audit('patrol-route.import', 'success', admin.id, vehicleId, { routeId, name, mapVersion, waypointCount: waypoints.length });
+    return { route: { id: routeId, name, mapVersion, waypointCount: waypoints.length } };
+  });
 
   async function acquireLease(client: PoolClient, user: UserRow, vehicleId: string) {
     await client.query('SELECT id FROM vehicles WHERE id=$1 FOR UPDATE', [vehicleId]);
@@ -385,7 +438,7 @@ export async function createApp(services: AppServices = {}) {
     const vehicleId = await deviceVehicle(request);
     const taskId = (request.params as { id: string }).id;
     const body = object(request.body);
-    const task = await db.query<{ status: string; whitelist_id: string; route_id: string }>('SELECT status,whitelist_id,route_id FROM patrol_tasks WHERE id=$1 AND vehicle_id=$2', [taskId, vehicleId]);
+    const task = await db.query<{ status: string; whitelist_id: string; route_id: string; review_confidence_threshold: number; dedupe_window_sec: number }>('SELECT status,whitelist_id,route_id,review_confidence_threshold,dedupe_window_sec FROM patrol_tasks WHERE id=$1 AND vehicle_id=$2', [taskId, vehicleId]);
     if (!task.rows[0]) throw Object.assign(new Error('Task not found'), { statusCode: 404 });
     if (body?.type === 'stop_confirmed') {
       if (task.rows[0].status !== 'cancellation_requested' || body.zeroVelocity !== true) throw Object.assign(new Error('Zero-velocity confirmation is required'), { statusCode: 409 });
@@ -411,18 +464,20 @@ export async function createApp(services: AppServices = {}) {
       const occurred = new Date(occurredAt);
       if (Number.isNaN(occurred.getTime())) throw Object.assign(new Error('occurredAt is invalid'), { statusCode: 400 });
       const plate = typeof body.plate === 'string' && body.plate.trim() ? normalisePlate(body.plate) : null;
-      const whitelist = plate && confidence >= 0.75
+      const threshold = task.rows[0].review_confidence_threshold;
+      const dedupeWindowMs = task.rows[0].dedupe_window_sec * 1000;
+      const whitelist = plate && confidence >= threshold
         ? await db.query<{ category: 'private' | 'visitor' }>('SELECT category FROM whitelist_entries WHERE whitelist_id=$1 AND plate=$2', [task.rows[0].whitelist_id, plate])
         : { rows: [] as Array<{ category: 'private' | 'visitor' }> };
-      const classification = confidence < 0.75 || !plate
+      const classification = confidence < threshold || !plate
         ? 'pending_review'
         : whitelist.rows[0]?.category === 'private' ? 'registered_private'
           : whitelist.rows[0]?.category === 'visitor' ? 'visitor' : 'suspected_external';
       const noParking = bboxIntersectsRoi(body.vehicleBox, waypoint.rows[0].no_parking_roi);
       const longitude = body.longitude === undefined ? null : number(body.longitude, 'longitude', -180, 180);
       const latitude = body.latitude === undefined ? null : number(body.latitude, 'latitude', -90, 90);
-      const bucket = new Date(Math.floor(occurred.getTime() / 1_800_000) * 1_800_000).toISOString();
-      const dedupeKey = plate && confidence >= 0.75 ? plate : randomUUID();
+      const bucket = new Date(Math.floor(occurred.getTime() / dedupeWindowMs) * dedupeWindowMs).toISOString();
+      const dedupeKey = plate && confidence >= threshold ? plate : randomUUID();
       // FR-005: plate_observations + patrol_events + reviews 原子写入，防止部分失败导致 review 队列缺项
       const { observationId, observationCount } = await db.transaction(async (client) => {
         const obs = await client.query<{ id: string; observation_count: number }>(

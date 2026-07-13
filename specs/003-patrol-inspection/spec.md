@@ -41,8 +41,9 @@ task/plate/waypoint/30-minute window and appears in the report.
   administrator configures routes, ROI and whitelists.
 - **FR-004**: Scheduler APIs use the existing per-vehicle device credential;
   browser clients cannot submit scheduler events.
-- **FR-005**: Recognition confidence below 0.75 is pending review. Other
-  plates are classified as registered private, visitor or suspected external.
+- **FR-005**: Recognition confidence below the task's immutable review-threshold
+  snapshot (default `0.75`) is pending review. Other plates are classified as
+  registered private, visitor or suspected external.
 - **FR-006**: No-parking is an independent tag when a vehicle box intersects
   the selected waypoint's camera-frame ROI.
 - **FR-007**: Reports contain task metadata, completion state, counts by
@@ -54,3 +55,5 @@ task/plate/waypoint/30-minute window and appears in the report.
 - Autonomous motion and manual takeover are coordinated by the vehicle-side
   scheduler; this feature does not change the TCP control protocol.
 - PostgreSQL remains the system of record.
+- The dedupe window is snapshotted with the task (default 30 minutes); an
+  administrator may change only the default used by future tasks.

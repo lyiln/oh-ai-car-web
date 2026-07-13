@@ -16,6 +16,17 @@ export function PatrolRecordDetailPage() {
   const [points, setPoints] = useState<TrackPoint[]>([]);
   const [error, setError] = useState('');
 
+  const previewHtml = () => {
+    if (!report?.htmlContent) return;
+    const url = URL.createObjectURL(new Blob([report.htmlContent], { type: 'text/html;charset=utf-8' }));
+    window.open(url, '_blank', 'noopener,noreferrer'); window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  };
+  const downloadCsv = () => {
+    if (!report?.csvContent) return;
+    const url = URL.createObjectURL(new Blob([`\uFEFF${report.csvContent}`], { type: 'text/csv;charset=utf-8' }));
+    const anchor = document.createElement('a'); anchor.href = url; anchor.download = `patrol-report-${report.taskId.slice(0, 8)}.csv`; anchor.click(); URL.revokeObjectURL(url);
+  };
+
   useEffect(() => {
     if (!id) return;
     void (async () => {
@@ -97,9 +108,8 @@ export function PatrolRecordDetailPage() {
             <div className="stack-form">
               <p>{report.summary ?? `任务 ${report.taskId} 报告`}</p>
               <div className="button-row">
-                {report.htmlUrl && <a href={report.htmlUrl} target="_blank" rel="noreferrer">HTML 预览</a>}
-                {report.csvUrl && <a href={report.csvUrl}>下载 CSV</a>}
-                {report.zipUrl && <a href={report.zipUrl}>下载 ZIP</a>}
+                <button type="button" className="secondary" disabled={!report.htmlContent} onClick={previewHtml}>HTML 预览</button>
+                <button type="button" className="secondary" disabled={!report.csvContent} onClick={downloadCsv}>下载 CSV</button>
               </div>
             </div>
           )

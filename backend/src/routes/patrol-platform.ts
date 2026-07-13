@@ -43,6 +43,8 @@ type PatrolTaskRow = {
   device_name?: string;
   route_name?: string;
   event_count?: number;
+  review_confidence_threshold?: number;
+  dedupe_window_sec?: number;
 };
 
 type RouteUser = {
@@ -95,7 +97,7 @@ function iso(value: Date | string | null | undefined): string | null {
   return value instanceof Date ? value.toISOString() : String(value);
 }
 
-function deviceDto(row: DeviceRow) {
+function deviceDto(row: DeviceRow, status?: 'online' | 'offline' | 'patrolling') {
   return {
     id: row.id,
     code: row.code,
@@ -108,6 +110,7 @@ function deviceDto(row: DeviceRow) {
     lastSeenAt: iso(row.last_seen_at),
     lastPatrolAt: iso(row.last_patrol_at),
     archived: row.archived,
+    status: status ?? (row.last_seen_at && Date.now() - new Date(row.last_seen_at).getTime() < 2 * 60_000 ? 'online' : 'offline'),
   };
 }
 
@@ -140,6 +143,19 @@ function optionalValidUntil(value: unknown): string | null {
   const date = new Date(trimmed);
   if (Number.isNaN(date.getTime())) throw httpError('validUntil is invalid', 400);
   return date.toISOString();
+}
+
+const DEFAULT_PATROL_RULES = { reviewConfidenceThreshold: 0.75, dedupeWindowSec: 1800 } as const;
+function patrolRules(rows: Array<{ key: string; value: unknown }>) {
+  const values = new Map(rows.map((row) => [row.key, row.value]));
+  const threshold = values.get('reviewConfidenceThreshold');
+  const window = values.get('dedupeWindowSec');
+  return {
+    reviewConfidenceThreshold: typeof threshold === 'number' && threshold >= 0 && threshold <= 1
+      ? threshold : DEFAULT_PATROL_RULES.reviewConfidenceThreshold,
+    dedupeWindowSec: typeof window === 'number' && Number.isInteger(window) && window >= 60 && window <= 86_400
+      ? window : DEFAULT_PATROL_RULES.dedupeWindowSec,
+  };
 }
 
 type WhitelistEntryRow = {
@@ -269,7 +285,11 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
          ORDER BY v.name`,
         [user.id, pattern],
       );
-    return { devices: result.rows.map(deviceDto) };
+    const active = await db.query<{ vehicle_id: string }>(
+      "SELECT vehicle_id FROM patrol_tasks WHERE status IN ('queued','running','cancellation_requested')",
+    );
+    const activeIds = new Set(active.rows.map((row) => row.vehicle_id));
+    return { devices: result.rows.map((row) => deviceDto(row, activeIds.has(row.id) ? 'patrolling' : undefined)) };
   });
 
   app.post('/api/devices', async (request) => {
@@ -440,7 +460,7 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
       pendingReviews: pendingReviews.rows[0]?.c ?? 0,
       violations: violations.rows[0]?.c ?? 0,
       recentTasks: recentTasks.rows.map(taskDto),
-      todayAlerts: todayAlerts.rows.map((row) => ({
+      alerts: todayAlerts.rows.map((row) => ({
         id: row.id,
         message: `${row.plate ?? '未知车牌'} · ${row.violation_type}`,
         priority: row.priority,
@@ -503,10 +523,14 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
          FROM whitelist_entries WHERE whitelist_id=$2`,
         [snapshotId, whitelist.rows[0].id],
       );
+      const ruleRows = await client.query<{ key: string; value: unknown }>(
+        "SELECT key,value FROM platform_settings WHERE key IN ('reviewConfidenceThreshold','dedupeWindowSec')",
+      );
+      const rules = patrolRules(ruleRows.rows);
       await client.query(
-        `INSERT INTO patrol_tasks (id, vehicle_id, route_id, whitelist_id, shift, status, created_by_user_id)
-         VALUES ($1,$2,$3,$4,$5,'queued',$6)`,
-        [id, deviceId, routeId, snapshotId, shift, user.id],
+        `INSERT INTO patrol_tasks (id, vehicle_id, route_id, whitelist_id, shift, status, created_by_user_id, review_confidence_threshold, dedupe_window_sec)
+         VALUES ($1,$2,$3,$4,$5,'queued',$6,$7,$8)`,
+        [id, deviceId, routeId, snapshotId, shift, user.id, rules.reviewConfidenceThreshold, rules.dedupeWindowSec],
       );
       await client.query("INSERT INTO patrol_events (id,task_id,event_type,details) VALUES ($1,$2,'status',$3)", [randomUUID(), id, JSON.stringify({ status: 'queued' })]);
     });
@@ -673,6 +697,8 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
         responseCompleted: responseStats.rows[0]?.completed ?? 0,
         responseAiAdviceCount: responseStats.rows[0]?.ai_used ?? 0,
         responseAverageSeconds: responseStats.rows[0]?.average_seconds ?? null,
+        reviewConfidenceThreshold: taskRow.review_confidence_threshold ?? DEFAULT_PATROL_RULES.reviewConfidenceThreshold,
+        dedupeWindowSec: taskRow.dedupe_window_sec ?? DEFAULT_PATROL_RULES.dedupeWindowSec,
         status: taskRow.status,
       };
 
@@ -1335,8 +1361,7 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     const result = await db.query<{ key: string; value: unknown; updated_at: Date }>(
       'SELECT key, value, updated_at FROM platform_settings ORDER BY key',
     );
-    const settings: Record<string, unknown> = {};
-    for (const row of result.rows) settings[row.key] = row.value;
+    const settings = patrolRules(result.rows);
     return { settings, entries: result.rows.map((row) => ({ key: row.key, value: row.value, updatedAt: iso(row.updated_at) })) };
   });
 
@@ -1344,16 +1369,17 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     const admin = await requireAdmin(request);
     const body = object(request.body);
     if (!body) throw httpError('body is required', 400);
-
+    const settings = object(body.settings) ?? body;
+    const allowed = new Set(['reviewConfidenceThreshold', 'dedupeWindowSec']);
+    if (!Object.keys(settings).length || Object.keys(settings).some((key) => !allowed.has(key))) {
+      throw httpError('Only reviewConfidenceThreshold and dedupeWindowSec can be updated', 400);
+    }
     const upserts: Array<{ key: string; value: unknown }> = [];
-    if (typeof body.key === 'string' && body.key.trim()) {
-      upserts.push({ key: body.key.trim(), value: body.value ?? {} });
-    } else if (body.settings && typeof body.settings === 'object' && !Array.isArray(body.settings)) {
-      for (const [key, value] of Object.entries(body.settings as Record<string, unknown>)) {
-        upserts.push({ key, value });
-      }
-    } else {
-      throw httpError('Provide { key, value } or { settings: { ... } }', 400);
+    if (settings.reviewConfidenceThreshold !== undefined) {
+      upserts.push({ key: 'reviewConfidenceThreshold', value: number(settings.reviewConfidenceThreshold, 'reviewConfidenceThreshold', 0, 1) });
+    }
+    if (settings.dedupeWindowSec !== undefined) {
+      upserts.push({ key: 'dedupeWindowSec', value: number(settings.dedupeWindowSec, 'dedupeWindowSec', 60, 86_400) });
     }
 
     for (const entry of upserts) {

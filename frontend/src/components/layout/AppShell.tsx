@@ -16,6 +16,8 @@ const NAV = [
   { to: '/whitelist', label: '白名单管理' },
   { to: '/reports', label: '报告中心' },
   { to: '/settings', label: '系统设置' },
+  { to: '/admin/users', label: '用户管理' },
+  { to: '/admin/audit', label: '审计日志' },
 ] as const;
 
 function labelForPath(pathname: string): string {
@@ -48,7 +50,7 @@ export function AppShell() {
           </div>
         </div>
         <nav className="shell-nav" aria-label="主导航">
-          {NAV.filter((item) => item.to !== '/whitelist' || user?.role === 'admin').map((item) => (
+          {NAV.filter((item) => !['/whitelist', '/admin/users', '/admin/audit'].includes(item.to) || user?.role === 'admin').map((item) => (
             <NavLink key={item.to} to={item.to} className={({ isActive }) => (isActive ? 'active' : undefined)}>
               {item.label}
             </NavLink>

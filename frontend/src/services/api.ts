@@ -9,7 +9,7 @@ export interface Device {
   videoPort: number;
   bridgeUrl?: string;
   description?: string;
-  status?: 'online' | 'offline' | 'patrolling' | 'fault';
+  status?: 'online' | 'offline' | 'patrolling';
   lastPatrolAt?: string | null;
   archived?: boolean;
 }
@@ -113,9 +113,8 @@ export interface PatrolReport {
   date?: string;
   violationCount?: number;
   visitorCount?: number;
-  htmlUrl?: string | null;
-  csvUrl?: string | null;
-  zipUrl?: string | null;
+  htmlContent?: string;
+  csvContent?: string;
   summary?: string;
 }
 

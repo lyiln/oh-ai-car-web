@@ -21,7 +21,8 @@
     "dotenv": "^16.4.7",
     "fastify": "^5.2.1",
     "nodemailer": "^6.10.1",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "yaml": "^2.8.1"
   },
   "devDependencies": {
     "@types/node": "^22.15.21",

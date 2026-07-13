@@ -8,18 +8,7 @@ import {
 } from './api.js';
 
 export async function dashboardSummary(): Promise<DashboardSummary> {
-  try {
-    return await apiRequest<DashboardSummary>('/api/dashboard/summary');
-  } catch {
-    return {
-      onlineDevices: 0,
-      todayPatrols: 0,
-      pendingReviews: 0,
-      violations: 0,
-      recentTasks: [],
-      alerts: [],
-    };
-  }
+  return apiRequest<DashboardSummary>('/api/dashboard/summary');
 }
 
 export async function violations(): Promise<Violation[]> {
@@ -89,36 +78,18 @@ export async function importWhitelist(csv: string): Promise<{ imported: number; 
 }
 
 export async function reports(): Promise<PatrolReport[]> {
-  try {
-    const result = await apiRequest<{ reports: PatrolReport[] }>('/api/reports');
-    return result.reports ?? [];
-  } catch {
-    return [];
-  }
+  const result = await apiRequest<{ reports: PatrolReport[] }>('/api/reports');
+  return result.reports ?? [];
 }
 
 export async function report(id: string): Promise<PatrolReport | null> {
-  try {
-    const result = await apiRequest<{ report: PatrolReport }>(`/api/reports/${id}`);
-    return result.report;
-  } catch {
-    return null;
-  }
+  const result = await apiRequest<{ report: PatrolReport }>(`/api/reports/${id}`);
+  return result.report;
 }
 
 export async function getSettings(): Promise<Record<string, unknown>> {
-  try {
-    const result = await apiRequest<{ settings: Record<string, unknown> }>('/api/settings');
-    return result.settings ?? {};
-  } catch {
-    return {
-      waypointsYaml: '',
-      alertConfidence: 0.7,
-      dedupeWindowSec: 120,
-      bridgeDefault: '',
-      connectTimeoutMs: 5000,
-    };
-  }
+  const result = await apiRequest<{ settings: Record<string, unknown> }>('/api/settings');
+  return result.settings ?? {};
 }
 
 export async function putSettings(settings: Record<string, unknown>): Promise<{ ok: true }> {

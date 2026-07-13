@@ -524,3 +524,12 @@ BEGIN
   END IF;
 END $$;
 `;
+
+export const migration011 = `
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS review_confidence_threshold double precision NOT NULL DEFAULT 0.75
+  CHECK (review_confidence_threshold >= 0 AND review_confidence_threshold <= 1);
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS dedupe_window_sec integer NOT NULL DEFAULT 1800
+  CHECK (dedupe_window_sec BETWEEN 60 AND 86400);
+CREATE UNIQUE INDEX IF NOT EXISTS patrol_routes_vehicle_name_version_idx
+  ON patrol_routes(vehicle_id, name, map_version);
+`;

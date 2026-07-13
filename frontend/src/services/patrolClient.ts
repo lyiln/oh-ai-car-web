@@ -56,3 +56,10 @@ export async function routes(deviceId?: string | null): Promise<PatrolRoute[]> {
   const result = await apiRequest<{ routes: PatrolRoute[] }>(`/api/patrol/routes${qs}`);
   return result.routes ?? [];
 }
+
+export async function importRoute(vehicleId: string, input: { name: string; mapVersion: string; yaml: string }): Promise<PatrolRoute> {
+  const result = await apiRequest<{ route: PatrolRoute }>(`/api/vehicles/${vehicleId}/patrol-routes`, {
+    method: 'POST', body: JSON.stringify(input),
+  });
+  return result.route;
+}
