@@ -62,4 +62,35 @@ describe('deviceClient', () => {
     expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/api/devices/device-1');
     expect(fetchMock.mock.calls[0]?.[1]?.method).toBe('PUT');
   });
+
+  it('applies host/port overrides on connectDevice after lease', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const url = String(input);
+      if (url.includes('/api/devices/') && url.includes('/connect')) {
+        return new Response(JSON.stringify({
+          host: '10.0.0.1',
+          tcpPort: 6000,
+          videoPort: 6500,
+          leaseId: 'lease-1',
+          expiresAt: '2099-01-01T00:00:00.000Z',
+          gatewayToken: 'token-1',
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ error: 'not found' }), { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const session = await deviceClient.connectDevice('device-1', {
+      host: '10.82.66.179',
+      tcpPort: 6000,
+      videoPort: 6501,
+    });
+    expect(session).toMatchObject({
+      host: '10.82.66.179',
+      tcpPort: 6000,
+      videoPort: 6501,
+      leaseId: 'lease-1',
+      gatewayToken: 'token-1',
+    });
+  });
 });

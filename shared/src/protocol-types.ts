@@ -14,9 +14,18 @@ export interface ConnectionConfig {
 export const DIRECTIONS = ['Stop', 'Front', 'After', 'Left', 'Right', 'LeftRotate', 'RightRotate', 'Brake'] as const;
 export type Direction = (typeof DIRECTIONS)[number];
 
+export type ProbeStatus = 'REACHABLE' | 'TIMEOUT' | 'REFUSED' | 'ERROR';
+export interface ProbeResult {
+  status: ProbeStatus;
+  host: string;
+  tcpPort: number;
+  message?: string;
+}
+
 export type ControlCommand =
-  | { command: 'connect'; payload: ConnectionConfig }
+  | { command: 'connect'; payload: ConnectionConfig & { vehicleId?: string; leaseToken?: string } }
   | { command: 'leaseRefresh'; payload: ConnectionConfig & { vehicleId: string; leaseToken: string } }
+  | { command: 'probe'; payload: Pick<ConnectionConfig, 'host' | 'tcpPort'> & { timeoutMs?: number } }
   | { command: 'disconnect'; payload: Record<string, never> }
   | { command: 'button'; payload: { direction: Direction } }
   | { command: 'rocker'; payload: { x: number; y: number } }
@@ -25,7 +34,7 @@ export type ControlCommand =
   | { command: 'tracking'; payload: { enabled: boolean } };
 
 export type CommandEnvelope = { type: 'command'; requestId: string } & ControlCommand;
-export interface ResultEnvelope { type: 'result'; requestId: string; ok: true; encoded?: string }
+export interface ResultEnvelope { type: 'result'; requestId: string; ok: true; encoded?: string; probe?: ProbeResult }
 export interface ErrorEnvelope { type: 'error'; requestId: string; code: string; message: string }
 export interface StateEnvelope {
   type: 'state';

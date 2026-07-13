@@ -23,6 +23,41 @@
    `PLATFORM_API_URL=http://<server>:8080 npm run dev:gateway`. The gateway then
    rejects control connections without a live platform lease.
 
+## Local three-process stack (HarmonyOS APP parity)
+
+The HarmonyOS APP connects **directly** from the phone to car TCP `:6000` and
+loads video at `http://{IP}:6500/index2`. The Web stack keeps the same car
+protocol (`$01…#` packets, same ports) but inserts a **localhost gateway** for
+browser safety:
+
+| APP (`NetworkSettings` / remote) | Web (`/console`) |
+|---|---|
+| Enter car IP / TCP 6000 / video 6500 | Editable network panel on `/console` |
+| Phone opens TCP to car | Operator PC gateway opens TCP to car |
+| No auth | Platform lease + `PLATFORM_API_URL` on gateway |
+| Video Web component → `:6500/index2` | Browser iframe → same URL |
+
+**Requirement:** the operator PC must be on the **same LAN** as the car (same
+condition as the phone when using the APP). The gateway initiates TCP from that
+PC; the browser never speaks raw TCP.
+
+For local development, run all three (see `npm run dev:stack`):
+
+```bash
+npm run dev:backend
+npm run dev:frontend
+# PowerShell:
+$env:PLATFORM_API_URL="http://127.0.0.1:8788"; npm run dev:gateway
+```
+
+Then open `http://127.0.0.1:5173`, sign in, select a device, open **控制台**,
+confirm or override IP/ports, and connect. The UI probes TCP before claiming
+control and shows separate status for gateway / lease / car TCP.
+
+Protocol encoding matches the retained ArkTS `CarEncode` evidence (Front =
+`$011504011B#`). Real-car confirmation remains gated by
+`PROTOCOL_STATUS.md` and `docs/flows/web-control-real-car-validation.md`.
+
 Do not expose the local gateway beyond the operator machine. Use HTTPS and set
 `COOKIE_SECURE=true` before any non-local deployment. Run
 `npm run test:integration --workspace=@oh-ai-car-web/backend` in a Docker-ready

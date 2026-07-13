@@ -1,9 +1,13 @@
 import net from 'node:net';
-import type { ConnectionConfig } from '@oh-ai-car-web/shared';
+import type { ConnectionConfig, ProbeResult } from '@oh-ai-car-web/shared';
+
+const DEFAULT_PROBE_TIMEOUT_MS = 2000;
 
 export class CarTcpClient {
   private socket: net.Socket | null = null;
   private target: ConnectionConfig | null = null;
+  /** Preserved after unexpected close so write() can reconnect once. */
+  private lastTarget: ConnectionConfig | null = null;
   private connected = false;
   private readonly stateListeners = new Set<(connected: boolean, target: ConnectionConfig | null, error?: string) => void>();
 
@@ -19,6 +23,7 @@ export class CarTcpClient {
   async connect(target: ConnectionConfig): Promise<void> {
     this.disconnect();
     this.target = target;
+    this.lastTarget = target;
     const socket = new net.Socket();
     this.socket = socket;
     const timeoutMs = target.timeoutMs ?? 3000;
@@ -61,10 +66,58 @@ export class CarTcpClient {
     this.emit();
   }
 
-  async write(message: string): Promise<void> {
+  private writeOnce(message: string): Promise<void> {
     if (!this.socket || !this.connected || this.socket.destroyed) throw new Error('TCP socket is not connected');
-    await new Promise<void>((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
       this.socket?.write(message, (error) => error ? reject(error) : resolve());
+    });
+  }
+
+  /**
+   * Write a control packet. If the socket is down, reconnect once to lastTarget
+   * and retry (APP-like TCPClientManager reconnect behavior, plus resend).
+   */
+  async write(message: string): Promise<void> {
+    try {
+      await this.writeOnce(message);
+    } catch (firstError) {
+      const retryTarget = this.target ?? this.lastTarget;
+      if (!retryTarget) throw firstError;
+      await this.connect(retryTarget);
+      await this.writeOnce(message);
+    }
+  }
+
+  /** Short TCP reachability check without claiming the control session. */
+  static async probe(host: string, tcpPort: number, timeoutMs = DEFAULT_PROBE_TIMEOUT_MS): Promise<ProbeResult> {
+    const trimmed = host.trim();
+    return new Promise((resolve) => {
+      const socket = new net.Socket();
+      let settled = false;
+      const finish = (result: ProbeResult) => {
+        if (settled) return;
+        settled = true;
+        socket.removeAllListeners();
+        socket.destroy();
+        resolve(result);
+      };
+      socket.setTimeout(timeoutMs, () => finish({
+        status: 'TIMEOUT',
+        host: trimmed,
+        tcpPort,
+        message: `TCP probe timed out after ${timeoutMs}ms`,
+      }));
+      socket.once('error', (error: NodeJS.ErrnoException) => {
+        const refused = error.code === 'ECONNREFUSED';
+        finish({
+          status: refused ? 'REFUSED' : 'ERROR',
+          host: trimmed,
+          tcpPort,
+          message: error.message,
+        });
+      });
+      socket.once('connect', () => finish({ status: 'REACHABLE', host: trimmed, tcpPort }));
+      socket.connect(tcpPort, trimmed);
     });
   }
 
@@ -77,6 +130,13 @@ export class CarTcpClient {
     this.emit();
   }
 
+  /** Clear reconnect target when the operator explicitly disconnects. */
+  clearLastTarget(): void {
+    this.lastTarget = null;
+  }
+
   get isConnected(): boolean { return this.connected; }
   get currentTarget(): ConnectionConfig | null { return this.target; }
+  /** True when an unexpected drop left a target we can reconnect to. */
+  get hasReconnectTarget(): boolean { return this.lastTarget !== null; }
 }

@@ -84,7 +84,10 @@ export async function deleteDevice(id: string): Promise<{ ok: true }> {
   return apiRequest<{ ok: true }>(`/api/devices/${id}`, { method: 'DELETE' });
 }
 
-export async function connectDevice(id: string): Promise<{
+export async function connectDevice(
+  id: string,
+  override?: { host?: string; tcpPort?: number; videoPort?: number },
+): Promise<{
   host: string;
   tcpPort: number;
   videoPort: number;
@@ -92,8 +95,16 @@ export async function connectDevice(id: string): Promise<{
   leaseId?: string;
   expiresAt?: string;
 }> {
+  let session: {
+    host: string;
+    tcpPort: number;
+    videoPort: number;
+    gatewayToken?: string;
+    leaseId?: string;
+    expiresAt?: string;
+  };
   try {
-    return await apiRequest(`/api/devices/${id}/connect`, { method: 'POST', body: '{}' });
+    session = await apiRequest(`/api/devices/${id}/connect`, { method: 'POST', body: '{}' });
   } catch {
     const lease = await apiRequest<{ leaseId: string; expiresAt: string; gatewayToken: string }>(
       `/api/vehicles/${id}/control-lease`,
@@ -102,7 +113,7 @@ export async function connectDevice(id: string): Promise<{
     const list = await devices();
     const device = list.find((entry) => entry.id === id);
     if (!device) throw new Error('设备不存在');
-    return {
+    session = {
       host: device.host,
       tcpPort: device.tcpPort,
       videoPort: device.videoPort,
@@ -111,6 +122,21 @@ export async function connectDevice(id: string): Promise<{
       expiresAt: lease.expiresAt,
     };
   }
+
+  return {
+    ...session,
+    host: override?.host?.trim() || session.host,
+    tcpPort: override?.tcpPort ?? session.tcpPort,
+    videoPort: override?.videoPort ?? session.videoPort,
+  };
+}
+
+export async function renewLease(leaseId: string): Promise<{ expiresAt: string; gatewayToken: string }> {
+  return apiRequest(`/api/control-leases/${leaseId}/renew`, { method: 'POST', body: '{}' });
+}
+
+export async function releaseLease(leaseId: string): Promise<{ ok: true }> {
+  return apiRequest(`/api/control-leases/${leaseId}`, { method: 'DELETE' });
 }
 
 export async function deviceStatus(id: string): Promise<DeviceStatus> {

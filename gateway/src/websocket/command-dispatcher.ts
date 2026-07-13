@@ -1,8 +1,8 @@
 import {
   DIRECTIONS, encodeButton, encodePhoto, encodeRocker, encodeStartRecording, encodeStopRecording, encodeTracking, encodeWheelSpeeds,
-  isPort, isSpeed, type ConnectionConfig,
+  isPort, isSpeed, type ConnectionConfig, type ProbeResult,
 } from '@oh-ai-car-web/shared';
-import type { CarTcpClient } from '../tcp/car-tcp-client.js';
+import { CarTcpClient } from '../tcp/car-tcp-client.js';
 
 export class CommandError extends Error {
   constructor(public readonly code: string, message: string) { super(message); }
@@ -35,6 +35,22 @@ export function parseConnectionConfig(payload: unknown): ConnectionConfig {
   return { host: value.host.trim(), tcpPort: value.tcpPort, videoPort: value.videoPort, timeoutMs: 3000 };
 }
 
+export function parseProbeConfig(payload: unknown): { host: string; tcpPort: number; timeoutMs: number } {
+  const value = object(payload);
+  if (typeof value.host !== 'string' || !value.host.trim() || !isPort(value.tcpPort)) {
+    throw new CommandError('INVALID_CONFIG', 'host and tcpPort are required for probe');
+  }
+  const timeoutMs = typeof value.timeoutMs === 'number' && Number.isFinite(value.timeoutMs)
+    ? Math.min(10_000, Math.max(200, Math.round(value.timeoutMs)))
+    : 2000;
+  return { host: value.host.trim(), tcpPort: value.tcpPort, timeoutMs };
+}
+
+export async function probeTarget(payload: unknown): Promise<ProbeResult> {
+  const config = parseProbeConfig(payload);
+  return CarTcpClient.probe(config.host, config.tcpPort, config.timeoutMs);
+}
+
 function speeds(payload: unknown, keys: string[]): number[] {
   const value = object(payload);
   const result = keys.map((key) => value[key]);
@@ -44,7 +60,9 @@ function speeds(payload: unknown, keys: string[]): number[] {
 
 export async function dispatch(client: CarTcpClient, envelope: ParsedCommand): Promise<{ requestId: string; encoded?: string }> {
   const { requestId, payload } = envelope;
-  if (!client.isConnected) throw new CommandError('NOT_CONNECTED', 'TCP socket is not connected');
+  if (!client.isConnected && !client.hasReconnectTarget) {
+    throw new CommandError('NOT_CONNECTED', 'TCP socket is not connected');
+  }
 
   let encoded: string;
   switch (envelope.command) {
@@ -74,7 +92,9 @@ export async function dispatch(client: CarTcpClient, envelope: ParsedCommand): P
       break;
     }
     case 'connect':
-    case 'disconnect': throw new CommandError('INVALID_LIFECYCLE', 'Connection lifecycle is managed by the control server');
+    case 'disconnect':
+    case 'probe':
+      throw new CommandError('INVALID_LIFECYCLE', 'Connection lifecycle is managed by the control server');
     default: throw new CommandError('UNSUPPORTED_COMMAND', 'Only documented high-level commands are accepted');
   }
   await client.write(encoded);

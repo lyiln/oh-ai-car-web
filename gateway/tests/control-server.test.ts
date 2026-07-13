@@ -175,4 +175,61 @@ describe('localhost control gateway', () => {
     await firstCar.close();
     await secondCar.close();
   });
+
+  it('probes TCP reachability without claiming the controller session', async () => {
+    const fake = await createFakeCarTcpServer();
+    const server = new ControlServer({ port: 0 }); servers.push(server);
+    const port = await server.listen();
+    const ws = await open(port);
+    const reachable = await request(ws, {
+      type: 'command',
+      requestId: 'probe-ok',
+      command: 'probe',
+      payload: { host: '127.0.0.1', tcpPort: fake.port, timeoutMs: 1000 },
+    });
+    expect(reachable).toMatchObject({
+      type: 'result',
+      probe: { status: 'REACHABLE', host: '127.0.0.1', tcpPort: fake.port },
+    });
+    expect(server.client.isConnected).toBe(false);
+
+    const refused = await request(ws, {
+      type: 'command',
+      requestId: 'probe-refused',
+      command: 'probe',
+      payload: { host: '127.0.0.1', tcpPort: 1, timeoutMs: 500 },
+    });
+    expect(refused.type).toBe('result');
+    expect((refused.probe as { status: string }).status).toMatch(/REFUSED|TIMEOUT|ERROR/);
+
+    ws.close();
+    await fake.close();
+  });
+
+  it('reconnects once and resends when the TCP socket drops mid-command', async () => {
+    const fake = await createFakeCarTcpServer();
+    const server = new ControlServer({ port: 0 }); servers.push(server);
+    const port = await server.listen();
+    const ws = await open(port);
+    expect((await connect(ws, fake.port)).type).toBe('result');
+
+    const internal = server.client as unknown as { socket: { destroy: () => void } | null };
+    expect(internal.socket).toBeTruthy();
+    internal.socket!.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const response = await request(ws, {
+      type: 'command',
+      requestId: 'after-drop',
+      command: 'button',
+      payload: { direction: 'Front' },
+    });
+    expect(response).toMatchObject({ type: 'result', encoded: '$011504011B#' });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(fake.messages).toContain('$011504011B#');
+    expect(fake.connections()).toBeGreaterThanOrEqual(2);
+
+    ws.close();
+    await fake.close();
+  });
 });

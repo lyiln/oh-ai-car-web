@@ -111,6 +111,28 @@ The gateway writes Stop before closing TCP and releasing the controlling
 session. Gateway shutdown and controlling-browser closure follow the same
 best-effort Stop sequence.
 
+### `probe`
+
+Reachability check that does **not** claim the controller session:
+
+```json
+{
+  "type": "command",
+  "requestId": "probe-1",
+  "command": "probe",
+  "payload": {
+    "host": "192.168.1.11",
+    "tcpPort": 6000,
+    "timeoutMs": 2000
+  }
+}
+```
+
+Result includes `probe.status`: `REACHABLE`, `TIMEOUT`, `REFUSED`, or `ERROR`.
+
+When a TCP socket drops after a successful `connect`, the gateway may reconnect
+once to the last target and resend the pending command (APP-like reconnect).
+
 ### `button`
 
 ```json
