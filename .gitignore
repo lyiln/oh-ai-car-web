@@ -8,6 +8,12 @@ coverage/
 scripts/.local-jetson-gps.json
 scripts/.local/
 vendor/oh-ai-car-YOLOv5/
-yolo-v5/
 edge-agent/evidence-cache/
-*.pt
+
+# YOLO plate repo: commit source + weights under yolo-v5/**/weights/*.pt
+# Ignore local inference/runtime artifacts only
+yolo-v5/**/demo_output/
+yolo-v5/**/__pycache__/
+yolo-v5/**/.pytest_cache/
+yolo-v5/**/web_test_app/node_modules/
+yolo-v5/**/web_test_app/dist/
