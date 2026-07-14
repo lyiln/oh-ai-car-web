@@ -10,6 +10,7 @@ import {
   normalizePlateText,
 } from '../../services/plateClient.js';
 import * as opsClient from '../../services/opsClient.js';
+import * as mapClient from '../../services/mapClient.js';
 import type {
   HealthResponse,
   InferResponse,
@@ -115,7 +116,9 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
     plate: string;
     evidenceUrl?: string | null;
     eventId?: string;
+    noParkingLabel?: string;
   } | null>(null);
+  const [noParkingHint, setNoParkingHint] = useState<string>('位姿未刷新');
 
   const refreshHealth = useCallback(async () => {
     try {
@@ -170,6 +173,38 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
       ) ?? videoResult.matchedFrames[0]
     );
   }, [activeVideoFrameKey, videoResult]);
+
+  useEffect(() => {
+    if (!vehicleId) {
+      setNoParkingHint('未选车');
+      return undefined;
+    }
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const check = await mapClient.checkFloorNoParking(vehicleId);
+        if (cancelled) return;
+        if (!check.pose) {
+          setNoParkingHint('无近 10s 位姿（请先跑 pose 代理）');
+          return;
+        }
+        const poseText = `x=${check.pose.x.toFixed(2)} y=${check.pose.y.toFixed(2)}`;
+        if (check.inNoParking) {
+          setNoParkingHint(`禁停区：是（${check.zone?.name ?? '未命名'}）· ${poseText}`);
+        } else {
+          setNoParkingHint(`禁停区：否 · ${poseText}`);
+        }
+      } catch {
+        if (!cancelled) setNoParkingHint('禁停判定暂不可用');
+      }
+    };
+    void tick();
+    const timer = window.setInterval(() => void tick(), 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [vehicleId]);
 
   const violationCandidate = useMemo(() => {
     if (tab === 'live') {
@@ -255,11 +290,18 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
         jpegBase64,
         waypoint: '控制台识别测试',
       });
+      const np = created.noParking;
+      const noParkingLabel = np?.inNoParking
+        ? `禁停区命中：${np.zone?.name ?? '是'}`
+        : np?.reason === 'no_recent_pose'
+          ? '未判禁停（无近时位姿）'
+          : '不在禁停区';
       setSubmitOk({
         id: created.violation.id,
         plate: created.violation.plate,
         evidenceUrl: created.violation.evidenceUrl,
         eventId: created.review.eventId,
+        noParkingLabel,
       });
     } catch (reason) {
       setSubmitError(reason instanceof Error ? reason.message : '添加到违规车辆失败');
@@ -745,6 +787,10 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
         </button>
       </div>
 
+      <p className="notice" style={{ marginTop: 0 }}>
+        禁停 / 坐标（约 2s 刷新）：{noParkingHint}
+      </p>
+
       {!health?.ok && (
         <p className="notice">
           YOLO 服务未启动。运行 <code>npm run dev:plate-api</code> 后刷新。
@@ -761,8 +807,10 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
           {submitBusy ? '上传中…' : '添加到违规车辆'}
         </button>
         <p className="muted">
-          {violationCandidate
-            ? `将把 ${violationCandidate.plate} 与截图写入「违规车辆」并进入「待人工审核」；命中白名单的车牌不可加入违规车辆`
+          {!vehicleId
+            ? '请先在上方选择小车。'
+            : violationCandidate
+            ? `将把 ${violationCandidate.plate} 与截图写入「违规车辆」并进入「待人工审核」；白名单车牌不可加入。提交时用上方最新 map 位姿判定禁停区。`
             : '识别出有效车牌后可一键写入违规并进入审核队列。'}
         </p>
       </div>
@@ -770,6 +818,7 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
       {submitOk && (
         <p className="notice">
           已写入：{submitOk.plate}
+          {submitOk.noParkingLabel ? ` · ${submitOk.noParkingLabel}` : ''}
           {' · '}
           <Link to="/reviews">去审核队列</Link>
           {' · '}

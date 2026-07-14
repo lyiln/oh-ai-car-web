@@ -57,6 +57,8 @@ YOLO 服务。后端监听
 详细说明见 [docs/flows/web-nav-one-click-ready.md](docs/flows/web-nav-one-click-ready.md)
 与 [docs/flows/web-goto-click-nav.md](docs/flows/web-goto-click-nav.md)。
 
+楼道禁停区（地图框选 + 控制台识别判位姿）：见 [docs/flows/floor-no-parking-zones.md](docs/flows/floor-no-parking-zones.md)。
+
 ### 1. 电脑
 
 ```sh

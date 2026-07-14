@@ -785,3 +785,19 @@ WHERE expires_at IS NULL;
 ALTER TABLE control_leases ALTER COLUMN expires_at SET NOT NULL;
 ALTER TABLE control_leases DROP COLUMN IF EXISTS gateway_heartbeat_at;
 `;
+
+// 楼道 SLAM 米制禁停多边形（与 pose_points / FloorMap 同一坐标系；非高德 map_zones）。
+export const migration023 = `
+CREATE TABLE IF NOT EXISTS floor_map_zones (
+  id uuid PRIMARY KEY,
+  vehicle_id uuid NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+  map_version text NOT NULL DEFAULT 'floor-map-v1',
+  name text NOT NULL,
+  active boolean NOT NULL DEFAULT true,
+  ring jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS floor_map_zones_vehicle_idx ON floor_map_zones(vehicle_id, map_version);
+ALTER TABLE violations ADD COLUMN IF NOT EXISTS floor_zone_id uuid REFERENCES floor_map_zones(id) ON DELETE SET NULL;
+`;

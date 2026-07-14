@@ -22,6 +22,13 @@ export interface FloorMapInitialPose {
   yaw: number;
 }
 
+export interface FloorMapZoneOverlay {
+  id: string;
+  name: string;
+  ring: WorldPoint[];
+  active?: boolean;
+}
+
 interface Props {
   meta: FloorMapMeta;
   destinations?: FloorMapDestination[];
@@ -30,9 +37,12 @@ interface Props {
   pendingPoints?: WorldPoint[];
   goal?: FloorMapGoal | null;
   initialPose?: FloorMapInitialPose | null;
-  /** 标点 / 前往：单击 */
+  zones?: FloorMapZoneOverlay[];
+  draftZone?: WorldPoint[];
+  /** 标点 / 前往 / 禁停区顶点：单击 */
   clickable?: boolean;
   onMapClick?: (world: WorldPoint) => void;
+  onMapDoubleClick?: (world: WorldPoint) => void;
   /** 设初始位：按下定位、拖拽朝向、松开提交（对齐 RViz 2D Pose Estimate） */
   poseEstimate?: boolean;
   onPoseEstimate?: (pose: FloorMapInitialPose) => void;
@@ -46,8 +56,11 @@ export function FloorMap({
   pendingPoints = [],
   goal = null,
   initialPose = null,
+  zones = [],
+  draftZone = [],
   clickable = false,
   onMapClick,
+  onMapDoubleClick,
   poseEstimate = false,
   onPoseEstimate,
 }: Props) {
@@ -121,6 +134,46 @@ export function FloorMap({
       const { px, py } = worldToPixel(meta, x, y);
       return { sx: px * scale, sy: py * scale };
     };
+
+    // 禁停多边形（已保存 + 正在绘制）
+    const paintZone = (ring: WorldPoint[], fill: string, stroke: string, label?: string) => {
+      if (ring.length < 2) return;
+      ctx.beginPath();
+      ring.forEach((point, index) => {
+        const { sx, sy } = toScreen(point.x, point.y);
+        if (index === 0) ctx.moveTo(sx, sy);
+        else ctx.lineTo(sx, sy);
+      });
+      if (ring.length >= 3) ctx.closePath();
+      ctx.fillStyle = fill;
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 2;
+      if (ring.length >= 3) ctx.fill();
+      ctx.stroke();
+      if (label && ring.length > 0) {
+        const cx = ring.reduce((sum, p) => sum + p.x, 0) / ring.length;
+        const cy = ring.reduce((sum, p) => sum + p.y, 0) / ring.length;
+        const { sx, sy } = toScreen(cx, cy);
+        ctx.fillStyle = stroke;
+        ctx.font = '11px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(label, sx, sy);
+      }
+    };
+    for (const zone of zones) {
+      if (zone.active === false) continue;
+      paintZone(zone.ring, 'rgba(220, 38, 38, 0.18)', '#dc2626', zone.name);
+    }
+    if (draftZone.length) {
+      paintZone(draftZone, 'rgba(234, 88, 12, 0.2)', '#ea580c', '绘制中');
+      for (const point of draftZone) {
+        const { sx, sy } = toScreen(point.x, point.y);
+        ctx.fillStyle = '#ea580c';
+        ctx.beginPath();
+        ctx.arc(sx, sy, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
 
     for (const destination of destinations) {
       const { sx, sy } = toScreen(destination.x, destination.y);
@@ -261,7 +314,7 @@ export function FloorMap({
       ctx.arc(sx, sy, 3, 0, Math.PI * 2);
       ctx.fill();
     }
-  }, [meta, destinations, pose, trail, pendingPoints, goal, initialPose, dragPose, displayWidth, imageReady]);
+  }, [meta, destinations, pose, trail, pendingPoints, goal, initialPose, dragPose, displayWidth, imageReady, zones, draftZone]);
 
   useEffect(() => {
     draw();
@@ -282,6 +335,13 @@ export function FloorMap({
     if (!clickable || !onMapClick) return;
     const world = eventToWorld(event);
     if (world) onMapClick(world);
+  };
+
+  const handleDoubleClick = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    if (poseEstimate || !onMapDoubleClick) return;
+    event.preventDefault();
+    const world = eventToWorld(event);
+    if (world) onMapDoubleClick(world);
   };
 
   const handlePointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
@@ -338,6 +398,7 @@ export function FloorMap({
         className="floor-map-canvas"
         style={{ cursor: clickable || poseEstimate ? 'crosshair' : 'default', touchAction: poseEstimate ? 'none' : undefined }}
         onClick={handleClick}
+        onDoubleClick={handleDoubleClick}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
