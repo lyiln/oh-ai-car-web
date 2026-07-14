@@ -353,7 +353,6 @@ export function ConsolePage() {
               <button type="button" className={tab === 'wheels' ? 'login-tab-active' : undefined} onClick={() => setTab('wheels')}>麦轮</button>
             </div>
           </section>
-          <VideoPanel host={host} port={videoPort} />
           <MediaControls
             disabled={disabled}
             pending={mediaPending}
@@ -384,7 +383,8 @@ export function ConsolePage() {
           </section>
         </aside>
       </div>
-      <div className="console-plate-section">
+      <div className="console-media-layout">
+        <VideoPanel host={host} port={videoPort} />
         <PlateScanPanel
           host={host}
           videoPort={videoPort}

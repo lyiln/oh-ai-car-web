@@ -83,6 +83,20 @@ export type InferResponse = {
   rawResultPath: string;
 };
 
+export type GateResponse = {
+  ok: boolean;
+  imageName: string;
+  summary: string;
+  carDetected: boolean;
+  carDetectionCount: number;
+  carDetections: CarDetection[];
+  primaryCar: PrimaryCarResult | null;
+  status: string;
+  stageTimings?: StageTimings;
+  imageUrls: ImageUrls;
+  rawResultPath: string;
+};
+
 export type PlateHit = InferResponse & {
   id: string;
   capturedAt: string;

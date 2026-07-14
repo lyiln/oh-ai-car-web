@@ -1,4 +1,4 @@
-import type { HealthResponse, InferResponse, VideoInferResponse } from '../types/plateInference.js';
+import type { GateResponse, HealthResponse, InferResponse, VideoInferResponse } from '../types/plateInference.js';
 
 const PLATE_API_BASE = '/plate-api';
 const GATEWAY_API_BASE = '/gateway-api';
@@ -10,6 +10,20 @@ function rewritePlateAssetUrl(url: string | null | undefined): string | null {
 }
 
 export function rewriteInferImageUrls(result: InferResponse): InferResponse {
+  return {
+    ...result,
+    imageUrls: {
+      uploadedImageUrl: rewritePlateAssetUrl(result.imageUrls.uploadedImageUrl),
+      carVisualUrl: rewritePlateAssetUrl(result.imageUrls.carVisualUrl),
+      primaryCarVisualUrl: rewritePlateAssetUrl(result.imageUrls.primaryCarVisualUrl),
+      primaryCarCropUrl: rewritePlateAssetUrl(result.imageUrls.primaryCarCropUrl),
+      plateVisualUrl: rewritePlateAssetUrl(result.imageUrls.plateVisualUrl),
+      plateCropUrl: rewritePlateAssetUrl(result.imageUrls.plateCropUrl),
+    },
+  };
+}
+
+export function rewriteGateImageUrls(result: GateResponse): GateResponse {
   return {
     ...result,
     imageUrls: {
@@ -65,6 +79,36 @@ export async function inferPlateImage(image: Blob, filename = 'frame.jpg'): Prom
     throw new Error(detail || `Plate infer failed (${response.status})`);
   }
   return rewriteInferImageUrls(payload as InferResponse);
+}
+
+export async function inferPlateOnlyImage(image: Blob, filename = 'frame.jpg'): Promise<InferResponse> {
+  const formData = new FormData();
+  formData.append('image', image, filename);
+  const response = await fetch(`${PLATE_API_BASE}/api/infer-plate-only`, {
+    method: 'POST',
+    body: formData,
+  });
+  const payload = (await response.json()) as InferResponse | { detail?: string };
+  if (!response.ok) {
+    const detail = 'detail' in payload ? payload.detail : undefined;
+    throw new Error(detail || `Plate-only infer failed (${response.status})`);
+  }
+  return rewriteInferImageUrls(payload as InferResponse);
+}
+
+export async function inferCarGate(image: Blob, filename = 'frame.jpg'): Promise<GateResponse> {
+  const formData = new FormData();
+  formData.append('image', image, filename);
+  const response = await fetch(`${PLATE_API_BASE}/api/gate`, {
+    method: 'POST',
+    body: formData,
+  });
+  const payload = (await response.json()) as GateResponse | { detail?: string };
+  if (!response.ok) {
+    const detail = 'detail' in payload ? payload.detail : undefined;
+    throw new Error(detail || `Plate gate failed (${response.status})`);
+  }
+  return rewriteGateImageUrls(payload as GateResponse);
 }
 
 export async function inferPlateVideo(

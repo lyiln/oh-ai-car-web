@@ -191,6 +191,40 @@ def build_infer_response(runtime_root: Path, run_root: Path, payload: dict[str, 
     }
 
 
+def build_gate_response(runtime_root: Path, run_root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    image_result = find_single_image_result(payload)
+    image_name = Path(str(image_result["image_path"])).name
+    primary_car = image_result.get("primary_car")
+    if isinstance(primary_car, dict):
+        primary_car = dict(primary_car)
+
+    image_urls = {
+        "uploadedImageUrl": file_to_public_url(runtime_root, run_root / "input" / image_name),
+        "carVisualUrl": file_to_public_url(runtime_root, run_root / "car_detector" / image_name),
+        "primaryCarVisualUrl": None,
+        "primaryCarCropUrl": None,
+        "plateVisualUrl": None,
+        "plateCropUrl": None,
+    }
+    if isinstance(primary_car, dict):
+        image_urls["primaryCarVisualUrl"] = file_to_public_url(runtime_root, Path(str(primary_car["visual_path"])))
+        image_urls["primaryCarCropUrl"] = file_to_public_url(runtime_root, Path(str(primary_car["crop_path"])))
+
+    return {
+        "ok": True,
+        "imageName": image_name,
+        "summary": payload.get("summary", ""),
+        "carDetected": bool(image_result.get("car_detected", False)),
+        "carDetectionCount": int(image_result.get("car_detection_count", 0)),
+        "carDetections": image_result.get("car_detections", []),
+        "primaryCar": primary_car,
+        "status": str(image_result.get("status", "unknown")),
+        "stageTimings": payload.get("stage_timings", {}),
+        "imageUrls": image_urls,
+        "rawResultPath": str(run_root / "car_gate_results.json"),
+    }
+
+
 def cleanup_old_runs(runtime_root: Path, keep: int = 20) -> None:
     runs_root = runtime_root / "runs"
     if not runs_root.exists():
