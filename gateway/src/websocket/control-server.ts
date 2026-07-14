@@ -18,7 +18,10 @@ const DEFAULT_ALLOWED_ORIGINS = [
 const STOP_TIMEOUT_MS = 500;
 
 export interface LeaseVerification { vehicle: { host: string; tcpPort: number; videoPort: number }; expiresAt: string; }
-export interface LeaseVerifier { verify(token: string, vehicleId: string): Promise<LeaseVerification | null>; }
+export interface LeaseVerifier {
+  verify(token: string, vehicleId: string): Promise<LeaseVerification | null>;
+  release?(token: string): Promise<void>;
+}
 export interface ControlServerOptions { port?: number; staticDir?: string; allowedOrigins?: readonly string[]; leaseVerifier?: LeaseVerifier; }
 
 export class ControlServer {
@@ -32,6 +35,7 @@ export class ControlServer {
   private closing: Promise<void> | null = null;
   private readonly leaseVerifier: LeaseVerifier | undefined;
   private leaseTimer: NodeJS.Timeout | null = null;
+  private sessionToken: string | null = null;
   private port = 0;
 
   constructor(options: ControlServerOptions = {}) {
@@ -210,7 +214,7 @@ export class ControlServer {
     if (command.command === 'probe') {
       if (!this.leaseVerifier) throw new CommandError('PLATFORM_AUTH_REQUIRED', 'TCP probe requires a platform control lease');
       const { timeoutMs } = parseProbeConfig(command.payload);
-      const target = await this.authorizeConnection(command.payload, false, false);
+      const { target } = await this.authorizeConnection(command.payload, false);
       const probe = await CarTcpClient.probe(target.host, target.tcpPort, timeoutMs);
       return { requestId: command.requestId, probe };
     }
@@ -221,8 +225,10 @@ export class ControlServer {
         if (this.client.isConnected) await this.safeDisconnect();
         this.controller = ws;
         this.broadcastState(null);
-        const target = await this.authorizeConnection(command.payload);
+        const { target, token, expiresAt } = await this.authorizeConnection(command.payload, false);
         await this.client.connect(target);
+        this.sessionToken = token;
+        if (expiresAt) this.scheduleLeaseExpiry(expiresAt);
         return { requestId: command.requestId };
       } catch (error) {
         if (this.controller === ws) {
@@ -235,7 +241,9 @@ export class ControlServer {
 
     this.requireController(ws);
     if (command.command === 'leaseRefresh') {
-      await this.authorizeConnection(command.payload, true);
+      const { token, expiresAt } = await this.authorizeConnection(command.payload, true);
+      this.sessionToken = token;
+      if (expiresAt) this.scheduleLeaseExpiry(expiresAt);
       return { requestId: command.requestId };
     }
     if (command.command === 'disconnect') {
@@ -259,17 +267,23 @@ export class ControlServer {
     } catch (error) {
       failure = error;
     } finally {
+      const sessionToken = this.sessionToken;
+      this.sessionToken = null;
       this.clearLeaseTimer();
       this.controller = null;
       this.client.disconnect();
+      if (sessionToken && this.leaseVerifier?.release) {
+        try { await this.leaseVerifier.release(sessionToken); }
+        catch (error) { console.error('Gateway control-session release failed', error); }
+      }
     }
     if (failure) throw new CommandError('STOP_FAILED', failure instanceof Error ? `Stop write failed: ${failure.message}` : 'Stop write failed');
     return encoded;
   }
 
-  private async authorizeConnection(payload: unknown, refresh = false, scheduleLease = true) {
+  private async authorizeConnection(payload: unknown, refresh: boolean) {
     const target = parseConnectionConfig(payload);
-    if (!this.leaseVerifier) return target;
+    if (!this.leaseVerifier) return { target, token: null, expiresAt: null };
     const value = payload as { vehicleId?: unknown; leaseToken?: unknown };
     if (typeof value.vehicleId !== 'string' || typeof value.leaseToken !== 'string') throw new CommandError('PLATFORM_AUTH_REQUIRED', 'A valid platform control lease is required');
     const lease = await this.leaseVerifier.verify(value.leaseToken, value.vehicleId);
@@ -283,8 +297,7 @@ export class ControlServer {
         throw new CommandError('PLATFORM_AUTH_REQUIRED', 'Lease refresh does not match the connected vehicle');
       }
     }
-    if (scheduleLease) this.scheduleLeaseExpiry(lease.expiresAt);
-    return lease.vehicle;
+    return { target: lease.vehicle, token: value.leaseToken, expiresAt: lease.expiresAt };
   }
 
   private scheduleLeaseExpiry(expiresAt: string): void {

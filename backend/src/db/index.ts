@@ -5,7 +5,7 @@ import {
   migration011, migration012, migration012AiAgents, migration013ViolationReviewDisposition,
   migration013WhitelistPhoneSms,
   migration014, migration015, migration016,
-  migration017, migration018, migration019, migration020,
+  migration017, migration018, migration019, migration020, migration021, migration022,
 } from './schema.js';
 
 export class Database {
@@ -49,6 +49,8 @@ export class Database {
         { version: '018-patrol-routes-code', sql: migration018 },
         { version: '019-goto-goals', sql: migration019 },
         { version: '020-vehicle-nav-state', sql: migration020 },
+        { version: '021-persistent-control-sessions', sql: migration021 },
+        { version: '022-twenty-minute-control-leases', sql: migration022 },
       ]) {
         await client.query('BEGIN');
         try {

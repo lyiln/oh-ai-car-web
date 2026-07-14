@@ -89,6 +89,7 @@ export async function dispatch(client: CarTcpClient, envelope: ParsedCommand): P
     case 'connect':
     case 'disconnect':
     case 'probe':
+    case 'leaseRefresh':
       throw new CommandError('INVALID_LIFECYCLE', 'Connection lifecycle is managed by the control server');
     default: throw new CommandError('UNSUPPORTED_COMMAND', 'Only documented high-level commands are accepted');
   }

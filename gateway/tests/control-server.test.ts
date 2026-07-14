@@ -12,6 +12,7 @@ const ALLOWED_ORIGINS = [
   'http://127.0.0.1:5173',
   'http://localhost:5173',
 ];
+const leaseExpiry = () => new Date(Date.now() + 20 * 60_000).toISOString();
 
 function request(ws: WebSocket, message: Record<string, unknown>): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
@@ -183,8 +184,8 @@ describe('localhost control gateway', () => {
       leaseVerifier: {
         verify: async (token, vehicleId) => {
           if (token !== 'lease-token') return null;
-          if (vehicleId === 'vehicle-1') return { vehicle: { host: '127.0.0.1', tcpPort: fake.port, videoPort: 6500 }, expiresAt: '2099-01-01T00:00:00.000Z' };
-          if (vehicleId === 'refused') return { vehicle: { host: '127.0.0.1', tcpPort: 1, videoPort: 6500 }, expiresAt: '2099-01-01T00:00:00.000Z' };
+          if (vehicleId === 'vehicle-1') return { vehicle: { host: '127.0.0.1', tcpPort: fake.port, videoPort: 6500 }, expiresAt: leaseExpiry() };
+          if (vehicleId === 'refused') return { vehicle: { host: '127.0.0.1', tcpPort: 1, videoPort: 6500 }, expiresAt: leaseExpiry() };
           return null;
         },
       },
@@ -222,6 +223,84 @@ describe('localhost control gateway', () => {
       payload: { host: '127.0.0.1', tcpPort: 1, videoPort: 6500, vehicleId: 'vehicle-1', leaseToken: 'lease-token' },
     });
     expect(mismatched).toMatchObject({ type: 'error', code: 'PLATFORM_AUTH_REQUIRED' });
+    ws.close();
+    await fake.close();
+  });
+
+  it('releases the verified control session when the controlling browser closes', async () => {
+    const fake = await createFakeCarTcpServer();
+    let releases = 0;
+    const server = new ControlServer({
+      port: 0,
+      leaseVerifier: {
+        verify: async (token, vehicleId) => token === 'session-token' && vehicleId === 'vehicle-1'
+          ? { vehicle: { host: '127.0.0.1', tcpPort: fake.port, videoPort: 6500 }, expiresAt: leaseExpiry() }
+          : null,
+        async release(token) { if (token === 'session-token') releases++; },
+      },
+    });
+    servers.push(server);
+    const port = await server.listen();
+    const ws = await open(port);
+    expect(await request(ws, {
+      type: 'command', requestId: 'session-connect', command: 'connect',
+      payload: { host: '127.0.0.1', tcpPort: fake.port, videoPort: 6500, vehicleId: 'vehicle-1', leaseToken: 'session-token' },
+    })).toMatchObject({ type: 'result' });
+    ws.close();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(releases).toBe(1);
+    await fake.close();
+  });
+
+  it('refreshes the gateway lease timer with a renewed token', async () => {
+    const fake = await createFakeCarTcpServer();
+    const firstExpiry = new Date(Date.now() + 300).toISOString();
+    const server = new ControlServer({
+      port: 0,
+      leaseVerifier: {
+        verify: async (token, vehicleId) => vehicleId === 'vehicle-1' && ['initial-token', 'renewed-token'].includes(token)
+          ? { vehicle: { host: '127.0.0.1', tcpPort: fake.port, videoPort: 6500 }, expiresAt: token === 'initial-token' ? firstExpiry : leaseExpiry() }
+          : null,
+      },
+    });
+    servers.push(server);
+    const port = await server.listen();
+    const ws = await open(port);
+    expect(await request(ws, {
+      type: 'command', requestId: 'session-connect', command: 'connect',
+      payload: { host: '127.0.0.1', tcpPort: fake.port, videoPort: 6500, vehicleId: 'vehicle-1', leaseToken: 'initial-token' },
+    })).toMatchObject({ type: 'result' });
+    expect(await request(ws, {
+      type: 'command', requestId: 'lease-refresh', command: 'leaseRefresh',
+      payload: { host: '127.0.0.1', tcpPort: fake.port, videoPort: 6500, vehicleId: 'vehicle-1', leaseToken: 'renewed-token' },
+    })).toMatchObject({ type: 'result' });
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(server.client.isConnected).toBe(true);
+    ws.close();
+    await fake.close();
+  });
+
+  it('stops and disconnects the car when the verified lease expires', async () => {
+    const fake = await createFakeCarTcpServer();
+    const server = new ControlServer({
+      port: 0,
+      leaseVerifier: {
+        verify: async (token, vehicleId) => token === 'short-token' && vehicleId === 'vehicle-1'
+          ? { vehicle: { host: '127.0.0.1', tcpPort: fake.port, videoPort: 6500 }, expiresAt: new Date(Date.now() + 200).toISOString() }
+          : null,
+      },
+    });
+    servers.push(server);
+    const port = await server.listen();
+    const ws = await open(port);
+    expect(await request(ws, {
+      type: 'command', requestId: 'short-connect', command: 'connect',
+      payload: { host: '127.0.0.1', tcpPort: fake.port, videoPort: 6500, vehicleId: 'vehicle-1', leaseToken: 'short-token' },
+    })).toMatchObject({ type: 'result' });
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(server.client.isConnected).toBe(false);
+    expect(fake.messages).toContain('$011504001A#');
     ws.close();
     await fake.close();
   });
