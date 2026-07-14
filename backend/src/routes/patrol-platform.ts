@@ -891,18 +891,32 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
   });
 
   app.get('/api/map/waypoints', async (request) => {
-    await requireUser(request);
+    const user = await requireUser(request);
     const routeId = (request.query as { routeId?: string }).routeId;
+    if (routeId) {
+      const route = await db.query<{ vehicle_id: string }>('SELECT vehicle_id FROM patrol_routes WHERE id=$1', [routeId]);
+      if (!route.rows[0]) throw httpError('Route not found', 404);
+      if (!await canAccessVehicle(user, route.rows[0].vehicle_id)) throw httpError('Vehicle access denied', 403);
+    }
     const result = routeId
       ? await db.query(
         `SELECT id, name, x AS longitude, y AS latitude, ordinal AS "order", route_id AS "routeId"
          FROM patrol_waypoints WHERE route_id=$1 ORDER BY ordinal`,
         [routeId],
       )
-      : await db.query(
-        `SELECT id, name, x AS longitude, y AS latitude, ordinal AS "order", route_id AS "routeId"
-         FROM patrol_waypoints ORDER BY route_id, ordinal`,
-      );
+      : user.role === 'admin'
+        ? await db.query(
+          `SELECT id, name, x AS longitude, y AS latitude, ordinal AS "order", route_id AS "routeId"
+           FROM patrol_waypoints ORDER BY route_id, ordinal`,
+        )
+        : await db.query(
+          `SELECT w.id, w.name, w.x AS longitude, w.y AS latitude, w.ordinal AS "order", w.route_id AS "routeId"
+           FROM patrol_waypoints w
+           JOIN patrol_routes r ON r.id=w.route_id
+           JOIN vehicle_members vm ON vm.vehicle_id=r.vehicle_id AND vm.user_id=$1
+           ORDER BY w.route_id, w.ordinal`,
+          [user.id],
+        );
     return { waypoints: result.rows };
   });
 

@@ -1,6 +1,10 @@
 import type { Database } from '../../db/index.js';
+import type { ToolContext } from '../types.js';
 
-export async function queryWhitelist(db: Database, q?: string) {
+export async function queryWhitelist(db: Database, ctx: ToolContext, q?: string) {
+  if (ctx.user.role !== 'admin') {
+    throw Object.assign(new Error('Administrator role required'), { statusCode: 403 });
+  }
   const pattern = q?.trim() ? `%${q.trim()}%` : null;
   const result = await db.query<{
     id: string;

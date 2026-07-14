@@ -4,7 +4,7 @@
 
 ## 认证
 
-所有 `/api/*`（除 `/device/v1/*`、`/internal/*`）需已登录会话 Cookie `oh_ai_session`，且请求 Origin 受信任。密码登录适用于活跃账号；邮箱 OTP 仅对已绑定邮箱的管理员可用。验证码只在后端生成、哈希存储并经 SMTP 投递，API 不返回验证码或收件地址。
+所有 `/api/*`（除 `/device/v1/*`、`/internal/*`）需已登录会话 Cookie `oh_ai_session`，且请求 Origin 受信任。密码登录适用于活跃账号；邮箱 OTP 仅对已绑定邮箱的管理员可用。验证码只在后端生成、哈希存储并经 SMTP 投递，API 不返回验证码或收件地址。密码登录按规范化用户名限制为 10 次/15 分钟，OTP 申请为 5 次/15 分钟，OTP 验证为 5 次/5 分钟；超限返回 429。单个 OTP 连续失败 5 次后立即失效。
 
 ## 设备 `/api/devices`
 
@@ -51,6 +51,7 @@
 | PUT/DELETE | `/api/map/zones/:id` |
 
 禁停区使用 PostGIS `geometry(Polygon,4326)`，API 返回坐标环。
+管理员可读取全部航点；操作员只可读取 `vehicle_members` 授权车辆的航点，指定无权路线时返回 403。
 
 设备侧使用 `/device/v1/patrol/tasks/:id/events` 发送 `observation`。观测必须属于
 任务快照路线中的航点；低于任务置信度阈值（默认 0.75）的观测进入待复核；达到阈值后：
@@ -156,6 +157,8 @@
 
 `reviews`、`violations`、`reports`、`dashboard` 等端点使用 `$N::uuid IS NULL OR EXISTS (... AND vm.user_id=$N)` 模式：管理员传 `NULL`（全量访问），操作员传自身 user_id（仅限授权车辆）。
 
+`GET /api/evidence/:fileName` 还会反查巡检事件、观测、违规或上门任务的车辆关联。未关联文件和无权证据统一返回 404。AI 顾问只为管理员注册全局白名单查询工具，底层工具仍独立校验管理员角色。
+
 ## 数据库迁移
 
 | 版本 | 内容 |
@@ -170,6 +173,7 @@
 | 008-doorstep-response-safety | 可恢复分配、安全取消状态、零速度停止确认与活动车辆互斥 |
 | 009-global-whitelist | 兼容旧版扁平白名单，将 live 数据迁移为全局版本并保留任务快照 |
 | 010-whitelist-entry-fields | 白名单车位和有效期字段 |
+| 016-auth-otp-attempt-limit | auth_otps.failed_attempts 与单验证码五次失败失效约束 |
 
 ## 演示注意
 

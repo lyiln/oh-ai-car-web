@@ -69,8 +69,10 @@ C ROS2 workspace is maintained in the sibling project `../oh-ai-car-ros2`.
 - `Front` TCP 报文仍有冲突，必须遵守 `PROTOCOL_STATUS.md`。
 - 未跟踪的 `tmp/` 是用户已有内容，不要删除或纳入提交。
 - 2026-07-13 已完成网页控制台和平台业务收口：控制入口统一由租约约束，路线与识别规则可配置并按任务快照执行。该改动**不包含** ROS/Nav2 scheduler、Jetson 恢复或真实车辆动作；自动巡检和上门处置的真车边界不变。
-- 本次 workspace 单元测试、typecheck 和 build 已通过；PostGIS 集成测试因当前环境
-  没有 Docker/Testcontainers runtime 而跳过 15 项，不能作为 migration 011 或部署验证证据。
+- 2026-07-14 已完成 Web 安全收口：地图航点、AI 白名单和证据读取按角色/车辆授权隔离；认证端点增加限流，migration 016 增加 OTP 五次失败失效；Nodemailer 已升级至 9.0.3，生产依赖审计为 0 漏洞。
+- 本次 workspace 单元测试、typecheck 和 build 已通过；PostGIS 集成测试 20/20 通过，
+  migration 016、车辆级授权和 OTP 并发/限流已有临时数据库运行证据；Docker Compose
+  完整栈的登录、车辆创建及认证 WebSocket 冒烟验证也已通过。目标数据库仍未应用 migration 016。
 
 ## When this handoff is finished
 

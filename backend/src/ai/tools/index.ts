@@ -9,6 +9,18 @@ import { queryDashboardSummary, queryPatrolReport, queryPatrolTasksByDate } from
 import { queryWhitelist } from './whitelist.js';
 
 export function createAdvisorTools(db: Database, ctx: ToolContext) {
+  const whitelistTools = ctx.user.role === 'admin'
+    ? [tool(
+      async ({ q }) => JSON.stringify(await queryWhitelist(db, ctx, q)),
+      {
+        name: 'list_whitelist',
+        description: '查询当前全局白名单车辆列表，可选关键词过滤车牌/车主/楼栋',
+        schema: z.object({
+          q: z.string().optional().describe('可选搜索关键词'),
+        }),
+      },
+    )]
+    : [];
   return [
     tool(
       async () => JSON.stringify(getProjectWorkflow()),
@@ -18,16 +30,7 @@ export function createAdvisorTools(db: Database, ctx: ToolContext) {
         schema: z.object({}),
       },
     ),
-    tool(
-      async ({ q }) => JSON.stringify(await queryWhitelist(db, q)),
-      {
-        name: 'list_whitelist',
-        description: '查询当前全局白名单车辆列表，可选关键词过滤车牌/车主/楼栋',
-        schema: z.object({
-          q: z.string().optional().describe('可选搜索关键词'),
-        }),
-      },
-    ),
+    ...whitelistTools,
     tool(
       async () => JSON.stringify(await queryDevices(db, ctx)),
       {

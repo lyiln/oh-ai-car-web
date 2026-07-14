@@ -4,7 +4,7 @@ import {
   migration006, migration007, migration008, migration009, migration010,
   migration011, migration012, migration012AiAgents, migration013ViolationReviewDisposition,
   migration013WhitelistPhoneSms,
-  migration014, migration015,
+  migration014, migration015, migration016,
 } from './schema.js';
 
 export class Database {
@@ -43,6 +43,7 @@ export class Database {
         { version: '013-whitelist-phone-sms', sql: migration013WhitelistPhoneSms },
         { version: '014-wxpusher-uid', sql: migration014 },
         { version: '015-drop-phone-aliyun', sql: migration015 },
+        { version: '016-auth-otp-attempt-limit', sql: migration016 },
       ]) {
         await client.query('BEGIN');
         try {

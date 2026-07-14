@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import argon2 from 'argon2';
 import cookie from '@fastify/cookie';
 import cors from '@fastify/cors';
+import rateLimit from '@fastify/rate-limit';
 import websocket from '@fastify/websocket';
 import Fastify, { type FastifyRequest } from 'fastify';
 import type { PoolClient } from 'pg';
@@ -54,6 +55,12 @@ function bboxIntersectsRoi(box: unknown, roi: unknown): boolean {
 }
 function normalizeEmail(value: string): string { return value.trim().toLowerCase(); }
 function isEmail(value: string): boolean { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value); }
+function authRateKey(request: FastifyRequest): string {
+  const body = object(request.body);
+  const username = typeof body?.username === 'string' ? body.username.trim().toLowerCase() : '';
+  const usableUsername = username.length <= 128 && !/[\u0000-\u001f\u007f]/.test(username);
+  return username && usableUsername ? `username:${username}` : `ip:${request.ip}`;
+}
 function userDto(user: UserRow) { return { id: user.id, username: user.username, displayName: user.display_name, role: user.role, active: user.active, email: user.email }; }
 function generatePasscode(): string { return String(Math.floor(100_000 + Math.random() * 900_000)); }
 type ImportedWaypoint = { name: string; x: number; y: number; yaw: number; dwellSeconds: number; noParkingRoi: number[] | null };
@@ -108,14 +115,25 @@ export class RealtimeHub {
   }
 }
 
-export interface AppServices { db?: Database; config?: Partial<Config>; mailer?: OtpMailer; }
+export interface AppServices {
+  db?: Database;
+  config?: Partial<Config>;
+  mailer?: OtpMailer;
+  authRateLimits?: { loginMax: number; otpRequestMax: number; otpVerifyMax: number };
+}
 export async function createApp(services: AppServices = {}) {
   const config = loadConfig(services.config);
   const db = services.db ?? new Database(config.databaseUrl);
   const mailer = services.mailer ?? createSmtpOtpMailer(config);
   const hub = new RealtimeHub();
+  const authRateLimits = services.authRateLimits ?? { loginMax: 10, otpRequestMax: 5, otpVerifyMax: 5 };
   const app = Fastify({ logger: true });
   await app.register(cookie);
+  await app.register(rateLimit, {
+    global: false,
+    hook: 'preHandler',
+    errorResponseBuilder: () => Object.assign(new Error('请求过于频繁，请稍后重试'), { statusCode: 429 }),
+  });
   const trustedOrigins = new Set(config.allowedOrigins);
   const isTrustedOrigin = (origin: string | undefined) => Boolean(origin && trustedOrigins.has(origin));
   await app.register(cors, { origin: (origin, callback) => callback(null, isTrustedOrigin(origin)), credentials: true });
@@ -128,6 +146,14 @@ export async function createApp(services: AppServices = {}) {
 
   async function audit(action: string, outcome: string, actorUserId?: string, vehicleId?: string, metadata: Record<string, unknown> = {}) {
     await db.query('INSERT INTO audit_logs (id, actor_user_id, vehicle_id, action, outcome, metadata) VALUES ($1,$2,$3,$4,$5,$6)', [randomUUID(), actorUserId ?? null, vehicleId ?? null, action, outcome, JSON.stringify(metadata)]);
+  }
+  function auditRateLimit(action: string) {
+    return (request: FastifyRequest) => {
+      const body = object(request.body);
+      const username = typeof body?.username === 'string' ? body.username.trim() : '';
+      void audit(action, 'throttled', undefined, undefined, username ? { username } : {})
+        .catch((error) => request.log.error({ error }, 'Failed to audit authentication rate limit'));
+    };
   }
   function session(request: FastifyRequest): SessionPayload | null { const value = request.cookies[SESSION_COOKIE]; return value ? verify<SessionPayload>(value, config.sessionSecret) : null; }
   async function currentUser(request: FastifyRequest): Promise<UserRow | null> {
@@ -175,7 +201,9 @@ export async function createApp(services: AppServices = {}) {
   app.setErrorHandler((error, _request, reply) => reply.status((error as { statusCode?: number }).statusCode ?? 400).send({ error: error instanceof Error ? error.message : 'Request failed' }));
   app.get('/health', async () => ({ ok: true }));
 
-  app.post('/api/auth/login', async (request, reply) => {
+  app.post('/api/auth/login', {
+    config: { rateLimit: { max: authRateLimits.loginMax, timeWindow: '15 minutes', keyGenerator: authRateKey, onExceeded: auditRateLimit('auth.login') } },
+  }, async (request, reply) => {
     const body = object(request.body); const username = string(body?.username, 'username'); const password = string(body?.password, 'password');
     const result = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users WHERE username=$1`, [username]);
     const user = result.rows[0];
@@ -183,7 +211,9 @@ export async function createApp(services: AppServices = {}) {
     issueSession(reply, user);
     await audit('auth.login', 'success', user.id); return { user: userDto(user) };
   });
-  app.post('/api/auth/request-otp', async (request, reply) => {
+  app.post('/api/auth/request-otp', {
+    config: { rateLimit: { max: authRateLimits.otpRequestMax, timeWindow: '15 minutes', keyGenerator: authRateKey, onExceeded: auditRateLimit('auth.otp.request') } },
+  }, async (request, reply) => {
     const body = object(request.body); const username = string(body?.username, 'username');
     const sent = { ok: true as const, message: '如该管理员账号已登记邮箱，验证码将发送至绑定邮箱', time: String(config.otpExpiryMinutes) };
     if (!mailer.available) {
@@ -216,7 +246,9 @@ export async function createApp(services: AppServices = {}) {
     }
     return sent;
   });
-  app.post('/api/auth/verify-otp', async (request, reply) => {
+  app.post('/api/auth/verify-otp', {
+    config: { rateLimit: { max: authRateLimits.otpVerifyMax, timeWindow: '5 minutes', keyGenerator: authRateKey, onExceeded: auditRateLimit('auth.otp.verify') } },
+  }, async (request, reply) => {
     const body = object(request.body); const username = string(body?.username, 'username'); const passcode = string(body?.passcode, 'passcode');
     if (!/^\d{6}$/.test(passcode)) throw Object.assign(new Error('passcode is invalid'), { statusCode: 400 });
     const userResult = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users WHERE username=$1 AND active=true AND role='admin'`, [username]);
@@ -226,14 +258,33 @@ export async function createApp(services: AppServices = {}) {
       return reply.status(401).send({ error: '验证码无效或已过期' });
     }
     const email = normalizeEmail(candidate.email);
-    const otp = await db.query<{ id: string; user_id: string; code_hash: string; expires_at: Date }>('SELECT id, user_id, code_hash, expires_at FROM auth_otps WHERE email=$1 AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1', [email]);
-    const row = otp.rows[0];
-    if (!row || row.expires_at.getTime() < Date.now() || !await argon2.verify(row.code_hash, passcode)) {
-      await audit('auth.otp.verify', 'rejected', undefined, undefined, { username, email });
+    const verification = await db.transaction(async (client) => {
+      const otp = await client.query<{ id: string; user_id: string; code_hash: string; expires_at: Date; failed_attempts: number }>(
+        'SELECT id, user_id, code_hash, expires_at, failed_attempts FROM auth_otps WHERE email=$1 AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1 FOR UPDATE',
+        [email],
+      );
+      const row = otp.rows[0];
+      if (!row || row.expires_at.getTime() < Date.now() || row.failed_attempts >= 5) {
+        return { valid: false as const, attemptLimitReached: Boolean(row && row.failed_attempts >= 5) };
+      }
+      if (!await argon2.verify(row.code_hash, passcode)) {
+        const updated = await client.query<{ failed_attempts: number }>(
+          `UPDATE auth_otps
+           SET failed_attempts=LEAST(failed_attempts+1,5),
+               consumed_at=CASE WHEN failed_attempts+1>=5 THEN now() ELSE consumed_at END
+           WHERE id=$1 RETURNING failed_attempts`,
+          [row.id],
+        );
+        return { valid: false as const, attemptLimitReached: updated.rows[0]?.failed_attempts === 5 };
+      }
+      await client.query('UPDATE auth_otps SET consumed_at=now() WHERE id=$1', [row.id]);
+      return { valid: true as const, userId: row.user_id };
+    });
+    if (!verification.valid) {
+      await audit('auth.otp.verify', verification.attemptLimitReached ? 'attempt_limit_reached' : 'rejected', undefined, undefined, { username, email });
       return reply.status(401).send({ error: '验证码无效或已过期' });
     }
-    await db.query('UPDATE auth_otps SET consumed_at=now() WHERE id=$1', [row.id]);
-    const result = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users WHERE id=$1 AND active=true AND role='admin'`, [row.user_id]);
+    const result = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users WHERE id=$1 AND active=true AND role='admin'`, [verification.userId]);
     const user = result.rows[0];
     if (!user) { await audit('auth.otp.verify', 'rejected', undefined, undefined, { username, email }); return reply.status(401).send({ error: '验证码无效或已过期' }); }
     issueSession(reply, user);
@@ -457,8 +508,29 @@ export async function createApp(services: AppServices = {}) {
     return { url: saved.publicPath, fileName: saved.fileName };
   });
   app.get('/api/evidence/:fileName', async (request, reply) => {
-    await requireUser(request);
+    const user = await requireUser(request);
     const fileName = (request.params as { fileName: string }).fileName;
+    const publicPath = `/api/evidence/${fileName}`;
+    const authorized = await db.query(
+      `WITH evidence_vehicles AS (
+         SELECT t.vehicle_id FROM patrol_events e JOIN patrol_tasks t ON t.id=e.task_id WHERE e.evidence_url=$1
+         UNION
+         SELECT t.vehicle_id FROM plate_observations po JOIN patrol_tasks t ON t.id=po.task_id
+           WHERE po.evidence_image_url=$1 OR po.annotated_image_url=$1
+         UNION
+         SELECT v.vehicle_id FROM violations v WHERE v.evidence_url=$1
+         UNION
+         SELECT rt.source_vehicle_id FROM response_tasks rt WHERE rt.arrival_evidence_url=$1
+         UNION
+         SELECT rt.assigned_vehicle_id FROM response_tasks rt WHERE rt.arrival_evidence_url=$1 AND rt.assigned_vehicle_id IS NOT NULL
+       )
+       SELECT 1 FROM evidence_vehicles ev
+       WHERE $2::uuid IS NULL OR EXISTS (
+         SELECT 1 FROM vehicle_members vm WHERE vm.vehicle_id=ev.vehicle_id AND vm.user_id=$2
+       ) LIMIT 1`,
+      [publicPath, user.role === 'admin' ? null : user.id],
+    );
+    if (!authorized.rowCount) return reply.status(404).send({ error: 'Evidence not found' });
     const bytes = readEvidenceJpeg(fileName);
     if (!bytes) return reply.status(404).send({ error: 'Evidence not found' });
     return reply.type('image/jpeg').header('cache-control', 'private, max-age=3600').send(bytes);

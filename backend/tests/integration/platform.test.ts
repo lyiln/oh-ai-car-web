@@ -1,15 +1,20 @@
 import { randomUUID } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import argon2 from 'argon2';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { GenericContainer, Wait, type StartedTestContainer } from 'testcontainers';
 import { createApp } from '../../src/app.js';
 import { Database } from '../../src/db/index.js';
+import { saveEvidenceJpeg } from '../../src/evidence-storage.js';
 
 const origin = 'https://platform.example.test';
 const defaultPassword = 'password';
 let container: StartedTestContainer;
 let db: Database;
 let app: Awaited<ReturnType<typeof createApp>>;
+let evidenceDir: string;
 const deliveredOtps: Array<{ to: string; passcode: string; expiresInMinutes: number }> = [];
 const ids = { admin: randomUUID(), operatorA: randomUUID(), operatorB: randomUUID() };
 
@@ -56,6 +61,8 @@ async function resetGlobalWhitelist(entries: Array<{ plate: string; owner?: stri
 }
 
 beforeAll(async () => {
+  evidenceDir = mkdtempSync(join(tmpdir(), 'oh-ai-platform-evidence-'));
+  process.env.EVIDENCE_STORAGE_DIR = evidenceDir;
   container = await new GenericContainer('postgis/postgis:16-3.4')
     .withEnvironment({ POSTGRES_DB: 'platform', POSTGRES_USER: 'platform', POSTGRES_PASSWORD: 'platform' })
     .withExposedPorts(5432)
@@ -71,7 +78,7 @@ beforeAll(async () => {
     await waitForDatabase(db);
     await Promise.all([db.migrate(), secondMigrator.migrate()]);
     const migrations = await db.query<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version');
-    expect(migrations.rows).toHaveLength(17);
+    expect(migrations.rows).toHaveLength(18);
     expect(new Set(migrations.rows.map((row) => row.version))).toEqual(new Set([
       '001',
       '002-patrol-inspection',
@@ -90,6 +97,7 @@ beforeAll(async () => {
       '013-whitelist-phone-sms',
       '014-wxpusher-uid',
       '015-drop-phone-aliyun',
+      '016-auth-otp-attempt-limit',
     ]));
   } finally {
     await secondMigrator.close();
@@ -108,10 +116,17 @@ beforeAll(async () => {
       available: true,
       async sendLoginPasscode(input) { deliveredOtps.push(input); },
     },
+    authRateLimits: { loginMax: 1_000, otpRequestMax: 1_000, otpVerifyMax: 1_000 },
   });
 }, 120_000);
 
-afterAll(async () => { if (app) await app.close(); if (db) await db.close(); if (container) await container.stop(); });
+afterAll(async () => {
+  if (app) await app.close();
+  if (db) await db.close();
+  if (container) await container.stop();
+  if (evidenceDir) rmSync(evidenceDir, { recursive: true, force: true });
+  delete process.env.EVIDENCE_STORAGE_DIR;
+});
 
 beforeEach(async () => {
   await db.query('UPDATE users SET password_hash=$1 WHERE id=$2', [await argon2.hash(defaultPassword), ids.admin]);
@@ -138,6 +153,51 @@ describe('platform API against PostGIS', () => {
     expect((await app.inject({ method: 'POST', url: '/device/v1/telemetry', headers: { authorization: `Bearer ${token}` }, payload: { points: [point] } })).json()).toEqual({ accepted: 0 });
     const track = await app.inject({ method: 'GET', url: `/api/vehicles/${vehicleId}/track`, headers: { cookie: operatorACookie } });
     expect(track.statusCode).toBe(200); expect(track.json<{ points: unknown[] }>().points).toHaveLength(1);
+  });
+
+  it('isolates route waypoints and evidence by vehicle membership', async () => {
+    const adminCookie = await login('admin', defaultPassword);
+    const operatorACookie = await login('operator-a', defaultPassword);
+    const operatorBCookie = await login('operator-b', defaultPassword);
+    const vehicleA = randomUUID(); const vehicleB = randomUUID();
+    const routeA = randomUUID(); const routeB = randomUUID();
+    await db.query(
+      `INSERT INTO vehicles (id,code,name,tcp_host,tcp_port,video_port) VALUES
+       ($1,$2,'权限车 A','192.168.10.11',6000,6500),($3,$4,'权限车 B','192.168.10.12',6000,6500)`,
+      [vehicleA, `AUTH-A-${vehicleA.slice(0, 8)}`, vehicleB, `AUTH-B-${vehicleB.slice(0, 8)}`],
+    );
+    await db.query('INSERT INTO vehicle_members (vehicle_id,user_id) VALUES ($1,$2)', [vehicleA, ids.operatorA]);
+    await db.query(
+      `INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES
+       ($1,$2,'授权路线 A','map-auth-a','waypoints: []',$5),($3,$4,'授权路线 B','map-auth-b','waypoints: []',$5)`,
+      [routeA, vehicleA, routeB, vehicleB, ids.admin],
+    );
+    await db.query(
+      `INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES
+       ($1,$2,1,'授权航点 A',1,1,0,8),($3,$4,1,'授权航点 B',2,2,0,8)`,
+      [randomUUID(), routeA, randomUUID(), routeB],
+    );
+
+    const own = await app.inject({ method: 'GET', url: `/api/map/waypoints?routeId=${routeA}`, headers: { cookie: operatorACookie } });
+    expect(own.statusCode).toBe(200);
+    expect(own.json<{ waypoints: Array<{ routeId: string }> }>().waypoints).toHaveLength(1);
+    const foreign = await app.inject({ method: 'GET', url: `/api/map/waypoints?routeId=${routeB}`, headers: { cookie: operatorACookie } });
+    expect(foreign.statusCode).toBe(403);
+    const scoped = await app.inject({ method: 'GET', url: '/api/map/waypoints', headers: { cookie: operatorACookie } });
+    const scopedRouteIds = scoped.json<{ waypoints: Array<{ routeId: string }> }>().waypoints.map((row) => row.routeId);
+    expect(scopedRouteIds).toContain(routeA);
+    expect(scopedRouteIds).not.toContain(routeB);
+
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, ...Array(64).fill(0), 0xff, 0xd9]);
+    const linked = saveEvidenceJpeg(jpeg, 'authz');
+    const unlinked = saveEvidenceJpeg(jpeg, 'unlinked');
+    await db.query('INSERT INTO violations (id,vehicle_id,evidence_url) VALUES ($1,$2,$3)', [randomUUID(), vehicleA, linked.publicPath]);
+    const evidenceUrl = `/api/evidence/${linked.fileName}`;
+    expect((await app.inject({ method: 'GET', url: evidenceUrl, headers: { cookie: operatorACookie } })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'GET', url: evidenceUrl, headers: { cookie: operatorBCookie } })).statusCode).toBe(404);
+    expect((await app.inject({ method: 'GET', url: evidenceUrl, headers: { cookie: adminCookie } })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'GET', url: `/api/evidence/${unlinked.fileName}`, headers: { cookie: adminCookie } })).statusCode).toBe(404);
+    expect((await app.inject({ method: 'GET', url: '/api/evidence/not-valid.png', headers: { cookie: adminCookie } })).statusCode).toBe(404);
   });
 
   it('delivers OTPs only to administrators without exposing account state or passcodes', async () => {
@@ -170,6 +230,70 @@ describe('platform API against PostGIS', () => {
     const verified = await app.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'admin', passcode: deliveredOtps[0]!.passcode } });
     expect(verified.statusCode).toBe(200);
     expect((await app.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'admin', passcode: deliveredOtps[0]!.passcode } })).statusCode).toBe(401);
+  });
+
+  it('rate-limits authentication and atomically consumes OTPs after five failures', async () => {
+    const rateUsers = [
+      ['rate-admin', 'rate-admin@example.test'],
+      ['concurrent-admin', 'concurrent-admin@example.test'],
+      ['request-limit-admin', 'request-limit-admin@example.test'],
+      ['expired-admin', 'expired-admin@example.test'],
+    ] as const;
+    for (const [username, email] of rateUsers) {
+      await db.query(
+        'INSERT INTO users (id,username,display_name,password_hash,role,email) VALUES ($1,$2,$2,$3,\'admin\',$4)',
+        [randomUUID(), username, await argon2.hash(defaultPassword), email],
+      );
+    }
+    const rateDelivered: Array<{ to: string; passcode: string; expiresInMinutes: number }> = [];
+    const limitedApp = await createApp({
+      db,
+      config: { sessionSecret: 'rate-limit-secret', publicOrigin: origin, allowedOrigins: [origin], otpExpiryMinutes: 5, otpResendCooldownSeconds: 60 },
+      mailer: { available: true, async sendLoginPasscode(input) { rateDelivered.push(input); } },
+    });
+    try {
+      const requested = await limitedApp.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'rate-admin' } });
+      expect(requested.statusCode).toBe(200);
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const rejected = await limitedApp.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'rate-admin', passcode: '000000' } });
+        expect(rejected.statusCode).toBe(401);
+      }
+      const stored = await db.query<{ failed_attempts: number; consumed_at: Date | null }>(
+        "SELECT failed_attempts,consumed_at FROM auth_otps WHERE email='rate-admin@example.test' ORDER BY created_at DESC LIMIT 1",
+      );
+      expect(stored.rows[0]?.failed_attempts).toBe(5);
+      expect(stored.rows[0]?.consumed_at).not.toBeNull();
+      const throttledVerify = await limitedApp.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'rate-admin', passcode: '000000' } });
+      expect(throttledVerify.statusCode).toBe(429);
+      expect(throttledVerify.headers['retry-after']).toBeDefined();
+
+      await limitedApp.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'concurrent-admin' } });
+      const concurrentCode = rateDelivered.find((entry) => entry.to === 'concurrent-admin@example.test')!.passcode;
+      const concurrent = await Promise.all([
+        limitedApp.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'concurrent-admin', passcode: concurrentCode } }),
+        limitedApp.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'concurrent-admin', passcode: concurrentCode } }),
+      ]);
+      expect(concurrent.map((response) => response.statusCode).sort()).toEqual([200, 401]);
+
+      const expiredUser = await db.query<{ id: string }>("SELECT id FROM users WHERE username='expired-admin'");
+      await db.query(
+        'INSERT INTO auth_otps (id,user_id,email,code_hash,expires_at) VALUES ($1,$2,$3,$4,now()-interval \'1 minute\')',
+        [randomUUID(), expiredUser.rows[0]!.id, 'expired-admin@example.test', await argon2.hash('123456')],
+      );
+      const expired = await limitedApp.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'expired-admin', passcode: '123456' } });
+      expect(expired.statusCode).toBe(401);
+
+      for (let attempt = 0; attempt < 5; attempt++) {
+        expect((await limitedApp.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'request-limit-admin' } })).statusCode).toBe(200);
+      }
+      expect((await limitedApp.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'request-limit-admin' } })).statusCode).toBe(429);
+      for (let attempt = 0; attempt < 10; attempt++) {
+        expect((await limitedApp.inject({ method: 'POST', url: '/api/auth/login', headers: { origin }, payload: { username: 'missing-rate-user', password: 'wrong' } })).statusCode).toBe(401);
+      }
+      expect((await limitedApp.inject({ method: 'POST', url: '/api/auth/login', headers: { origin }, payload: { username: 'missing-rate-user', password: 'wrong' } })).statusCode).toBe(429);
+    } finally {
+      await limitedApp.close();
+    }
   });
 
   it('allows admin to update own profile and rejects operators', async () => {
