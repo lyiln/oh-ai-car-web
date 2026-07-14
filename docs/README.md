@@ -13,6 +13,7 @@
 | 上门处置与真实小车 | [`../tasks/real-car-doorstep-integration-plan.md`](../tasks/real-car-doorstep-integration-plan.md)、[`flows/web-control-real-car-validation.md`](flows/web-control-real-car-validation.md)、[`flows/jetson-stage1-readonly-runbook.md`](flows/jetson-stage1-readonly-runbook.md) |
 | 协议冲突 | [`../PROTOCOL_STATUS.md`](../PROTOCOL_STATUS.md)、[`decisions/protocol-length-discrepancy.md`](decisions/protocol-length-discrepancy.md) |
 | 课程交付 | [`../课程状态.md`](../课程状态.md)、[`course/课程文档索引.md`](course/课程文档索引.md) |
+| CI/CD 与服务器接入 | [`CI-CD.md`](CI-CD.md) |
 
 ## 按用途查找
 

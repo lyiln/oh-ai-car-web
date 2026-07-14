@@ -25,6 +25,23 @@ export async function violation(id: string): Promise<Violation | null> {
   }
 }
 
+/** Console plate-scan workbench: upload JPEG evidence and create a pending violation + review for UI tests. */
+export async function createViolationFromConsoleScan(input: {
+  vehicleId: string;
+  plate: string;
+  jpegBase64: string;
+  confidence?: number | null;
+  waypoint?: string;
+}): Promise<{
+  violation: Pick<Violation, 'id' | 'plate' | 'evidenceUrl' | 'deviceId' | 'waypoint' | 'status' | 'type'>;
+  review: { id: string; eventId: string };
+}> {
+  return apiRequest('/api/violations/from-console-scan', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
 export async function pendingReviews(): Promise<Review[]> {
   const result = await apiRequest<{ reviews: Review[] }>('/api/reviews/pending');
   return result.reviews ?? [];

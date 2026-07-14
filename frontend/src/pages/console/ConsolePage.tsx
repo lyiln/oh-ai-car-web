@@ -3,6 +3,7 @@ import { Navigate } from 'react-router-dom';
 import type { ProbeResult, StateEnvelope } from '@oh-ai-car-web/shared';
 import { LiveMap } from '../../components/map/LiveMap.js';
 import { VideoPanel } from '../../components/VideoPanel.js';
+import { PlateScanPanel } from '../../components/plate/PlateScanPanel.js';
 import { ButtonControl } from '../../controls/ButtonControl.js';
 import { MediaControls } from '../../controls/MediaControls.js';
 import { RockerControl } from '../../controls/RockerControl.js';
@@ -382,6 +383,14 @@ export function ConsolePage() {
             <p className="muted">松开方向键 / 窗口失焦自动停止（对齐 APP）</p>
           </section>
         </aside>
+      </div>
+      <div className="console-plate-section">
+        <PlateScanPanel
+          host={host}
+          videoPort={videoPort}
+          vehicleId={selectedId}
+          disabled={disabled}
+        />
       </div>
     </div>
   );

@@ -18,6 +18,9 @@
     "sim:patrol": "node scripts/sim-patrol-loop.mjs",
     "sim:goto": "node scripts/sim-goto-loop.mjs",
     "test:deploy-live": "node deploy/tests/live-websocket.mjs",
+    "setup:yolo": "node scripts/run-python.mjs scripts/setup-yolo-plate.py",
+    "dev:plate-api": "node scripts/run-python.mjs scripts/start-plate-web-api.py",
+    "test:edge-plate": "node scripts/run-python.mjs edge-agent/tests/test_plate_adapter.py",
     "start": "npm run build && npm run start --workspace=@oh-ai-car-web/gateway"
   },
   "devDependencies": { "ws": "^8.18.2" }

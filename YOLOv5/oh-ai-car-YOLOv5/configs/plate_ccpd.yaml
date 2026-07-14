@@ -1,0 +1,7 @@
+path: c:/Users/jfkyx/Desktop/YOLOv5/member_d_plate_detection/datasets/ccpd_plate_small
+train: images/train
+val: images/val
+
+nc: 1
+names:
+  - plate

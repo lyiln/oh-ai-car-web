@@ -63,13 +63,16 @@ export class CarTcpClient {
     this.emit();
   }
 
-  async write(message: string): Promise<void> {
+  private writeOnce(message: string): Promise<void> {
     if (!this.socket || !this.connected || this.socket.destroyed) throw new Error('TCP socket is not connected');
     return new Promise<void>((resolve, reject) => {
       this.socket?.write(message, (error) => error ? reject(error) : resolve());
     });
   }
 
+  async write(message: string): Promise<void> {
+    await this.writeOnce(message);
+  }
   /** Short TCP reachability check without claiming the control session. */
   static async probe(host: string, tcpPort: number, timeoutMs = DEFAULT_PROBE_TIMEOUT_MS): Promise<ProbeResult> {
     const trimmed = host.trim();

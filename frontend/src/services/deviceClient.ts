@@ -84,7 +84,9 @@ export async function deleteDevice(id: string): Promise<{ ok: true }> {
   return apiRequest<{ ok: true }>(`/api/devices/${id}`, { method: 'DELETE' });
 }
 
-export async function connectDevice(id: string): Promise<{
+export async function connectDevice(
+  id: string,
+): Promise<{
   host: string;
   tcpPort: number;
   videoPort: number;

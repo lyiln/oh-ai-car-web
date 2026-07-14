@@ -121,14 +121,15 @@ npm run dev:frontend
 2. 在一个终端运行 `npm run dev:backend`；首次启动会迁移数据库。
 3. 以 `VITE_PLATFORM_ENABLED=true npm run dev:frontend` 启动前端。Vite 已将 `/api` 和 `/ws` 代理到 `127.0.0.1:8788`。
 4. 在操作员机器上，以 `PLATFORM_API_URL=http://127.0.0.1:8788 npm run dev:gateway` 启动本机网关。
-5. 配置高德 Key 和 ROS2 边缘代理后，才可以看到真实底图与实时轨迹。
+5. 若要使用控制台的「车牌识别工作台」，另开终端运行 `npm run dev:plate-api`。这是第四个本机进程，监听 `127.0.0.1:8010`；它需要 YOLO/PaddleOCR Python 依赖、模型权重和可发现的 YOLO 仓库。基础遥控不依赖它，详见[YOLO 集成说明](../integration/yolo-plate-recognition.md)。
+6. 配置高德 Key 和 ROS2 边缘代理后，才可以看到真实底图与实时轨迹。
 
 面向统一服务器的 Docker 配置、环境变量与 ROS2 命令见[部署说明](../deployment/vehicle-platform.md)。生产环境必须使用 HTTPS、强随机密钥、`COOKIE_SECURE=true` 和外部备份策略。
 
 ## 当前边界与尚未验证项
 
-- 已通过 TypeScript 构建和自动化测试的是代码逻辑；尚未启动 Docker Compose、验证真实 PostgreSQL/AMap/ROS2 或连接真实小车。
-- 后端包含 `npm run test:integration --workspace=@oh-ai-car-web/backend` 的 PostGIS 集成测试。PostgreSQL 镜像初始化会短暂启动一次再退出；测试等待第二次就绪日志后执行，已验证路线、任务领取、ROI、白名单分类、30 分钟去重、停止确认、双向租约互锁和并发启动。
+- TypeScript 构建、workspace 自动化测试、临时 PostGIS 集成测试和 Docker Compose 完整栈冒烟验证已经通过；Compose 证据覆盖前端入口、登录、车辆创建和认证/未认证 WebSocket，但不代表真实 AMap、SMTP、AI、ROS2 或小车已验证。
+- 后端 `npm run test:integration --workspace=@oh-ai-car-web/backend` 的 20 项 PostGIS 集成测试已通过，覆盖迁移、路线、任务领取、ROI、白名单分类与快照、30 分钟去重、停止确认、车辆级授权、OTP 并发/限流、上门处置和并发写入。
 - 巡检车的 Nav2、OCR、停止确认和真车安全接管仍需独立实测并记录。
 - 巡检看板目前通过刷新读取任务事件和识别记录，尚未把这些事件推送到浏览器 WebSocket；它不能作为实时进度已验证的证据。
 - 浏览器加载视频页面不代表小车视频流健康；TCP 写成功也不代表小车已执行指令。

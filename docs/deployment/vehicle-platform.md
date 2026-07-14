@@ -8,6 +8,10 @@
    `https://cars.example.edu`). It is required in production and is used to
    restrict CORS and Cookie-authenticated write requests. Use
    `PLATFORM_ALLOWED_ORIGINS` only for additional trusted development origins.
+   Compose sets `PLATFORM_TRUST_PROXY=true` because its backend is reachable only
+   through the bundled single-hop Nginx proxy. Nginx overwrites the forwarded IP
+   headers. Keep this setting false for a directly reachable backend, and never
+   enable it behind a proxy that passes through client-supplied forwarding headers.
    Set `BOOTSTRAP_ADMIN_EMAIL` to a mailbox that can receive administrator
    login codes, and configure all `SMTP_*` values for a controlled SMTP
    account. SMTP credentials and codes stay in the backend runtime; neither
@@ -24,7 +28,8 @@
 4. Run `PLATFORM_API_URL=http://<server>:8080 DEVICE_CREDENTIAL=<credential>
    python3 telemetry_agent.py` in an approved ROS2 environment with `/gps/fix`
    available. Hardware-specific deployment and ROS runtime recovery require a
-   separate stage 1.5 approval.
+   separate stage 1.5 approval. For the approved Jetson GPS setup procedure,
+   see [jetson-gps-setup.md](./jetson-gps-setup.md).
 5. On each operator machine, run the local gateway with
    `PLATFORM_API_URL=http://<server>:8080 npm run dev:gateway`. The gateway then
    rejects control connections without a live platform lease.
@@ -56,7 +61,8 @@ Run
 environment before deployment; it starts a temporary PostGIS database and does
 not use the deployment data volume.
 
-Use `npm run test:deploy-live` to build the Compose stack, authenticate, verify
-an authorised `/patrol/live` subscription through Nginx, and verify that an
-unauthenticated connection closes with policy code 1008. It creates an isolated
-Compose project and removes its containers and volumes when finished.
+Use `npm run test:deploy-live` to build the Compose stack, verify the frontend
+HTML entry, authenticate, verify an authorised `/patrol/live` subscription
+through Nginx, and verify that an unauthenticated connection closes with policy
+code 1008. It creates an isolated Compose project and removes its containers and
+volumes when finished.

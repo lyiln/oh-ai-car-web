@@ -1,15 +1,20 @@
 import { randomUUID } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import argon2 from 'argon2';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { GenericContainer, Wait, type StartedTestContainer } from 'testcontainers';
 import { createApp } from '../../src/app.js';
 import { Database } from '../../src/db/index.js';
+import { saveEvidenceJpeg } from '../../src/evidence-storage.js';
 
 const origin = 'https://platform.example.test';
 const defaultPassword = 'password';
 let container: StartedTestContainer;
 let db: Database;
 let app: Awaited<ReturnType<typeof createApp>>;
+let evidenceDir: string;
 const deliveredOtps: Array<{ to: string; passcode: string; expiresInMinutes: number }> = [];
 const ids = { admin: randomUUID(), operatorA: randomUUID(), operatorB: randomUUID() };
 
@@ -56,6 +61,8 @@ async function resetGlobalWhitelist(entries: Array<{ plate: string; owner?: stri
 }
 
 beforeAll(async () => {
+  evidenceDir = mkdtempSync(join(tmpdir(), 'oh-ai-platform-evidence-'));
+  process.env.EVIDENCE_STORAGE_DIR = evidenceDir;
   container = await new GenericContainer('postgis/postgis:16-3.4')
     .withEnvironment({ POSTGRES_DB: 'platform', POSTGRES_USER: 'platform', POSTGRES_PASSWORD: 'platform' })
     .withExposedPorts(5432)
@@ -65,14 +72,36 @@ beforeAll(async () => {
     .withWaitStrategy(Wait.forLogMessage(/PostgreSQL init process complete; ready for start up/))
     .start();
   const databaseUrl = `postgres://platform:platform@${container.getHost()}:${container.getMappedPort(5432)}/platform`;
-  const firstMigrator = new Database(databaseUrl);
+  db = new Database(databaseUrl);
   const secondMigrator = new Database(databaseUrl);
-  await waitForDatabase(firstMigrator);
-  await Promise.all([firstMigrator.migrate(), secondMigrator.migrate()]);
-  const migrations = await firstMigrator.query<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version');
-  expect(migrations.rows).toHaveLength(10);
-  await secondMigrator.close();
-  db = firstMigrator;
+  try {
+    await waitForDatabase(db);
+    await Promise.all([db.migrate(), secondMigrator.migrate()]);
+    const migrations = await db.query<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version');
+    expect(migrations.rows).toHaveLength(18);
+    expect(new Set(migrations.rows.map((row) => row.version))).toEqual(new Set([
+      '001',
+      '002-patrol-inspection',
+      '003-patrol-stop-confirmation',
+      '004-platform-operations',
+      '005-patrol-snapshot-reviews',
+      '006-whitelist-live-version-locking',
+      '007-doorstep-response',
+      '008-doorstep-response-safety',
+      '009-global-whitelist',
+      '010-whitelist-entry-fields',
+      '011-patrol-event-details',
+      '012-patrol-rule-snapshots',
+      '012-ai-agents',
+      '013-violation-review-disposition',
+      '013-whitelist-phone-sms',
+      '014-wxpusher-uid',
+      '015-drop-phone-aliyun',
+      '016-auth-otp-attempt-limit',
+    ]));
+  } finally {
+    await secondMigrator.close();
+  }
   for (const [name, id, role, email] of [
     ['admin', ids.admin, 'admin', 'admin@example.test'],
     ['operator-a', ids.operatorA, 'operator', 'operator-a@example.test'],
@@ -87,10 +116,17 @@ beforeAll(async () => {
       available: true,
       async sendLoginPasscode(input) { deliveredOtps.push(input); },
     },
+    authRateLimits: { loginMax: 1_000, otpRequestMax: 1_000, otpVerifyMax: 1_000 },
   });
 }, 120_000);
 
-afterAll(async () => { if (app) await app.close(); if (db) await db.close(); if (container) await container.stop(); });
+afterAll(async () => {
+  if (app) await app.close();
+  if (db) await db.close();
+  if (container) await container.stop();
+  if (evidenceDir) rmSync(evidenceDir, { recursive: true, force: true });
+  delete process.env.EVIDENCE_STORAGE_DIR;
+});
 
 beforeEach(async () => {
   await db.query('UPDATE users SET password_hash=$1 WHERE id=$2', [await argon2.hash(defaultPassword), ids.admin]);
@@ -117,6 +153,71 @@ describe('platform API against PostGIS', () => {
     expect((await app.inject({ method: 'POST', url: '/device/v1/telemetry', headers: { authorization: `Bearer ${token}` }, payload: { points: [point] } })).json()).toEqual({ accepted: 0 });
     const track = await app.inject({ method: 'GET', url: `/api/vehicles/${vehicleId}/track`, headers: { cookie: operatorACookie } });
     expect(track.statusCode).toBe(200); expect(track.json<{ points: unknown[] }>().points).toHaveLength(1);
+  });
+
+  it('isolates route waypoints and evidence by vehicle membership', async () => {
+    const adminCookie = await login('admin', defaultPassword);
+    const operatorACookie = await login('operator-a', defaultPassword);
+    const operatorBCookie = await login('operator-b', defaultPassword);
+    const vehicleA = randomUUID(); const vehicleB = randomUUID();
+    const routeA = randomUUID(); const routeB = randomUUID();
+    await db.query(
+      `INSERT INTO vehicles (id,code,name,tcp_host,tcp_port,video_port) VALUES
+       ($1,$2,'权限车 A','192.168.10.11',6000,6500),($3,$4,'权限车 B','192.168.10.12',6000,6500)`,
+      [vehicleA, `AUTH-A-${vehicleA.slice(0, 8)}`, vehicleB, `AUTH-B-${vehicleB.slice(0, 8)}`],
+    );
+    await db.query('INSERT INTO vehicle_members (vehicle_id,user_id) VALUES ($1,$2)', [vehicleA, ids.operatorA]);
+    await db.query(
+      `INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES
+       ($1,$2,'授权路线 A','map-auth-a','waypoints: []',$5),($3,$4,'授权路线 B','map-auth-b','waypoints: []',$5)`,
+      [routeA, vehicleA, routeB, vehicleB, ids.admin],
+    );
+    await db.query(
+      `INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES
+       ($1,$2,1,'授权航点 A',1,1,0,8),($3,$4,1,'授权航点 B',2,2,0,8)`,
+      [randomUUID(), routeA, randomUUID(), routeB],
+    );
+
+    const own = await app.inject({ method: 'GET', url: `/api/map/waypoints?routeId=${routeA}`, headers: { cookie: operatorACookie } });
+    expect(own.statusCode).toBe(200);
+    expect(own.json<{ waypoints: Array<{ routeId: string }> }>().waypoints).toHaveLength(1);
+    const foreign = await app.inject({ method: 'GET', url: `/api/map/waypoints?routeId=${routeB}`, headers: { cookie: operatorACookie } });
+    expect(foreign.statusCode).toBe(403);
+    const scoped = await app.inject({ method: 'GET', url: '/api/map/waypoints', headers: { cookie: operatorACookie } });
+    const scopedRouteIds = scoped.json<{ waypoints: Array<{ routeId: string }> }>().waypoints.map((row) => row.routeId);
+    expect(scopedRouteIds).toContain(routeA);
+    expect(scopedRouteIds).not.toContain(routeB);
+
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, ...Array(64).fill(0), 0xff, 0xd9]);
+    const linked = saveEvidenceJpeg(jpeg, 'authz');
+    const taskLinked = saveEvidenceJpeg(jpeg, 'authz-task');
+    const eventLinked = saveEvidenceJpeg(jpeg, 'authz-event');
+    const unlinked = saveEvidenceJpeg(jpeg, 'unlinked');
+    await db.query('INSERT INTO violations (id,vehicle_id,evidence_url) VALUES ($1,$2,$3)', [randomUUID(), vehicleA, linked.publicPath]);
+    const whitelistId = randomUUID(); const taskId = randomUUID(); const eventId = randomUUID();
+    await db.query(
+      'INSERT INTO whitelist_imports (id,vehicle_id,name,created_by_user_id,is_snapshot) VALUES ($1,$2,$3,$4,true)',
+      [whitelistId, vehicleA, '历史证据授权快照', ids.admin],
+    );
+    await db.query(
+      "INSERT INTO patrol_tasks (id,vehicle_id,route_id,whitelist_id,shift,status,created_by_user_id) VALUES ($1,$2,$3,$4,'history','completed',$5)",
+      [taskId, vehicleA, routeA, whitelistId, ids.admin],
+    );
+    await db.query("INSERT INTO patrol_events (id,task_id,event_type) VALUES ($1,$2,'status')", [eventId, taskId]);
+    await db.query('INSERT INTO violations (id,task_id,evidence_url) VALUES ($1,$2,$3)', [randomUUID(), taskId, taskLinked.publicPath]);
+    await db.query('INSERT INTO violations (id,event_id,evidence_url) VALUES ($1,$2,$3)', [randomUUID(), eventId, eventLinked.publicPath]);
+    const evidenceUrl = `/api/evidence/${linked.fileName}`;
+    expect((await app.inject({ method: 'GET', url: evidenceUrl, headers: { cookie: operatorACookie } })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'GET', url: evidenceUrl, headers: { cookie: operatorBCookie } })).statusCode).toBe(404);
+    expect((await app.inject({ method: 'GET', url: evidenceUrl, headers: { cookie: adminCookie } })).statusCode).toBe(200);
+    for (const historical of [taskLinked, eventLinked]) {
+      const historicalUrl = `/api/evidence/${historical.fileName}`;
+      expect((await app.inject({ method: 'GET', url: historicalUrl, headers: { cookie: operatorACookie } })).statusCode).toBe(200);
+      expect((await app.inject({ method: 'GET', url: historicalUrl, headers: { cookie: operatorBCookie } })).statusCode).toBe(404);
+      expect((await app.inject({ method: 'GET', url: historicalUrl, headers: { cookie: adminCookie } })).statusCode).toBe(200);
+    }
+    expect((await app.inject({ method: 'GET', url: `/api/evidence/${unlinked.fileName}`, headers: { cookie: adminCookie } })).statusCode).toBe(404);
+    expect((await app.inject({ method: 'GET', url: '/api/evidence/not-valid.png', headers: { cookie: adminCookie } })).statusCode).toBe(404);
   });
 
   it('delivers OTPs only to administrators without exposing account state or passcodes', async () => {
@@ -149,6 +250,90 @@ describe('platform API against PostGIS', () => {
     const verified = await app.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'admin', passcode: deliveredOtps[0]!.passcode } });
     expect(verified.statusCode).toBe(200);
     expect((await app.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'admin', passcode: deliveredOtps[0]!.passcode } })).statusCode).toBe(401);
+  });
+
+  it('rate-limits authentication and atomically consumes OTPs after five failures', async () => {
+    const rateUsers = [
+      ['rate-admin', 'rate-admin@example.test'],
+      ['concurrent-admin', 'concurrent-admin@example.test'],
+      ['request-limit-admin', 'request-limit-admin@example.test'],
+      ['expired-admin', 'expired-admin@example.test'],
+    ] as const;
+    for (const [username, email] of rateUsers) {
+      await db.query(
+        'INSERT INTO users (id,username,display_name,password_hash,role,email) VALUES ($1,$2,$2,$3,\'admin\',$4)',
+        [randomUUID(), username, await argon2.hash(defaultPassword), email],
+      );
+    }
+    const rateDelivered: Array<{ to: string; passcode: string; expiresInMinutes: number }> = [];
+    const limitedApp = await createApp({
+      db,
+      config: { sessionSecret: 'rate-limit-secret', publicOrigin: origin, allowedOrigins: [origin], otpExpiryMinutes: 5, otpResendCooldownSeconds: 60 },
+      mailer: { available: true, async sendLoginPasscode(input) { rateDelivered.push(input); } },
+    });
+    try {
+      const requested = await limitedApp.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'rate-admin' } });
+      expect(requested.statusCode).toBe(200);
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const rejected = await limitedApp.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'rate-admin', passcode: '000000' } });
+        expect(rejected.statusCode).toBe(401);
+      }
+      const stored = await db.query<{ failed_attempts: number; consumed_at: Date | null }>(
+        "SELECT failed_attempts,consumed_at FROM auth_otps WHERE email='rate-admin@example.test' ORDER BY created_at DESC LIMIT 1",
+      );
+      expect(stored.rows[0]?.failed_attempts).toBe(5);
+      expect(stored.rows[0]?.consumed_at).not.toBeNull();
+      const throttledVerify = await limitedApp.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'rate-admin', passcode: '000000' } });
+      expect(throttledVerify.statusCode).toBe(429);
+      expect(throttledVerify.headers['retry-after']).toBeDefined();
+      const verifyAudits = await db.query<{ outcome: string; metadata: Record<string, unknown> }>(
+        "SELECT outcome,metadata FROM audit_logs WHERE action='auth.otp.verify' AND metadata->>'username'='rate-admin' ORDER BY created_at DESC",
+      );
+      expect(verifyAudits.rows.some((row) => row.outcome === 'attempt_limit_reached')).toBe(true);
+      expect(verifyAudits.rows.some((row) => row.outcome === 'throttled')).toBe(true);
+
+      await limitedApp.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'concurrent-admin' } });
+      const concurrentCode = rateDelivered.find((entry) => entry.to === 'concurrent-admin@example.test')!.passcode;
+      const concurrent = await Promise.all([
+        limitedApp.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'concurrent-admin', passcode: concurrentCode } }),
+        limitedApp.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'concurrent-admin', passcode: concurrentCode } }),
+      ]);
+      expect(concurrent.map((response) => response.statusCode).sort()).toEqual([200, 401]);
+
+      const expiredUser = await db.query<{ id: string }>("SELECT id FROM users WHERE username='expired-admin'");
+      await db.query(
+        'INSERT INTO auth_otps (id,user_id,email,code_hash,expires_at) VALUES ($1,$2,$3,$4,now()-interval \'1 minute\')',
+        [randomUUID(), expiredUser.rows[0]!.id, 'expired-admin@example.test', await argon2.hash('123456')],
+      );
+      const expired = await limitedApp.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'expired-admin', passcode: '123456' } });
+      expect(expired.statusCode).toBe(401);
+
+      for (let attempt = 0; attempt < 5; attempt++) {
+        expect((await limitedApp.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'request-limit-admin' } })).statusCode).toBe(200);
+      }
+      expect((await limitedApp.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'request-limit-admin' } })).statusCode).toBe(429);
+      const requestLimitAudit = await db.query(
+        "SELECT 1 FROM audit_logs WHERE action='auth.otp.request' AND outcome='throttled' AND metadata->>'username'='request-limit-admin' AND NOT (metadata ? 'email')",
+      );
+      expect(requestLimitAudit.rowCount).toBeGreaterThan(0);
+      for (let attempt = 0; attempt < 10; attempt++) {
+        expect((await limitedApp.inject({ method: 'POST', url: '/api/auth/login', headers: { origin }, payload: { username: 'missing-rate-user', password: 'wrong' } })).statusCode).toBe(401);
+      }
+      expect((await limitedApp.inject({ method: 'POST', url: '/api/auth/login', headers: { origin }, payload: { username: 'missing-rate-user', password: 'wrong' } })).statusCode).toBe(429);
+      const loginLimitAudit = await db.query(
+        "SELECT 1 FROM audit_logs WHERE action='auth.login' AND outcome='throttled' AND metadata->>'username'='missing-rate-user'",
+      );
+      expect(loginLimitAudit.rowCount).toBeGreaterThan(0);
+      const authAuditMetadata = await db.query<{ metadata: Record<string, unknown> }>(
+        "SELECT metadata FROM audit_logs WHERE metadata->>'username' IN ('rate-admin','request-limit-admin','missing-rate-user')",
+      );
+      const serializedMetadata = JSON.stringify(authAuditMetadata.rows);
+      expect(serializedMetadata).not.toContain(defaultPassword);
+      expect(serializedMetadata).not.toContain('000000');
+      expect(serializedMetadata).not.toContain(rateDelivered[0]?.passcode ?? 'unavailable-passcode');
+    } finally {
+      await limitedApp.close();
+    }
   });
 
   it('allows admin to update own profile and rejects operators', async () => {
@@ -253,6 +438,148 @@ describe('platform API against PostGIS', () => {
     expect(report.json<{ report: { stats: { observationCount: number; registeredPrivate: number; noParkingCount: number } } }>().report.stats).toMatchObject({ observationCount: 1, registeredPrivate: 1, noParkingCount: 1 });
   });
 
+  it('accepts Chinese-province plate text from YOLO OCR observations', async () => {
+    const adminCookie = await login('admin', defaultPassword);
+    const operatorCookie = await login('operator-a', 'password');
+    const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-CN-PLATE', name: '中文车牌车', host: '192.168.1.26', tcpPort: 6000, videoPort: 6500 } });
+    const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
+    await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA] } });
+    const routeId = randomUUID(); const waypointId = randomUUID();
+    await db.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [routeId, vehicleId, '中文车牌路线', 'v1', 'generated', ids.admin]);
+    await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds,no_parking_roi) VALUES ($1,$2,0,$3,0,0,0,8,$4)', [waypointId, routeId, '识别点', JSON.stringify([0.1, 0.1, 0.5, 0.5])]);
+    for (const ordinal of [1, 2]) await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,$3,$4,0,0,0,8)', [randomUUID(), routeId, ordinal, `点${ordinal}`]);
+    await resetGlobalWhitelist([{ plate: '皖A12345', owner: '中文住户', building: '2号楼' }]);
+    const started = await app.inject({ method: 'POST', url: '/api/patrol/start', headers: { origin, cookie: operatorCookie }, payload: { deviceId: vehicleId, routeId, shift: 'morning' } });
+    expect(started.statusCode).toBe(200);
+    const taskId = started.json<{ task: { id: string } }>().task.id;
+    const credential = await app.inject({ method: 'POST', url: `/api/vehicles/${vehicleId}/device-credentials`, headers: { origin, cookie: adminCookie } });
+    const token = credential.json<{ credential: { token: string } }>().credential.token;
+    await app.inject({ method: 'GET', url: '/device/v1/patrol/tasks/next', headers: { authorization: `Bearer ${token}` } });
+    const observation = {
+      type: 'observation',
+      waypointId,
+      occurredAt: '2026-07-11T02:01:00.000Z',
+      plate: '皖A·12345',
+      confidence: 0.93,
+      vehicleBox: [0.2, 0.2, 0.2, 0.2],
+    };
+    const posted = await app.inject({ method: 'POST', url: `/device/v1/patrol/tasks/${taskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: observation });
+    expect(posted.statusCode).toBe(200);
+    expect(posted.json()).toMatchObject({ classification: 'registered_private', noParking: true, deduplicated: false });
+    const events = await app.inject({ method: 'GET', url: `/api/patrol/tasks/${taskId}/events`, headers: { origin, cookie: operatorCookie } });
+    expect(events.json<{ observations: Array<{ plate: string; classification: string }> }>().observations).toEqual([
+      expect.objectContaining({ plate: '皖A12345', classification: 'registered_private' }),
+    ]);
+  });
+
+  it('classifies incomplete OCR plates via ≥3 contiguous alphanumeric whitelist overlap', async () => {
+    const adminCookie = await login('admin', defaultPassword);
+    const operatorCookie = await login('operator-a', 'password');
+    const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-PARTIAL-PLATE', name: '部分车牌车', host: '192.168.1.27', tcpPort: 6000, videoPort: 6500 } });
+    const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
+    await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA] } });
+    const routeId = randomUUID(); const waypointId = randomUUID();
+    await db.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [routeId, vehicleId, '部分车牌路线', 'v1', 'generated', ids.admin]);
+    await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds,no_parking_roi) VALUES ($1,$2,0,$3,0,0,0,8,$4)', [waypointId, routeId, '识别点', JSON.stringify([0.1, 0.1, 0.5, 0.5])]);
+    for (const ordinal of [1, 2]) await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,$3,$4,0,0,0,8)', [randomUUID(), routeId, ordinal, `点${ordinal}`]);
+    await resetGlobalWhitelist([{ plate: '京A12345', owner: '部分匹配住户', building: '3号楼' }]);
+    const started = await app.inject({ method: 'POST', url: '/api/patrol/start', headers: { origin, cookie: operatorCookie }, payload: { deviceId: vehicleId, routeId, shift: 'morning' } });
+    expect(started.statusCode).toBe(200);
+    const taskId = started.json<{ task: { id: string } }>().task.id;
+    const credential = await app.inject({ method: 'POST', url: `/api/vehicles/${vehicleId}/device-credentials`, headers: { origin, cookie: adminCookie } });
+    const token = credential.json<{ credential: { token: string } }>().credential.token;
+    await app.inject({ method: 'GET', url: '/device/v1/patrol/tasks/next', headers: { authorization: `Bearer ${token}` } });
+    const posted = await app.inject({
+      method: 'POST',
+      url: `/device/v1/patrol/tasks/${taskId}/events`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        type: 'observation',
+        waypointId,
+        occurredAt: '2026-07-11T02:15:00.000Z',
+        plate: 'A123',
+        confidence: 0.9,
+        vehicleBox: [0.2, 0.2, 0.2, 0.2],
+      },
+    });
+    expect(posted.statusCode).toBe(200);
+    expect(posted.json()).toMatchObject({
+      classification: 'registered_private',
+      plateMatch: {
+        mode: 'partial',
+        matchedPlate: '京A12345',
+        fragment: 'A123',
+        direction: 'scan_in_whitelist',
+      },
+    });
+  });
+
+  it('matches OCR with extra characters via whitelist⊆scan and enables doorstep on matched plate', async () => {
+    const adminCookie = await login('admin', defaultPassword);
+    const operatorCookie = await login('operator-a', 'password');
+    const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-DOOR-PARTIAL', name: '模糊上门车', host: '192.168.1.28', tcpPort: 6000, videoPort: 6500 } });
+    const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
+    await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA] } });
+    await db.query('UPDATE vehicles SET last_seen_at=now() WHERE id=$1', [vehicleId]);
+    await db.query('INSERT INTO telemetry_points (id,vehicle_id,occurred_at,longitude,latitude,battery_pct) VALUES ($1,$2,now(),0,0,80)', [randomUUID(), vehicleId]);
+    const destination = await app.inject({ method: 'POST', url: '/api/resident-destinations', headers: { origin, cookie: adminCookie }, payload: { vehicleId, building: '3号楼', displayName: '3号楼门口', mapVersion: 'v-partial-door', x: 4, y: 5, yaw: 0 } });
+    expect(destination.statusCode).toBe(200);
+    const routeId = randomUUID(); const waypointId = randomUUID();
+    await db.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [routeId, vehicleId, '模糊上门路线', 'v-partial-door', 'generated', ids.admin]);
+    await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds,no_parking_roi) VALUES ($1,$2,0,$3,0,0,0,8,$4)', [waypointId, routeId, '禁停点', JSON.stringify([0.1, 0.1, 0.5, 0.5])]);
+    for (const ordinal of [1, 2]) await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,$3,$4,0,0,0,8)', [randomUUID(), routeId, ordinal, `点${ordinal}`]);
+    await resetGlobalWhitelist([{ plate: '京A12345', owner: '模糊上门住户', building: '3号楼' }]);
+    const started = await app.inject({ method: 'POST', url: '/api/patrol/start', headers: { origin, cookie: operatorCookie }, payload: { deviceId: vehicleId, routeId, shift: 'morning' } });
+    const taskId = started.json<{ task: { id: string } }>().task.id;
+    const credential = await app.inject({ method: 'POST', url: `/api/vehicles/${vehicleId}/device-credentials`, headers: { origin, cookie: adminCookie } });
+    const token = credential.json<{ credential: { token: string } }>().credential.token;
+    await app.inject({ method: 'GET', url: '/device/v1/patrol/tasks/next', headers: { authorization: `Bearer ${token}` } });
+    // Incomplete OCR fragment — same match path as classification
+    const fragmentObs = await app.inject({
+      method: 'POST',
+      url: `/device/v1/patrol/tasks/${taskId}/events`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        type: 'observation',
+        waypointId,
+        occurredAt: '2026-07-11T02:20:00.000Z',
+        plate: 'A123',
+        confidence: 0.91,
+        vehicleBox: [0.2, 0.2, 0.2, 0.2],
+        evidenceImageUrl: 'https://evidence.invalid/partial-door.jpg',
+      },
+    });
+    expect(fragmentObs.statusCode).toBe(200);
+    expect(fragmentObs.json()).toMatchObject({
+      classification: 'registered_private',
+      responseEligible: true,
+      ownerName: '模糊上门住户',
+      building: '3号楼',
+      plateMatch: { mode: 'partial', matchedPlate: '京A12345', direction: 'scan_in_whitelist' },
+    });
+    // OCR with trailing noise — whitelist body ⊆ scan
+    const noisyObs = await app.inject({
+      method: 'POST',
+      url: `/device/v1/patrol/tasks/${taskId}/events`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        type: 'observation',
+        waypointId,
+        occurredAt: '2026-07-11T02:25:00.000Z',
+        plate: '京A12345X',
+        confidence: 0.93,
+        vehicleBox: [0.2, 0.2, 0.2, 0.2],
+        evidenceImageUrl: 'https://evidence.invalid/noisy-door.jpg',
+      },
+    });
+    expect(noisyObs.statusCode).toBe(200);
+    expect(noisyObs.json()).toMatchObject({
+      classification: 'registered_private',
+      responseEligible: true,
+      plateMatch: { mode: 'partial', matchedPlate: '京A12345', direction: 'whitelist_in_scan' },
+    });
+  });
+
   it('creates patrol_events and reviews for pending-review observations, and whitelist snapshot is immutable', async () => {
     const adminCookie = await login('admin', defaultPassword);
     const operatorCookie = await login('operator-a', 'password');
@@ -274,31 +601,48 @@ describe('platform API against PostGIS', () => {
     // Mutate live whitelist after task start — snapshot must stay isolated
     await app.inject({ method: 'POST', url: '/api/whitelist/import', headers: { origin, cookie: adminCookie }, payload: { rows: [{ plate: 'X99999', owner: '篡改', building: '99号楼', vehicleType: 'visitor' }] } });
     // Low-confidence observation → pending_review → must create patrol_event + review
-    const lowConf = await app.inject({ method: 'POST', url: `/device/v1/patrol/tasks/${taskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { type: 'observation', waypointId, occurredAt: '2026-07-11T03:00:00.000Z', plate: 'B99998', confidence: 0.5 } });
+    // OCR fragment still carries plateMatch hint for operators even when below threshold.
+    const lowConf = await app.inject({
+      method: 'POST',
+      url: `/device/v1/patrol/tasks/${taskId}/events`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { type: 'observation', waypointId, occurredAt: '2026-07-11T03:00:00.000Z', plate: 'X999', confidence: 0.5 },
+    });
     expect(lowConf.statusCode).toBe(200);
-    expect(lowConf.json()).toMatchObject({ classification: 'pending_review', deduplicated: false });
+    expect(lowConf.json()).toMatchObject({
+      classification: 'pending_review',
+      deduplicated: false,
+      plateMatch: { mode: 'partial', matchedPlate: 'X99999', fragment: 'X999', direction: 'scan_in_whitelist' },
+    });
     // High-confidence observation for X99999 — snapshot still classifies it as private, not visitor
     const highConf = await app.inject({ method: 'POST', url: `/device/v1/patrol/tasks/${taskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { type: 'observation', waypointId, occurredAt: '2026-07-11T03:01:00.000Z', plate: 'X99999', confidence: 0.92 } });
     expect(highConf.json()).toMatchObject({ classification: 'registered_private' });
-    // Review queue must contain the low-confidence observation
+    // Review queue must contain the low-confidence observation with match rationale
     const reviews = await app.inject({ method: 'GET', url: '/api/reviews/pending', headers: { origin, cookie: operatorCookie } });
     expect(reviews.statusCode).toBe(200);
-    const pending = reviews.json<{ reviews: Array<{ eventId: string; reason: string; deviceName: string }> }>().reviews;
+    const pending = reviews.json<{ reviews: Array<{ eventId: string; reason: string; deviceName: string; plate?: string; plateMatch?: { matchedPlate: string; mode: string } }> }>().reviews;
     expect(pending).toEqual(
-      expect.arrayContaining([expect.objectContaining({ reason: 'low_confidence', deviceName: '审核测试车' })]),
+      expect.arrayContaining([
+        expect.objectContaining({
+          reason: 'low_confidence',
+          deviceName: '审核测试车',
+          plate: 'X999',
+          plateMatch: expect.objectContaining({ mode: 'partial', matchedPlate: 'X99999' }),
+        }),
+      ]),
     );
     const review = pending.find((item) => item.reason === 'low_confidence')!;
     expect((await app.inject({
       method: 'POST',
       url: `/api/reviews/${review.eventId}/resolve`,
       headers: { origin, cookie: operatorCookie },
-      payload: { action: 'whitelist', plate: 'B99998' },
+      payload: { action: 'whitelist', plate: 'X999' },
     })).statusCode).toBe(403);
     expect((await app.inject({
       method: 'POST',
       url: `/api/reviews/${review.eventId}/resolve`,
       headers: { origin, cookie: adminCookie },
-      payload: { action: 'whitelist', plate: 'B99998' },
+      payload: { action: 'whitelist', plate: 'X999' },
     })).statusCode).toBe(200);
     // Task events must include the 'observation' type event
     const events = await app.inject({ method: 'GET', url: `/api/patrol/tasks/${taskId}/events`, headers: { origin, cookie: operatorCookie } });

@@ -526,6 +526,13 @@ END $$;
 `;
 
 export const migration011 = `
+ALTER TABLE patrol_events ADD COLUMN IF NOT EXISTS details jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE patrol_events ADD COLUMN IF NOT EXISTS waypoint_id uuid REFERENCES patrol_waypoints(id);
+ALTER TABLE patrol_routes ADD COLUMN IF NOT EXISTS code text;
+UPDATE patrol_routes SET code = 'route-' || substr(id::text, 1, 8) WHERE code IS NULL;
+`;
+
+export const migration012 = `
 ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS review_confidence_threshold double precision NOT NULL DEFAULT 0.75
   CHECK (review_confidence_threshold >= 0 AND review_confidence_threshold <= 1);
 ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS dedupe_window_sec integer NOT NULL DEFAULT 1800
@@ -534,10 +541,124 @@ CREATE UNIQUE INDEX IF NOT EXISTS patrol_routes_vehicle_name_version_idx
   ON patrol_routes(vehicle_id, name, map_version);
 `;
 
+export const migration013ViolationReviewDisposition = `
+ALTER TABLE violations DROP CONSTRAINT IF EXISTS violations_disposition_check;
+ALTER TABLE violations ADD CONSTRAINT violations_disposition_check
+  CHECK (disposition IN ('pending', 'processed', 'dismissed', 'confirmed', 'false_positive', 'resolved'));
+
+UPDATE violations v
+SET disposition = CASE
+  WHEN e.review_status IN ('confirmed', 'confirm') THEN 'confirmed'
+  WHEN e.review_status = 'false_positive' THEN 'false_positive'
+  WHEN e.review_status IN ('whitelist', 'external', 'visitor') THEN 'resolved'
+  ELSE v.disposition
+END
+FROM patrol_events e
+WHERE v.event_id = e.id
+  AND e.review_status IS NOT NULL
+  AND e.review_status <> 'pending'
+  AND v.disposition = 'pending';
+`;
+
+export const migration012AiAgents = `
+CREATE TABLE IF NOT EXISTS ai_daily_reports (
+  id uuid PRIMARY KEY,
+  report_date date NOT NULL,
+  vehicle_id uuid REFERENCES vehicles(id) ON DELETE SET NULL,
+  created_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  stats jsonb NOT NULL DEFAULT '{}'::jsonb,
+  narrative_markdown text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ai_daily_reports_date_idx ON ai_daily_reports(report_date DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS ai_daily_reports_vehicle_date_idx ON ai_daily_reports(vehicle_id, report_date DESC);
+`;
+
+export const migration013WhitelistPhoneSms = `
+ALTER TABLE whitelist_entries
+  ADD COLUMN IF NOT EXISTS phone text NOT NULL DEFAULT '';
+
+ALTER TABLE response_tasks
+  ADD COLUMN IF NOT EXISTS owner_phone text NOT NULL DEFAULT '';
+ALTER TABLE response_tasks
+  ADD COLUMN IF NOT EXISTS sms_status text NOT NULL DEFAULT 'none';
+ALTER TABLE response_tasks
+  ADD COLUMN IF NOT EXISTS sms_sent_at timestamptz;
+ALTER TABLE response_tasks
+  ADD COLUMN IF NOT EXISTS sms_error text NOT NULL DEFAULT '';
+
+DO $$ BEGIN
+  ALTER TABLE response_tasks DROP CONSTRAINT IF EXISTS response_tasks_sms_status_check;
+  ALTER TABLE response_tasks ADD CONSTRAINT response_tasks_sms_status_check
+    CHECK (sms_status IN ('none','skipped_no_phone','skipped_not_configured','queued','sent','failed'));
+EXCEPTION WHEN others THEN NULL;
+END $$;
+
+CREATE TABLE IF NOT EXISTS sms_notifications (
+  id uuid PRIMARY KEY,
+  response_task_id uuid REFERENCES response_tasks(id) ON DELETE SET NULL,
+  plate text NOT NULL,
+  phone text NOT NULL,
+  body text NOT NULL,
+  provider text NOT NULL DEFAULT 'aliyun',
+  provider_request_id text,
+  status text NOT NULL CHECK (status IN ('sent','failed','skipped')),
+  error text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS sms_notifications_created_idx ON sms_notifications(created_at DESC);
+CREATE INDEX IF NOT EXISTS sms_notifications_response_task_idx ON sms_notifications(response_task_id);
+`;
+
+export const migration014 = `
+ALTER TABLE whitelist_entries
+  ADD COLUMN IF NOT EXISTS wx_uid text NOT NULL DEFAULT '';
+
+ALTER TABLE response_tasks
+  ADD COLUMN IF NOT EXISTS owner_wx_uid text NOT NULL DEFAULT '';
+
+DO $$ BEGIN
+  ALTER TABLE response_tasks DROP CONSTRAINT IF EXISTS response_tasks_sms_status_check;
+  ALTER TABLE response_tasks ADD CONSTRAINT response_tasks_sms_status_check
+    CHECK (sms_status IN (
+      'none','skipped_no_phone','skipped_no_uid','skipped_not_configured','queued','sent','failed'
+    ));
+EXCEPTION WHEN others THEN NULL;
+END $$;
+`;
+
+export const migration015 = `
+ALTER TABLE whitelist_entries DROP COLUMN IF EXISTS phone;
+ALTER TABLE response_tasks DROP COLUMN IF EXISTS owner_phone;
+
+UPDATE response_tasks SET sms_status='skipped_no_uid' WHERE sms_status='skipped_no_phone';
+
+DO $$ BEGIN
+  ALTER TABLE response_tasks DROP CONSTRAINT IF EXISTS response_tasks_sms_status_check;
+  ALTER TABLE response_tasks ADD CONSTRAINT response_tasks_sms_status_check
+    CHECK (sms_status IN (
+      'none','skipped_no_uid','skipped_not_configured','queued','sent','failed'
+    ));
+EXCEPTION WHEN others THEN NULL;
+END $$;
+
+ALTER TABLE sms_notifications ADD COLUMN IF NOT EXISTS wx_uid text NOT NULL DEFAULT '';
+UPDATE sms_notifications SET wx_uid = phone WHERE wx_uid = '' AND phone IS NOT NULL AND phone <> '';
+ALTER TABLE sms_notifications DROP COLUMN IF EXISTS phone;
+ALTER TABLE sms_notifications ALTER COLUMN provider SET DEFAULT 'wxpusher';
+`;
+
+export const migration016 = `
+ALTER TABLE auth_otps ADD COLUMN IF NOT EXISTS failed_attempts smallint NOT NULL DEFAULT 0;
+ALTER TABLE auth_otps DROP CONSTRAINT IF EXISTS auth_otps_failed_attempts_check;
+ALTER TABLE auth_otps ADD CONSTRAINT auth_otps_failed_attempts_check
+  CHECK (failed_attempts BETWEEN 0 AND 5);
+`;
+
 // 楼道室内 SLAM 地图与 map 坐标位姿。
 // - map_metadata 扩展分辨率/原点/尺寸，用于前端把栅格底图与 Nav2 坐标对齐。
 // - pose_points 保存 map 坐标系下的实时/历史位姿（x/y/yaw，单位米/弧度）。
-export const migration012 = `
+export const migration017 = `
 ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS vehicle_id uuid REFERENCES vehicles(id) ON DELETE CASCADE;
 ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS map_version text NOT NULL DEFAULT 'floor-map-v1';
 ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS resolution double precision NOT NULL DEFAULT 0.05;
@@ -565,7 +686,7 @@ CREATE INDEX IF NOT EXISTS pose_points_vehicle_time_idx ON pose_points(vehicle_i
 
 // 部分环境（旧 Neon / 手工改表）仍有 patrol_routes.code NOT NULL，与当前应用插入列不一致。
 // 补齐缺失值，并允许无 code 的插入；应用侧保存路线时仍会写入稳定 code。
-export const migration013 = `
+export const migration018 = `
 ALTER TABLE patrol_routes ADD COLUMN IF NOT EXISTS code text;
 UPDATE patrol_routes
 SET code = COALESCE(NULLIF(TRIM(code), ''), 'route-' || REPLACE(id::text, '-', ''))
@@ -580,10 +701,16 @@ BEGIN
     ALTER TABLE patrol_routes ALTER COLUMN code DROP NOT NULL;
   END IF;
 END $$;
+
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS failure_reason text;
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS finished_at timestamptz;
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS stop_requested_at timestamptz;
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS stop_confirmed_at timestamptz;
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS zero_velocity_confirmed_at timestamptz;
 `;
 
 // Web「2D Goal Pose」单点前往：对齐 Nav2 NavigateToPose，与多点巡航 patrol_tasks 分离。
-export const migration014 = `
+export const migration019 = `
 CREATE TABLE IF NOT EXISTS goto_goals (
   id uuid PRIMARY KEY,
   vehicle_id uuid NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
@@ -603,7 +730,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS goto_goals_vehicle_active_idx
 `;
 
 // Web 一键导航就绪 + 网页设初始位姿（对齐 RViz 2D Pose Estimate → /initialpose）。
-export const migration015 = `
+export const migration020 = `
 CREATE TABLE IF NOT EXISTS vehicle_nav_state (
   vehicle_id uuid PRIMARY KEY REFERENCES vehicles(id) ON DELETE CASCADE,
   prepare_requested boolean NOT NULL DEFAULT false,
@@ -622,13 +749,4 @@ CREATE TABLE IF NOT EXISTS vehicle_nav_state (
   detail text NOT NULL DEFAULT '',
   updated_at timestamptz NOT NULL DEFAULT now()
 );
-`;
-
-// 旧库 patrol_tasks 可能缺少 failure_reason（CREATE TABLE IF NOT EXISTS 不会补列）。
-export const migration016 = `
-ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS failure_reason text;
-ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS finished_at timestamptz;
-ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS stop_requested_at timestamptz;
-ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS stop_confirmed_at timestamptz;
-ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS zero_velocity_confirmed_at timestamptz;
 `;

@@ -4,6 +4,7 @@ export interface Config {
   host: string;
   port: number;
   cookieSecure: boolean;
+  trustProxy: boolean;
   publicOrigin: string | undefined;
   allowedOrigins: string[];
   bootstrapAdminUsername: string | undefined;
@@ -20,6 +21,9 @@ export interface Config {
   aiBaseUrl: string | undefined;
   aiApiKey: string | undefined;
   aiModel: string;
+  aiModelFast: string;
+  wxPusherAppToken: string | undefined;
+  wxPusherEndpoint: string;
 }
 
 export function loadConfig(overrides: Partial<Config> = {}): Config {
@@ -36,6 +40,7 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     host: process.env.HOST ?? '127.0.0.1',
     port: Number(process.env.PORT ?? 8788),
     cookieSecure: process.env.COOKIE_SECURE === 'true',
+    trustProxy: process.env.PLATFORM_TRUST_PROXY === 'true',
     publicOrigin,
     allowedOrigins,
     bootstrapAdminUsername: process.env.BOOTSTRAP_ADMIN_USERNAME,
@@ -51,7 +56,10 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     smtpFrom: process.env.SMTP_FROM,
     aiBaseUrl: process.env.AI_BASE_URL,
     aiApiKey: process.env.AI_API_KEY,
-    aiModel: process.env.AI_MODEL ?? 'gpt-4.1-mini',
+    aiModel: process.env.AI_MODEL ?? 'deepseek-v4-pro',
+    aiModelFast: process.env.AI_MODEL_FAST ?? 'deepseek-v4-flash',
+    wxPusherAppToken: process.env.WXPUSHER_APP_TOKEN,
+    wxPusherEndpoint: process.env.WXPUSHER_ENDPOINT ?? 'https://wxpusher.zjiecode.com',
     ...overrides,
   };
   if (process.env.NODE_ENV === 'production') {

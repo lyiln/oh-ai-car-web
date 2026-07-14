@@ -15,6 +15,14 @@ export default defineConfig(({ mode }) => {
         '/api': 'http://127.0.0.1:8788',
         '/ws': { target: 'ws://127.0.0.1:8788', ws: true },
         '/patrol': { target: 'ws://127.0.0.1:8788', ws: true },
+        '/gateway-api': {
+          target: 'http://127.0.0.1:8787',
+          rewrite: (path) => path.replace(/^\/gateway-api/, ''),
+        },
+        '/plate-api': {
+          target: 'http://127.0.0.1:8010',
+          rewrite: (path) => path.replace(/^\/plate-api/, ''),
+        },
         '/_AMapService': {
           target: 'https://restapi.amap.com',
           changeOrigin: true,
