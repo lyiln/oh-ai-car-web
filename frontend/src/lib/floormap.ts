@@ -55,6 +55,23 @@ export function pixelToWorld(meta: FloorMapMeta, px: number, py: number): WorldP
   return { x, y };
 }
 
+/** Ray-casting; ring in map meters. */
+export function pointInPolygon(point: WorldPoint, ring: WorldPoint[]): boolean {
+  if (ring.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i].x;
+    const yi = ring[i].y;
+    const xj = ring[j].x;
+    const yj = ring[j].y;
+    const intersect =
+      yi > point.y !== yj > point.y &&
+      point.x < ((xj - xi) * (point.y - yi)) / (yj - yi + Number.EPSILON) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
 /** 计算把整幅底图放进给定容器宽度时的显示缩放比例（像素 -> 屏幕）。 */
 export function fitScale(meta: FloorMapMeta, containerWidth: number): number {
   if (!meta.imageWidth) return 1;

@@ -3,6 +3,7 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { PoolClient } from 'pg';
 import type { Database } from '../db/index.js';
 import { saveEvidenceJpeg } from '../evidence-storage.js';
+import { parseRing, pointInPolygon } from '../geometry/point-in-polygon.js';
 import { matchWhitelistPlate, normalisePlate } from '../plate-match.js';
 
 type AuthUser = {
@@ -1133,6 +1134,153 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     return { ok: true as const };
   });
 
+  // --- Floor map no-parking zones (map-frame meters; not AMap map_zones) ---
+  type FloorZoneRow = {
+    id: string;
+    vehicle_id: string;
+    map_version: string;
+    name: string;
+    active: boolean;
+    ring: unknown;
+  };
+
+  const floorZoneDto = (row: FloorZoneRow) => ({
+    id: row.id,
+    vehicleId: row.vehicle_id,
+    mapVersion: row.map_version,
+    name: row.name,
+    active: row.active,
+    ring: Array.isArray(row.ring) ? row.ring : [],
+  });
+
+  app.get('/api/vehicles/:id/floor-zones', async (request) => {
+    const user = await requireUser(request);
+    const vehicleId = (request.params as { id: string }).id;
+    if (!await canAccessVehicle(user, vehicleId)) throw httpError('Vehicle access denied', 403);
+    const mapVersion = typeof (request.query as { mapVersion?: string }).mapVersion === 'string'
+      ? (request.query as { mapVersion?: string }).mapVersion!.trim()
+      : '';
+    const result = mapVersion
+      ? await db.query<FloorZoneRow>(
+        `SELECT id, vehicle_id, map_version, name, active, ring
+         FROM floor_map_zones WHERE vehicle_id=$1 AND map_version=$2 ORDER BY created_at`,
+        [vehicleId, mapVersion],
+      )
+      : await db.query<FloorZoneRow>(
+        `SELECT id, vehicle_id, map_version, name, active, ring
+         FROM floor_map_zones WHERE vehicle_id=$1 ORDER BY created_at`,
+        [vehicleId],
+      );
+    return { zones: result.rows.map(floorZoneDto) };
+  });
+
+  app.get('/api/vehicles/:id/floor-zones/check', async (request) => {
+    const user = await requireUser(request);
+    const vehicleId = (request.params as { id: string }).id;
+    if (!await canAccessVehicle(user, vehicleId)) throw httpError('Vehicle access denied', 403);
+    const query = request.query as { mapVersion?: string; maxAgeSec?: string };
+    const mapVersion = typeof query.mapVersion === 'string' && query.mapVersion.trim()
+      ? query.mapVersion.trim()
+      : null;
+    const maxAgeSec = Math.min(Math.max(Number(query.maxAgeSec) || 10, 1), 120);
+    const pose = await db.query<{ x: number; y: number; map_version: string | null; occurred_at: Date }>(
+      `SELECT x, y, map_version, occurred_at FROM pose_points
+       WHERE vehicle_id=$1 AND occurred_at >= now() - ($2::text || ' seconds')::interval
+       ORDER BY occurred_at DESC LIMIT 1`,
+      [vehicleId, String(maxAgeSec)],
+    );
+    if (!pose.rows[0]) {
+      return { inNoParking: false, reason: 'no_recent_pose', pose: null, zone: null };
+    }
+    const version = mapVersion || pose.rows[0].map_version || 'floor-map-v1';
+    const zones = await db.query<{ id: string; name: string; ring: unknown }>(
+      `SELECT id, name, ring FROM floor_map_zones
+       WHERE vehicle_id=$1 AND active=true AND map_version=$2`,
+      [vehicleId, version],
+    );
+    const point = { x: Number(pose.rows[0].x), y: Number(pose.rows[0].y) };
+    for (const zone of zones.rows) {
+      const ring = parseRing(zone.ring);
+      if (ring && pointInPolygon(point, ring)) {
+        return {
+          inNoParking: true,
+          reason: 'inside_zone',
+          pose: { x: point.x, y: point.y, mapVersion: version, occurredAt: pose.rows[0].occurred_at.toISOString() },
+          zone: { id: zone.id, name: zone.name },
+        };
+      }
+    }
+    return {
+      inNoParking: false,
+      reason: 'outside_zones',
+      pose: { x: point.x, y: point.y, mapVersion: version, occurredAt: pose.rows[0].occurred_at.toISOString() },
+      zone: null,
+    };
+  });
+
+  app.post('/api/vehicles/:id/floor-zones', async (request) => {
+    const admin = await requireAdmin(request);
+    const vehicleId = (request.params as { id: string }).id;
+    const body = object(request.body) ?? {};
+    const name = string(body.name, 'name').slice(0, 120);
+    const mapVersion = (typeof body.mapVersion === 'string' && body.mapVersion.trim())
+      ? body.mapVersion.trim().slice(0, 120)
+      : 'floor-map-v1';
+    const ring = parseRing(body.ring);
+    if (!ring) throw httpError('ring must be an array of at least 3 [x,y] points', 400);
+    const id = randomUUID();
+    await db.query(
+      `INSERT INTO floor_map_zones (id, vehicle_id, map_version, name, active, ring)
+       VALUES ($1,$2,$3,$4,true,$5::jsonb)`,
+      [id, vehicleId, mapVersion, name, JSON.stringify(ring.map((p) => [p.x, p.y]))],
+    );
+    await audit('floor_zone.create', 'success', admin.id, vehicleId, { zoneId: id, name, mapVersion });
+    const row = await db.query<FloorZoneRow>(
+      'SELECT id, vehicle_id, map_version, name, active, ring FROM floor_map_zones WHERE id=$1',
+      [id],
+    );
+    return { zone: floorZoneDto(row.rows[0]) };
+  });
+
+  app.put('/api/vehicles/:id/floor-zones/:zoneId', async (request) => {
+    const admin = await requireAdmin(request);
+    const { id: vehicleId, zoneId } = request.params as { id: string; zoneId: string };
+    const body = object(request.body) ?? {};
+    const existing = await db.query('SELECT id FROM floor_map_zones WHERE id=$1 AND vehicle_id=$2', [zoneId, vehicleId]);
+    if (!existing.rows[0]) throw httpError('Zone not found', 404);
+    const name = typeof body.name === 'string' ? body.name.trim().slice(0, 120) : null;
+    const active = typeof body.active === 'boolean' ? body.active : null;
+    const ring = body.ring === undefined ? null : parseRing(body.ring);
+    if (body.ring !== undefined && !ring) throw httpError('ring must be an array of at least 3 [x,y] points', 400);
+    await db.query(
+      `UPDATE floor_map_zones SET
+         name=COALESCE($1,name),
+         active=COALESCE($2,active),
+         ring=COALESCE($3::jsonb,ring),
+         updated_at=now()
+       WHERE id=$4`,
+      [name, active, ring ? JSON.stringify(ring.map((p) => [p.x, p.y])) : null, zoneId],
+    );
+    await audit('floor_zone.update', 'success', admin.id, vehicleId, { zoneId });
+    const row = await db.query<FloorZoneRow>(
+      'SELECT id, vehicle_id, map_version, name, active, ring FROM floor_map_zones WHERE id=$1',
+      [zoneId],
+    );
+    return { zone: floorZoneDto(row.rows[0]) };
+  });
+
+  app.delete('/api/vehicles/:id/floor-zones/:zoneId', async (request) => {
+    const admin = await requireAdmin(request);
+    const { id: vehicleId, zoneId } = request.params as { id: string; zoneId: string };
+    const result = await db.query(
+      'DELETE FROM floor_map_zones WHERE id=$1 AND vehicle_id=$2 RETURNING id',
+      [zoneId, vehicleId],
+    );
+    if (!result.rows[0]) throw httpError('Zone not found', 404);
+    await audit('floor_zone.delete', 'success', admin.id, vehicleId, { zoneId });
+    return { ok: true as const };
+  });
+
   // --- Violations ---
   // Console plate-scan workbench: reject whitelist matches; otherwise create violation + review queue item.
   app.post('/api/violations/from-console-scan', { bodyLimit: 6 * 1024 * 1024 }, async (request) => {
@@ -1187,6 +1335,43 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
       ? body.waypoint.trim().slice(0, 120)
       : '控制台识别测试';
 
+    const mapVersionHint = typeof body.mapVersion === 'string' && body.mapVersion.trim()
+      ? body.mapVersion.trim().slice(0, 120)
+      : null;
+    const pose = await db.query<{ x: number; y: number; map_version: string | null; occurred_at: Date }>(
+      `SELECT x, y, map_version, occurred_at FROM pose_points
+       WHERE vehicle_id=$1 AND occurred_at >= now() - interval '10 seconds'
+       ORDER BY occurred_at DESC LIMIT 1`,
+      [vehicleId],
+    );
+    let floorZoneId: string | null = null;
+    let floorZoneName: string | null = null;
+    let poseSnapshot: { x: number; y: number; mapVersion: string; occurredAt: string } | null = null;
+    if (pose.rows[0]) {
+      const version = mapVersionHint || pose.rows[0].map_version || 'floor-map-v1';
+      poseSnapshot = {
+        x: Number(pose.rows[0].x),
+        y: Number(pose.rows[0].y),
+        mapVersion: version,
+        occurredAt: pose.rows[0].occurred_at.toISOString(),
+      };
+      const zones = await db.query<{ id: string; name: string; ring: unknown }>(
+        `SELECT id, name, ring FROM floor_map_zones
+         WHERE vehicle_id=$1 AND active=true AND map_version=$2`,
+        [vehicleId, version],
+      );
+      for (const zone of zones.rows) {
+        const ring = parseRing(zone.ring);
+        if (ring && pointInPolygon({ x: poseSnapshot.x, y: poseSnapshot.y }, ring)) {
+          floorZoneId = zone.id;
+          floorZoneName = zone.name;
+          break;
+        }
+      }
+    }
+    const inNoParking = Boolean(floorZoneId);
+    const violationType = inNoParking ? 'no_parking' : 'suspected_external';
+
     const route = await db.query<{ id: string }>(
       'SELECT id FROM patrol_routes WHERE vehicle_id=$1 ORDER BY created_at DESC LIMIT 1',
       [vehicleId],
@@ -1226,6 +1411,10 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
             source: 'console_scan_test',
             vehicleId,
             plateMatch: null,
+            inNoParking,
+            floorZoneId,
+            floorZoneName,
+            pose: poseSnapshot,
           }),
         ],
       );
@@ -1236,9 +1425,20 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
       );
       await client.query(
         `INSERT INTO violations
-           (id, event_id, plate, violation_type, task_id, vehicle_id, waypoint, priority, disposition, evidence_url, occurred_at)
-         VALUES ($1, $2, $3, 'suspected_external', $4, $5, $6, 'normal', 'pending', $7, now())`,
-        [violationId, eventId, plate, taskId, vehicleId, waypoint, saved.publicPath],
+           (id, event_id, plate, violation_type, task_id, vehicle_id, waypoint, priority, disposition, evidence_url, occurred_at, floor_zone_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, now(), $10)`,
+        [
+          violationId,
+          eventId,
+          plate,
+          violationType,
+          taskId,
+          vehicleId,
+          waypoint,
+          inNoParking ? 'high' : 'normal',
+          saved.publicPath,
+          floorZoneId,
+        ],
       );
       return { taskId, eventId, reviewId, violationId };
     });
@@ -1252,6 +1452,8 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
       source: 'console_scan_test',
       confidence,
       eventId: created.eventId,
+      inNoParking,
+      floorZoneId,
     });
     await audit('violation.console_scan_test', 'success', user.id, vehicleId, {
       violationId: created.violationId,
@@ -1260,6 +1462,8 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
       plate,
       evidenceUrl: saved.publicPath,
       confidence,
+      inNoParking,
+      floorZoneId,
     });
     return {
       violation: {
@@ -1269,11 +1473,18 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
         deviceId: vehicleId,
         waypoint,
         status: 'pending',
-        type: 'suspected_external',
+        type: violationType,
+        zoneName: floorZoneName,
       },
       review: {
         id: created.reviewId,
         eventId: created.eventId,
+      },
+      noParking: {
+        inNoParking,
+        pose: poseSnapshot,
+        zone: floorZoneId ? { id: floorZoneId, name: floorZoneName } : null,
+        reason: inNoParking ? 'inside_zone' : (poseSnapshot ? 'outside_zones' : 'no_recent_pose'),
       },
     };
   });

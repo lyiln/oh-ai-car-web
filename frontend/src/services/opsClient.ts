@@ -32,9 +32,16 @@ export async function createViolationFromConsoleScan(input: {
   jpegBase64: string;
   confidence?: number | null;
   waypoint?: string;
+  mapVersion?: string;
 }): Promise<{
-  violation: Pick<Violation, 'id' | 'plate' | 'evidenceUrl' | 'deviceId' | 'waypoint' | 'status' | 'type'>;
+  violation: Pick<Violation, 'id' | 'plate' | 'evidenceUrl' | 'deviceId' | 'waypoint' | 'status' | 'type' | 'zoneName'>;
   review: { id: string; eventId: string };
+  noParking?: {
+    inNoParking: boolean;
+    reason: string;
+    pose: { x: number; y: number; mapVersion: string; occurredAt: string } | null;
+    zone: { id: string; name: string | null } | null;
+  };
 }> {
   return apiRequest('/api/violations/from-console-scan', {
     method: 'POST',
