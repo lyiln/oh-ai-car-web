@@ -56,6 +56,11 @@
 任务快照路线中的航点；低于 0.75 的置信度进入待复核，其余车牌使用任务快照的白名单分类；
 同一任务、航点、车牌和 30 分钟窗口会合并计数，禁停 ROI 相交独立记录。
 
+调度器另可：`GET /device/v1/patrol/tasks/next` 领取 queued 任务；
+`GET /device/v1/patrol/tasks/:id` 查询本车任务 `status`（检测 `cancellation_requested`）；
+并上报 `waypoint` / `status` / `stop_confirmed`（取消时须 `zeroVelocity: true`）。
+本机仿真调度见 `docs/flows/patrol-stage-c-sim.md`。
+
 **白名单快照隔离（FR-002）**：白名单是小区全局数据，只有管理员可读取、导入或修改。首次创建与写入在事务级 advisory lock 下串行；批量导入的有效行在一个事务中提交。任务启动在持锁事务内将当前全局 live 白名单复制为不可变快照（`whitelist_imports.is_snapshot=true`）。因此任务只会看到完整的导入前或导入后版本，后续导入只影响下一次巡检，不影响正在运行任务的分类。
 
 **待复核流程（FR-005）**：置信度 < 0.75 的首次观测（去重后计数为 1）除写入 `plate_observations` 外，还以事务方式同步写入 `patrol_events`（event_type='observation'）和 `reviews`（reason='low_confidence'，status='pending'），确保 `GET /api/reviews/pending` 立即可见。

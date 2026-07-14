@@ -155,6 +155,15 @@ export interface Waypoint {
   order?: number;
 }
 
+// map 坐标系（米）下的位姿点，用于楼道 SLAM 地图。
+export interface PosePoint {
+  occurredAt: string;
+  x: number;
+  y: number;
+  yaw: number;
+  mapVersion?: string | null;
+}
+
 export interface ResidentDestination {
   id: string;
   vehicleId: string;

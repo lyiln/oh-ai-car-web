@@ -1,394 +1,448 @@
-import { useEffect, useRef, useState } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { useEffect, useMemo, useState } from 'react';
 import { FormModal } from '../../components/layout/FormModal.js';
-import { GlobalMap, type GlobalMapHandle, type GlobalMapMode, type MapLayers } from '../../components/map/GlobalMap.js';
-import type { MapZone, ResidentDestination, TrackPoint, Violation, Waypoint } from '../../services/api.js';
-import * as deviceClient from '../../services/deviceClient.js';
+import { FloorMap, type FloorMapDestination } from '../../components/map/FloorMap.js';
+import { VideoPanel } from '../../components/VideoPanel.js';
+import { hasBasemap, type FloorMapMeta, type WorldPoint } from '../../lib/floormap.js';
+import type { ResidentDestination } from '../../services/api.js';
 import * as mapClient from '../../services/mapClient.js';
-import * as opsClient from '../../services/opsClient.js';
 import * as responseClient from '../../services/responseClient.js';
+import * as patrolClient from '../../services/patrolClient.js';
+import * as gotoClient from '../../services/gotoClient.js';
+import type { GotoGoal } from '../../services/gotoClient.js';
+import * as navClient from '../../services/navClient.js';
+import type { NavStatus } from '../../services/navClient.js';
+import { usePoseStream } from '../../hooks/usePoseStream.js';
 import { useSelectedDevice } from '../../contexts/SelectedDeviceContext.js';
 import { useAuth } from '../../contexts/AuthContext.js';
 
-function parseCoordinates(text: string): Array<[number, number]> {
-  return text
-    .split(/[\n;]+/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const [lngRaw, latRaw] = line.split(/[,，\s]+/);
-      const lng = Number(lngRaw);
-      const lat = Number(latRaw);
-      if (!Number.isFinite(lng) || !Number.isFinite(lat)) throw new Error(`无效坐标：${line}`);
-      return [lng, lat] as [number, number];
-    });
+type MapMode = 'idle' | 'mark' | 'goto' | 'setPose';
+
+function computeYaw(points: WorldPoint[], index: number): number {
+  const from = points[index];
+  const to = points[index + 1] ?? points[index - 1];
+  if (!to || (to.x === from.x && to.y === from.y)) return 0;
+  const forward = points[index + 1] ? to : from;
+  const backward = points[index + 1] ? from : to;
+  return Math.atan2(forward.y - backward.y, forward.x - backward.x);
 }
 
-function coordinateSourceLabel(source: string | null | undefined): string {
-  if (source === 'observation') return '观测直传';
-  if (source === 'telemetry') return '巡检车遥测回填';
-  return '暂无';
+function buildRouteYaml(points: WorldPoint[]): string {
+  const lines = ['waypoints:'];
+  points.forEach((point, index) => {
+    const yaw = computeYaw(points, index);
+    lines.push(
+      `  - { name: "点${index + 1}", x: ${point.x.toFixed(3)}, y: ${point.y.toFixed(3)}, yaw: ${yaw.toFixed(4)}, dwellSeconds: 8 }`,
+    );
+  });
+  return lines.join('\n');
 }
 
-function formatCoord(value: number | null | undefined): string {
-  return value != null && Number.isFinite(value) ? value.toFixed(6) : '-';
+function readImageFile(file: File): Promise<{ dataUrl: string; width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('读取图片失败'));
+    reader.onload = () => {
+      const dataUrl = String(reader.result);
+      const image = new Image();
+      image.onload = () => resolve({ dataUrl, width: image.naturalWidth, height: image.naturalHeight });
+      image.onerror = () => reject(new Error('无法解析图片尺寸'));
+      image.src = dataUrl;
+    };
+    reader.readAsDataURL(file);
+  });
 }
 
 export function MapPage() {
-  const { selectedId } = useSelectedDevice();
+  const { selectedId, selectedDevice } = useSelectedDevice();
   const { user } = useAuth();
   const isAdmin = user?.role === 'admin';
-  const [searchParams, setSearchParams] = useSearchParams();
-  const mapRef = useRef<GlobalMapHandle>(null);
-  const [zones, setZones] = useState<MapZone[]>([]);
-  const [waypoints, setWaypoints] = useState<Waypoint[]>([]);
-  const [violations, setViolations] = useState<Violation[]>([]);
-  const [trackPoints, setTrackPoints] = useState<TrackPoint[]>([]);
-  const [name, setName] = useState('');
-  const [coordsText, setCoordsText] = useState('');
-  const [pendingCoords, setPendingCoords] = useState<Array<[number, number]> | null>(null);
+
+  const [meta, setMeta] = useState<FloorMapMeta | null>(null);
+  const [destinations, setDestinations] = useState<FloorMapDestination[]>([]);
+  const [mode, setMode] = useState<MapMode>('idle');
+  const [pendingPoints, setPendingPoints] = useState<WorldPoint[]>([]);
+  const [activeGoal, setActiveGoal] = useState<GotoGoal | null>(null);
+  const [navStatus, setNavStatus] = useState<NavStatus | null>(null);
+  const [lastInitialPose, setLastInitialPose] = useState<{ x: number; y: number; yaw: number } | null>(null);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
-  const [addOpen, setAddOpen] = useState(false);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [destinationOpen, setDestinationOpen] = useState(false);
-  const [destinations, setDestinations] = useState<ResidentDestination[]>([]);
-  const [destinationForm, setDestinationForm] = useState({ building: '', displayName: '', mapVersion: '', x: '', y: '', yaw: '0' });
-  const [layers, setLayers] = useState<MapLayers>({ waypoints: true, zones: true, violations: true, track: false });
-  const [mode, setMode] = useState<GlobalMapMode>('view');
-  const [selectedZoneId, setSelectedZoneId] = useState<string | null>(null);
-  const [selectedViolation, setSelectedViolation] = useState<Violation | null>(null);
 
-  const focusViolation = (violation: Violation) => {
-    setSelectedViolation(violation);
-    if (
-      violation.longitude != null &&
-      violation.latitude != null &&
-      Number.isFinite(violation.longitude) &&
-      Number.isFinite(violation.latitude)
-    ) {
-      mapRef.current?.focusPosition(violation.longitude, violation.latitude);
-    }
-  };
+  const [saveOpen, setSaveOpen] = useState(false);
+  const [routeName, setRouteName] = useState('');
+  const [routeMapVersion, setRouteMapVersion] = useState('');
+
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const [uploadForm, setUploadForm] = useState({ mapVersion: 'floor-map-v1', resolution: '0.05', originX: '0', originY: '0', originYaw: '0' });
+  const [uploadImage, setUploadImage] = useState<{ dataUrl: string; width: number; height: number } | null>(null);
+
+  const { pose, trail, connected, clearTrail, seedPose } = usePoseStream(selectedId);
 
   const refresh = async () => {
-    const [nextZones, nextWaypoints, nextDestinations, nextViolations] = await Promise.all([
-      mapClient.zones(),
-      mapClient.waypoints(),
-      selectedId ? responseClient.destinations(selectedId) : Promise.resolve([]),
-      opsClient.violations().catch(() => [] as Violation[]),
+    const [nextMeta, nextDestinations, nextGoal, nextNav] = await Promise.all([
+      mapClient.basemap(selectedId),
+      selectedId ? responseClient.destinations(selectedId) : Promise.resolve([] as ResidentDestination[]),
+      selectedId ? gotoClient.activeGoto(selectedId) : Promise.resolve(null),
+      selectedId ? navClient.navStatus(selectedId) : Promise.resolve(null),
     ]);
-    setZones(nextZones);
-    setWaypoints(nextWaypoints);
-    setDestinations(nextDestinations);
-    setViolations(nextViolations);
-    if (selectedId && layers.track) {
-      setTrackPoints(await deviceClient.track(selectedId).catch(() => []));
-    } else {
-      setTrackPoints([]);
-    }
-    return nextViolations;
+    setMeta(nextMeta);
+    setDestinations(nextDestinations.map((item) => ({ id: item.id, displayName: item.displayName, x: item.x, y: item.y })));
+    setActiveGoal(nextGoal);
+    setNavStatus(nextNav);
+    if (nextMeta?.mapVersion && !routeMapVersion) setRouteMapVersion(nextMeta.mapVersion);
   };
 
   useEffect(() => {
-    void refresh()
-      .then((nextViolations) => {
-        const violationId = searchParams.get('violationId');
-        if (!violationId) return;
-        const match = nextViolations.find((item) => item.id === violationId);
-        if (match) {
-          setSelectedViolation(match);
-          setSearchParams({}, { replace: true });
-        }
-      })
-      .catch((reason: unknown) => setMessage(reason instanceof Error ? reason.message : '加载失败'));
-    // Deep-link focus runs once after load; layers.track / selectedId refresh intentionally re-fetch.
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- searchParams consumed once on load path
-  }, [selectedId, layers.track]);
+    void refresh().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : '加载失败'));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh reads selectedId directly
+  }, [selectedId]);
 
   useEffect(() => {
-    if (!selectedViolation) return;
-    const { longitude, latitude } = selectedViolation;
-    if (longitude == null || latitude == null || !Number.isFinite(longitude) || !Number.isFinite(latitude)) return;
-    const timer = window.setTimeout(() => {
-      mapRef.current?.focusPosition(longitude, latitude);
-    }, 500);
-    return () => window.clearTimeout(timer);
-  }, [selectedViolation?.id, selectedViolation?.longitude, selectedViolation?.latitude]);
+    if (!selectedId) return undefined;
+    const timer = window.setInterval(() => {
+      void Promise.all([
+        gotoClient.activeGoto(selectedId).then(setActiveGoal),
+        navClient.navStatus(selectedId).then(setNavStatus),
+      ]).catch(() => undefined);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [selectedId]);
 
-  const closeDrawer = () => {
-    setAddOpen(false);
-    setPendingCoords(null);
-    setAdvancedOpen(false);
-    setError('');
-  };
-
-  const openNameModal = (coordinates: Array<[number, number]>) => {
-    if (coordinates.length < 3) {
-      setError('多边形至少需要 3 个坐标点');
+  const enterGotoMode = async () => {
+    if (!selectedId) {
+      setError('请先选择设备');
       return;
     }
-    setPendingCoords(coordinates);
-    setCoordsText(coordinates.map(([lng, lat]) => `${lng},${lat}`).join('\n'));
-    setName('');
-    setAddOpen(true);
-    setAdvancedOpen(false);
-  };
-
-  const addZone = async (event: React.FormEvent) => {
-    event.preventDefault();
-    setMessage('');
     setError('');
+    setPendingPoints([]);
+    setMode('goto');
     try {
-      const coordinates = pendingCoords ?? parseCoordinates(coordsText);
-      if (coordinates.length < 3) throw new Error('多边形至少需要 3 个坐标点');
-      await mapClient.createZone({ name: name.trim() || '未命名禁停区', type: 'no_parking', coordinates });
-      setName('');
-      setCoordsText('');
-      setPendingCoords(null);
-      setMessage('禁停区已保存');
-      setAddOpen(false);
-      await refresh();
+      const status = await navClient.prepareNav(selectedId);
+      setNavStatus(status);
+      setMessage(
+        status.ready
+          ? '导航已就绪：可点地图前往。若车位不准，先用「设初始位」。'
+          : '已请求车上准备导航，请等待就绪指示灯变绿（需 Jetson 上运行 nav_supervisor）',
+      );
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '保存失败');
+      setError(reason instanceof Error ? reason.message : '准备导航失败');
     }
   };
 
-  const remove = async (id: string) => {
-    try {
-      await mapClient.deleteZone(id);
-      if (selectedZoneId === id) setSelectedZoneId(null);
-      setMessage('禁停区已删除');
-      await refresh();
-    } catch (reason) {
-      setMessage(reason instanceof Error ? reason.message : '删除失败');
+  const onMapClick = (world: WorldPoint) => {
+    if (mode === 'mark') {
+      setPendingPoints((current) => [...current, world]);
+      return;
+    }
+    if (mode === 'goto') {
+      if (!selectedId) return setError('请先选择设备');
+      if (navStatus && !navStatus.ready) {
+        setError(`导航未就绪：${navStatus.detail || '等待车上 supervisor'}`);
+        return;
+      }
+      const yaw = pose ? Math.atan2(world.y - pose.y, world.x - pose.x) : 0;
+      void gotoClient
+        .createGoto(selectedId, { x: world.x, y: world.y, yaw })
+        .then((goal) => {
+          setActiveGoal(goal);
+          setError('');
+          setMessage(`已下发前往目标 (${world.x.toFixed(2)}, ${world.y.toFixed(2)})`);
+        })
+        .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : '下发前往失败'));
     }
   };
 
-  const saveEditedZone = async (zoneId: string, coordinates: Array<[number, number]>) => {
-    try {
-      if (coordinates.length < 3) throw new Error('多边形至少需要 3 个坐标点');
-      await mapClient.updateZone(zoneId, { coordinates });
-      setMessage('禁停区已更新');
-      await refresh();
-    } catch (reason) {
-      setMessage(reason instanceof Error ? reason.message : '更新失败');
-    }
+  useEffect(() => {
+    const onRejected = (event: Event) => {
+      const detail = (event as CustomEvent<{ reason?: string }>).detail;
+      setError(detail?.reason || '初始位设置无效');
+    };
+    window.addEventListener('floormap-pose-estimate-rejected', onRejected);
+    return () => window.removeEventListener('floormap-pose-estimate-rejected', onRejected);
+  }, []);
+
+  const onPoseEstimate = (estimate: { x: number; y: number; yaw: number }) => {
+    if (!selectedId) return setError('请先选择设备');
+    void (async () => {
+      try {
+        // 设位前先清掉活跃前往，否则错误初始位会触发 Nav2 recovery 原地转圈。
+        if (activeGoal) {
+          await gotoClient.cancelGoto(selectedId, { force: true });
+          setActiveGoal(null);
+        }
+        const status = await navClient.setInitialPose(selectedId, estimate);
+        setNavStatus(status);
+        setLastInitialPose(estimate);
+        // 立刻把红三角放到设位点，并清空旧轨迹（不等 AMCL/代理回传）。
+        seedPose(estimate);
+        setError('');
+        const deg = ((estimate.yaw * 180) / Math.PI).toFixed(0);
+        setMessage(
+          `已下发初始位姿 x=${estimate.x.toFixed(2)} y=${estimate.y.toFixed(2)} 朝向=${deg}°（请等车标稳定后再前往）`,
+        );
+      } catch (reason) {
+        setError(reason instanceof Error ? reason.message : '设置初始位失败');
+      }
+    })();
   };
 
-  const addDestination = async (event: React.FormEvent) => {
-    event.preventDefault(); setError('');
+  const clearPending = () => setPendingPoints([]);
+  const undoPending = () => setPendingPoints((current) => current.slice(0, -1));
+
+  const openSaveModal = () => {
+    if (pendingPoints.length < 3 || pendingPoints.length > 8) {
+      setError('巡航路线需要 3 到 8 个航点');
+      return;
+    }
+    setError('');
+    setRouteName(`楼道巡航 ${new Date().toLocaleString()}`);
+    setRouteMapVersion((current) => current || meta?.mapVersion || 'floor-map-v1');
+    setSaveOpen(true);
+  };
+
+  const saveRoute = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setError('');
     if (!selectedId) return setError('请先选择设备');
     try {
-      await responseClient.createDestination({
-        vehicleId: selectedId, building: destinationForm.building, displayName: destinationForm.displayName,
-        mapVersion: destinationForm.mapVersion, x: Number(destinationForm.x), y: Number(destinationForm.y), yaw: Number(destinationForm.yaw),
+      await patrolClient.importRoute(selectedId, {
+        name: routeName.trim() || '楼道巡航路线',
+        mapVersion: routeMapVersion.trim() || meta?.mapVersion || 'floor-map-v1',
+        yaml: buildRouteYaml(pendingPoints),
       });
-      setDestinationOpen(false); setDestinationForm({ building: '', displayName: '', mapVersion: '', x: '', y: '', yaw: '0' });
-      setMessage('住户一层目的地已保存'); await refresh();
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '目的地保存失败'); }
+      setSaveOpen(false);
+      setMode('idle');
+      setPendingPoints([]);
+      setMessage('巡航路线已保存，可在巡检任务中启动');
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '保存路线失败');
+    }
   };
 
-  const selectedZone = zones.find((zone) => zone.id === selectedZoneId) ?? null;
+  const cancelGoto = async () => {
+    if (!selectedId) return;
+    try {
+      const stuck = activeGoal?.status === 'cancellation_requested';
+      await gotoClient.cancelGoto(selectedId, { force: stuck });
+      setMessage(stuck ? '已强制结束前往' : '已请求取消前往');
+      setActiveGoal(await gotoClient.activeGoto(selectedId));
+    } catch (reason) {
+      // 普通取消失败时再强制一次（代理离线导致卡死）
+      try {
+        await gotoClient.cancelGoto(selectedId, { force: true });
+        setMessage('已强制结束前往');
+        setActiveGoal(await gotoClient.activeGoto(selectedId));
+        setError('');
+      } catch {
+        setError(reason instanceof Error ? reason.message : '取消失败');
+      }
+    }
+  };
+
+  const onPickImage = async (file: File | undefined) => {
+    if (!file) return;
+    try {
+      setUploadImage(await readImageFile(file));
+      setError('');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '读取图片失败');
+    }
+  };
+
+  const uploadBasemap = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setError('');
+    if (!uploadImage) return setError('请先选择楼道底图 PNG');
+    try {
+      const next = await mapClient.uploadBasemap({
+        vehicleId: selectedId ?? undefined,
+        mapVersion: uploadForm.mapVersion.trim() || 'floor-map-v1',
+        resolution: Number(uploadForm.resolution),
+        originX: Number(uploadForm.originX),
+        originY: Number(uploadForm.originY),
+        originYaw: Number(uploadForm.originYaw),
+        imageWidth: uploadImage.width,
+        imageHeight: uploadImage.height,
+        imageDataUrl: uploadImage.dataUrl,
+      });
+      setMeta(next);
+      setUploadOpen(false);
+      setUploadImage(null);
+      setMessage('楼道底图已更新');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '底图上传失败');
+    }
+  };
+
+  const poseText = useMemo(() => {
+    if (!pose) return '暂无位姿（设初始位后应出现三角车标）';
+    const deg = ((pose.yaw * 180) / Math.PI).toFixed(0);
+    return `x=${pose.x.toFixed(2)}m, y=${pose.y.toFixed(2)}m, 朝向=${deg}°`;
+  }, [pose]);
+
+  const ready = hasBasemap(meta);
+  const clickable = mode === 'mark' || mode === 'goto';
+  const navReady = Boolean(navStatus?.ready);
 
   return (
     <div className="page map-page">
       <header className="page-header">
         <div>
-          <h1>全局地图</h1>
-          <p>在地图上绘制禁停区多边形，管理航点、违规车辆与图层</p>
+          <h1>楼道地图</h1>
+          <p>设初始位请按住拖出朝向箭头（对准真实车头）→ 前往模式 → 先点近处目标</p>
         </div>
         <div className="button-row">
-          <button type="button" className="secondary" disabled={!selectedId || !isAdmin} onClick={() => setDestinationOpen(true)}>新增住户目的地</button>
+          <button
+            type="button"
+            className={mode === 'setPose' ? 'primary' : 'secondary'}
+            disabled={!ready || !selectedId}
+            onClick={() => {
+              setMode((value) => (value === 'setPose' ? 'idle' : 'setPose'));
+              setPendingPoints([]);
+            }}
+          >
+            {mode === 'setPose' ? '退出设位' : '设初始位'}
+          </button>
+          <button
+            type="button"
+            className={mode === 'goto' ? 'primary' : 'secondary'}
+            disabled={!ready || !selectedId}
+            onClick={() => {
+              if (mode === 'goto') setMode('idle');
+              else void enterGotoMode();
+            }}
+          >
+            {mode === 'goto' ? '退出前往' : '前往模式'}
+          </button>
+          <button
+            type="button"
+            className={mode === 'mark' ? 'primary' : 'secondary'}
+            disabled={!ready}
+            onClick={() => setMode((value) => (value === 'mark' ? 'idle' : 'mark'))}
+          >
+            {mode === 'mark' ? '退出标点' : '标点模式'}
+          </button>
+          <button type="button" className="secondary" disabled={!pendingPoints.length} onClick={undoPending}>撤销</button>
+          <button type="button" className="secondary" disabled={!pendingPoints.length} onClick={clearPending}>清除标点</button>
           <button
             type="button"
             className="secondary"
-            disabled={!isAdmin || !selectedZoneId || mode === 'draw'}
-            onClick={() => setMode('edit')}
+            disabled={trail.length <= 1}
+            onClick={() => {
+              clearTrail();
+              setMessage('已清除轨迹（保留当前车标）');
+            }}
           >
-            编辑禁停区
+            清除轨迹
           </button>
-          <button
-            type="button"
-            className="danger"
-            disabled={!isAdmin || !selectedZoneId || mode !== 'view'}
-            onClick={() => selectedZoneId && void remove(selectedZoneId)}
-          >
-            删除选中
-          </button>
-          <button
-            type="button"
-            className="primary"
-            disabled={!isAdmin || mode === 'draw'}
-            onClick={() => { setSelectedZoneId(null); setMode('draw'); }}
-          >
-            绘制禁停区
-          </button>
+          <button type="button" className="primary" disabled={pendingPoints.length < 3} onClick={openSaveModal}>保存为巡航路线</button>
+          <button type="button" className="secondary" disabled={!activeGoal || !selectedId} onClick={() => void cancelGoto()}>取消前往</button>
+          {isAdmin && <button type="button" className="secondary" onClick={() => setUploadOpen(true)}>上传底图</button>}
         </div>
       </header>
       {message && <p className="notice">{message}</p>}
-      {error && !addOpen && <p className="error">{error}</p>}
-
-      <section className="panel filter-row">
-        <label className="toggle"><input type="checkbox" checked={layers.waypoints} onChange={(e) => setLayers({ ...layers, waypoints: e.target.checked })} /><span />航点</label>
-        <label className="toggle"><input type="checkbox" checked={layers.zones} onChange={(e) => setLayers({ ...layers, zones: e.target.checked })} /><span />禁停区</label>
-        <label className="toggle"><input type="checkbox" checked={layers.violations} onChange={(e) => setLayers({ ...layers, violations: e.target.checked })} /><span />违规车辆</label>
-        <label className="toggle"><input type="checkbox" checked={layers.track} onChange={(e) => setLayers({ ...layers, track: e.target.checked })} /><span />巡逻轨迹</label>
-        {selectedZone && <span className="tag tag-info">已选：{selectedZone.name}</span>}
-      </section>
+      {error && <p className="error">{error}</p>}
 
       <div className="global-map-layout">
-        <GlobalMap
-          ref={mapRef}
-          zones={zones}
-          waypoints={waypoints}
-          violations={violations}
-          trackPoints={trackPoints}
-          layers={layers}
-          mode={mode}
-          selectedZoneId={selectedZoneId}
-          onModeChange={setMode}
-          onZoneDrawn={openNameModal}
-          onZoneEdited={(zoneId, coordinates) => void saveEditedZone(zoneId, coordinates)}
-          onZoneSelect={(zoneId) => { setSelectedZoneId(zoneId); setMode('view'); }}
-          onViolationClick={focusViolation}
-        />
+        <section className="global-map floor-map">
+          <div className="global-map-toolbar">
+            <span>
+              {ready ? `${meta?.name ?? '楼道地图'} · ${meta?.mapVersion}` : '未配置底图'}
+              {mode === 'mark' ? ' · 点击添加巡航航点' : ''}
+              {mode === 'goto' ? ' · 点击地图下发单点前往' : ''}
+              {mode === 'setPose' ? ' · 按下定点，拖拽调朝向，松开提交' : ''}
+            </span>
+            <span className={navReady ? 'tag tag-success' : 'tag tag-info'}>{navReady ? '导航就绪' : '导航未就绪'}</span>
+            <span className={navStatus?.supervisorOnline ? 'tag tag-success' : 'tag tag-info'}>
+              {navStatus?.supervisorOnline ? '车上代理在线' : '车上代理离线'}
+            </span>
+            <span className={pose ? 'tag tag-success' : 'tag tag-info'}>{pose ? '车标可见' : '等待位姿'}</span>
+          </div>
+          {ready && meta ? (
+            <FloorMap
+              meta={meta}
+              destinations={destinations}
+              pose={pose}
+              trail={trail}
+              pendingPoints={pendingPoints}
+              goal={activeGoal}
+              initialPose={lastInitialPose}
+              clickable={clickable}
+              poseEstimate={mode === 'setPose'}
+              onMapClick={onMapClick}
+              onPoseEstimate={onPoseEstimate}
+            />
+          ) : (
+            <div className="empty-state">
+              <p>尚未配置楼道底图。</p>
+              {isAdmin ? <button type="button" className="primary" onClick={() => setUploadOpen(true)}>上传楼道底图</button> : <p className="muted">请管理员在此上传 map.pgm 转出的 PNG 与 map.yaml 参数。</p>}
+            </div>
+          )}
+        </section>
 
         <aside className="global-map-side panel">
-          <h2>禁停区列表</h2>
-          {!layers.zones ? <div className="empty-state">图层已关闭</div> : zones.length === 0 ? (
-            <div className="empty-state">
-              <p>暂无禁停区</p>
-              {isAdmin && <button type="button" className="primary" onClick={() => setMode('draw')}>绘制禁停区</button>}
-            </div>
+          {selectedDevice && selectedDevice.host ? (
+            <VideoPanel host={selectedDevice.host} port={selectedDevice.videoPort} />
           ) : (
-            <ul className="zone-list">
-              {zones.map((zone) => (
-                <li key={zone.id} className={zone.id === selectedZoneId ? 'zone-list-active' : undefined}>
-                  <button type="button" className="zone-list-item" onClick={() => setSelectedZoneId(zone.id)}>
-                    <strong>{zone.name}</strong>
-                    <small>{zone.coordinates?.length ?? 0} 个顶点</small>
-                  </button>
-                  {isAdmin && <button type="button" className="danger" onClick={() => void remove(zone.id)}>删除</button>}
-                </li>
-              ))}
-            </ul>
+            <div className="empty-state">选择设备后显示视频</div>
           )}
+          <h3 className="mt-16">导航就绪</h3>
+          <dl className="status-dl">
+            <dt>代理</dt><dd>{navStatus?.supervisorOnline ? '在线' : '离线'}</dd>
+            <dt>位姿桥</dt><dd>{navStatus?.poseOk ? 'OK' : '—'}</dd>
+            <dt>前往调度</dt><dd>{navStatus?.gotoOk ? 'OK' : '—'}</dd>
+            <dt>Nav2</dt><dd>{navStatus?.nav2Ok ? 'OK' : '—'}</dd>
+            <dt>Bringup</dt><dd>{navStatus?.bringupOk ? 'OK' : '—'}</dd>
+            <dt>说明</dt><dd className="muted">{navStatus?.detail || '点「前往模式」会请求准备'}</dd>
+          </dl>
 
-          {layers.waypoints && (
-            <>
-              <h3 className="mt-16">航点</h3>
-              {waypoints.length === 0 ? <div className="empty-state">暂无航点</div> : (
-                <ul className="event-stream">
-                  {waypoints.map((point) => (
-                    <li key={point.id}>{point.name}（{point.longitude.toFixed(5)}, {point.latitude.toFixed(5)}）</li>
-                  ))}
-                </ul>
-              )}
-            </>
-          )}
+          <h3 className="mt-16">小车状态</h3>
+          <dl className="status-dl">
+            <dt>位姿通道</dt><dd>{connected ? '在线' : '离线'}</dd>
+            <dt>位姿</dt><dd>{poseText}</dd>
+            <dt>轨迹点</dt><dd>{trail.length}</dd>
+            <dt>前往目标</dt>
+            <dd>
+              {activeGoal
+                ? `${activeGoal.status} (${activeGoal.x.toFixed(2)}, ${activeGoal.y.toFixed(2)})`
+                : '无'}
+            </dd>
+            <dt>待保存标点</dt><dd>{pendingPoints.length}</dd>
+          </dl>
 
           <h3 className="mt-16">一层住户目的地</h3>
           {destinations.length === 0 ? <div className="empty-state">当前设备暂无住户目的地</div> : (
-            <table>
-              <thead><tr><th>楼栋</th><th>名称</th><th>地图版本</th><th>状态</th></tr></thead>
-              <tbody>
-                {destinations.map((destination) => (
-                  <tr key={destination.id}>
-                    <td>{destination.building}</td>
-                    <td>{destination.displayName}</td>
-                    <td>{destination.mapVersion}</td>
-                    <td>{destination.active ? '启用' : '停用'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <ul className="event-stream">
+              {destinations.map((destination) => (
+                <li key={destination.id}>{destination.displayName}（{destination.x.toFixed(2)}, {destination.y.toFixed(2)}）</li>
+              ))}
+            </ul>
           )}
         </aside>
       </div>
 
-      {selectedViolation && (
-        <aside className="map-violation-drawer panel">
-          <div className="panel-heading">
-            <h2>{selectedViolation.plate || '未识别车牌'}</h2>
-            <button type="button" className="secondary" onClick={() => setSelectedViolation(null)}>关闭</button>
-          </div>
-          <dl className="status-dl">
-            <dt>类型</dt><dd>{selectedViolation.type}</dd>
-            <dt>时间</dt><dd>{new Date(selectedViolation.occurredAt).toLocaleString()}</dd>
-            <dt>禁停区</dt><dd>{selectedViolation.zoneName ?? '-'}</dd>
-            <dt>航点</dt><dd>{selectedViolation.waypoint ?? '-'}</dd>
-            <dt>经度</dt><dd>{formatCoord(selectedViolation.longitude)}</dd>
-            <dt>纬度</dt><dd>{formatCoord(selectedViolation.latitude)}</dd>
-            <dt>坐标来源</dt><dd>{coordinateSourceLabel(selectedViolation.coordinateSource)}</dd>
-            <dt>车主</dt><dd>{selectedViolation.ownerName ?? '-'}</dd>
-            <dt>楼栋</dt><dd>{selectedViolation.building ?? '-'}</dd>
-            <dt>登记车位</dt><dd>{selectedViolation.parkingSpot ?? '-'}</dd>
-            <dt>置信度</dt>
-            <dd>
-              {selectedViolation.confidence != null && Number.isFinite(selectedViolation.confidence)
-                ? `${(selectedViolation.confidence * 100).toFixed(0)}%`
-                : '-'}
-            </dd>
-            <dt>优先级</dt><dd>{selectedViolation.priority ?? '-'}</dd>
-            <dt>状态</dt><dd>{selectedViolation.status ?? '-'}</dd>
-          </dl>
-          {selectedViolation.longitude == null || selectedViolation.latitude == null ? (
-            <p className="muted">暂无 GPS，仅显示航点/禁停区名称。</p>
-          ) : null}
-          {selectedViolation.evidenceUrl && (
-            <img className="review-thumb" src={selectedViolation.evidenceUrl} alt="证据截图" />
-          )}
-          <div className="button-row">
-            <button
-              type="button"
-              className="secondary"
-              disabled={selectedViolation.longitude == null || selectedViolation.latitude == null}
-              onClick={() => {
-                if (selectedViolation.longitude != null && selectedViolation.latitude != null) {
-                  mapRef.current?.focusPosition(selectedViolation.longitude, selectedViolation.latitude);
-                }
-              }}
-            >
-              定位到此
-            </button>
-            <Link className="primary" to="/reviews">去审核</Link>
-          </div>
-        </aside>
-      )}
-
-      <FormModal open={addOpen} title="保存禁停区" onClose={closeDrawer}>
-        <form className="stack-form" onSubmit={(event) => void addZone(event)}>
-          <label>区域名称<input value={name} onChange={(e) => setName(e.target.value)} placeholder="例如：东门禁停区" /></label>
-          {pendingCoords && <p className="muted">已从地图绘制 {pendingCoords.length} 个顶点</p>}
-          <button type="button" className="secondary" onClick={() => setAdvancedOpen((value) => !value)}>
-            {advancedOpen ? '收起高级模式' : '高级模式（手填坐标）'}
-          </button>
-          {advancedOpen && (
-            <label>
-              坐标（每行 lng,lat）
-              <textarea
-                rows={8}
-                value={coordsText}
-                onChange={(e) => { setCoordsText(e.target.value); setPendingCoords(null); }}
-                placeholder={'116.397428,39.90923\n116.397528,39.90933\n116.397628,39.90913'}
-                required={!pendingCoords}
-              />
-            </label>
-          )}
+      <FormModal open={saveOpen} title="保存为巡航路线" onClose={() => setSaveOpen(false)}>
+        <form className="stack-form" onSubmit={(event) => void saveRoute(event)}>
+          <p className="muted">共 {pendingPoints.length} 个航点，将保存为可启动的巡检路线。</p>
+          <label>路线名称<input value={routeName} onChange={(e) => setRouteName(e.target.value)} required /></label>
+          <label>地图版本<input value={routeMapVersion} onChange={(e) => setRouteMapVersion(e.target.value)} placeholder="floor-map-v1" required /></label>
           {error && <p className="error">{error}</p>}
-          <button type="submit" className="primary">保存</button>
+          <button type="submit" className="primary">保存路线</button>
         </form>
       </FormModal>
-      <FormModal open={destinationOpen} title="新增一层住户目的地" onClose={() => setDestinationOpen(false)}>
-        <form className="stack-form" onSubmit={(event) => void addDestination(event)}>
-          <label>楼栋标识<input required value={destinationForm.building} onChange={(e) => setDestinationForm({ ...destinationForm, building: e.target.value })} placeholder="1号楼" /></label>
-          <label>显示名称<input required value={destinationForm.displayName} onChange={(e) => setDestinationForm({ ...destinationForm, displayName: e.target.value })} placeholder="1号楼一层公共门口" /></label>
-          <label>地图版本<input required value={destinationForm.mapVersion} onChange={(e) => setDestinationForm({ ...destinationForm, mapVersion: e.target.value })} placeholder="community-map-v1" /></label>
-          <label>X<input required type="number" step="any" value={destinationForm.x} onChange={(e) => setDestinationForm({ ...destinationForm, x: e.target.value })} /></label>
-          <label>Y<input required type="number" step="any" value={destinationForm.y} onChange={(e) => setDestinationForm({ ...destinationForm, y: e.target.value })} /></label>
-          <label>Yaw<input required type="number" step="any" value={destinationForm.yaw} onChange={(e) => setDestinationForm({ ...destinationForm, yaw: e.target.value })} /></label>
-          {error && <p className="error">{error}</p>}<button type="submit" className="primary">保存目的地</button>
+
+      <FormModal open={uploadOpen} title="上传楼道底图" onClose={() => setUploadOpen(false)}>
+        <form className="stack-form" onSubmit={(event) => void uploadBasemap(event)}>
+          <p className="muted">上传 map.pgm 转出的 PNG，并填入 map.yaml 的 resolution 与 origin。{selectedId ? '将绑定当前设备。' : '将作为全局默认底图。'}</p>
+          <label>底图 PNG<input type="file" accept="image/png,image/jpeg" onChange={(e) => void onPickImage(e.target.files?.[0])} required /></label>
+          {uploadImage && <p className="muted">图片尺寸：{uploadImage.width} × {uploadImage.height}px</p>}
+          <label>地图版本<input value={uploadForm.mapVersion} onChange={(e) => setUploadForm({ ...uploadForm, mapVersion: e.target.value })} required /></label>
+          <label>分辨率 resolution（米/像素）<input type="number" step="any" value={uploadForm.resolution} onChange={(e) => setUploadForm({ ...uploadForm, resolution: e.target.value })} required /></label>
+          <label>原点 origin X（米）<input type="number" step="any" value={uploadForm.originX} onChange={(e) => setUploadForm({ ...uploadForm, originX: e.target.value })} required /></label>
+          <label>原点 origin Y（米）<input type="number" step="any" value={uploadForm.originY} onChange={(e) => setUploadForm({ ...uploadForm, originY: e.target.value })} required /></label>
+          <label>原点朝向 yaw（弧度）<input type="number" step="any" value={uploadForm.originYaw} onChange={(e) => setUploadForm({ ...uploadForm, originYaw: e.target.value })} /></label>
+          {error && <p className="error">{error}</p>}
+          <button type="submit" className="primary">上传底图</button>
         </form>
       </FormModal>
     </div>

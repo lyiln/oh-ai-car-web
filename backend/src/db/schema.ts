@@ -533,3 +533,102 @@ ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS dedupe_window_sec integer NOT 
 CREATE UNIQUE INDEX IF NOT EXISTS patrol_routes_vehicle_name_version_idx
   ON patrol_routes(vehicle_id, name, map_version);
 `;
+
+// 楼道室内 SLAM 地图与 map 坐标位姿。
+// - map_metadata 扩展分辨率/原点/尺寸，用于前端把栅格底图与 Nav2 坐标对齐。
+// - pose_points 保存 map 坐标系下的实时/历史位姿（x/y/yaw，单位米/弧度）。
+export const migration012 = `
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS vehicle_id uuid REFERENCES vehicles(id) ON DELETE CASCADE;
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS map_version text NOT NULL DEFAULT 'floor-map-v1';
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS resolution double precision NOT NULL DEFAULT 0.05;
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS origin_x double precision NOT NULL DEFAULT 0;
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS origin_y double precision NOT NULL DEFAULT 0;
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS origin_yaw double precision NOT NULL DEFAULT 0;
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS image_width integer NOT NULL DEFAULT 0;
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS image_height integer NOT NULL DEFAULT 0;
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+CREATE UNIQUE INDEX IF NOT EXISTS map_metadata_vehicle_idx ON map_metadata(vehicle_id) WHERE vehicle_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS pose_points (
+  id uuid PRIMARY KEY,
+  vehicle_id uuid NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+  occurred_at timestamptz NOT NULL,
+  x double precision NOT NULL,
+  y double precision NOT NULL,
+  yaw double precision NOT NULL,
+  map_version text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (vehicle_id, occurred_at)
+);
+CREATE INDEX IF NOT EXISTS pose_points_vehicle_time_idx ON pose_points(vehicle_id, occurred_at DESC);
+`;
+
+// 部分环境（旧 Neon / 手工改表）仍有 patrol_routes.code NOT NULL，与当前应用插入列不一致。
+// 补齐缺失值，并允许无 code 的插入；应用侧保存路线时仍会写入稳定 code。
+export const migration013 = `
+ALTER TABLE patrol_routes ADD COLUMN IF NOT EXISTS code text;
+UPDATE patrol_routes
+SET code = COALESCE(NULLIF(TRIM(code), ''), 'route-' || REPLACE(id::text, '-', ''))
+WHERE code IS NULL OR TRIM(code) = '';
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'patrol_routes' AND column_name = 'code'
+      AND is_nullable = 'NO'
+  ) THEN
+    ALTER TABLE patrol_routes ALTER COLUMN code DROP NOT NULL;
+  END IF;
+END $$;
+`;
+
+// Web「2D Goal Pose」单点前往：对齐 Nav2 NavigateToPose，与多点巡航 patrol_tasks 分离。
+export const migration014 = `
+CREATE TABLE IF NOT EXISTS goto_goals (
+  id uuid PRIMARY KEY,
+  vehicle_id uuid NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+  x double precision NOT NULL,
+  y double precision NOT NULL,
+  yaw double precision NOT NULL DEFAULT 0,
+  status text NOT NULL CHECK (status IN ('queued','navigating','arrived','cancelled','failed','cancellation_requested')),
+  created_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  failure_reason text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  claimed_at timestamptz,
+  finished_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS goto_goals_vehicle_created_idx ON goto_goals(vehicle_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS goto_goals_vehicle_active_idx
+  ON goto_goals(vehicle_id) WHERE status IN ('queued','navigating','cancellation_requested');
+`;
+
+// Web 一键导航就绪 + 网页设初始位姿（对齐 RViz 2D Pose Estimate → /initialpose）。
+export const migration015 = `
+CREATE TABLE IF NOT EXISTS vehicle_nav_state (
+  vehicle_id uuid PRIMARY KEY REFERENCES vehicles(id) ON DELETE CASCADE,
+  prepare_requested boolean NOT NULL DEFAULT false,
+  prepare_requested_at timestamptz,
+  initial_pose_x double precision,
+  initial_pose_y double precision,
+  initial_pose_yaw double precision,
+  initial_pose_seq integer NOT NULL DEFAULT 0,
+  initial_pose_consumed_seq integer NOT NULL DEFAULT 0,
+  supervisor_seen_at timestamptz,
+  pose_ok boolean NOT NULL DEFAULT false,
+  goto_ok boolean NOT NULL DEFAULT false,
+  nav2_ok boolean NOT NULL DEFAULT false,
+  bringup_ok boolean NOT NULL DEFAULT false,
+  ready boolean NOT NULL DEFAULT false,
+  detail text NOT NULL DEFAULT '',
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+`;
+
+// 旧库 patrol_tasks 可能缺少 failure_reason（CREATE TABLE IF NOT EXISTS 不会补列）。
+export const migration016 = `
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS failure_reason text;
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS finished_at timestamptz;
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS stop_requested_at timestamptz;
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS stop_confirmed_at timestamptz;
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS zero_velocity_confirmed_at timestamptz;
+`;

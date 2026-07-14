@@ -12,6 +12,9 @@
   operator-facing task and report data.
 - `GET /device/v1/patrol/tasks/next`: authenticated scheduler claims one
   queued task for its vehicle.
+- `GET /device/v1/patrol/tasks/:taskId`: authenticated scheduler reads the
+  task `status` for its own vehicle (used to detect `cancellation_requested`
+  while navigating).
 - `POST /device/v1/patrol/tasks/:taskId/events`: authenticated scheduler posts
   `status`, `waypoint`, `observation`, or `stop_confirmed` events. A
   `stop_confirmed` event requires `{ "zeroVelocity": true }`.

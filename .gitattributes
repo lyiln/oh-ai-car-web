@@ -1,0 +1,4 @@
+# Keep shell scripts Unix LF so Jetson/bash does not fail on $'\r'
+*.sh text eol=lf
+edge-agent/*.sh text eol=lf
+edge-agent/scripts/*.sh text eol=lf

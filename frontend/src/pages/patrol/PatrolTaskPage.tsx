@@ -63,11 +63,11 @@ export function PatrolTaskPage() {
     }
   };
 
-  const stop = async () => {
+  const stop = async (force = false) => {
     setBusy(true);
     try {
-      await patrolClient.stop(selectedId ?? undefined);
-      setMessage('已发送停止指令');
+      const result = await patrolClient.stop(selectedId ?? undefined, { force });
+      setMessage(result.forced ? '已强制结束巡检（可继续前往/控制台）' : '已发送停止指令');
       await refresh(selectedId);
     } catch (reason) {
       setMessage(reason instanceof Error ? reason.message : '停止失败');
@@ -117,8 +117,10 @@ export function PatrolTaskPage() {
           </p>
           <div className="button-row">
             <button type="button" className="primary" disabled={busy || !selectedId} onClick={() => void start()}>开始巡检</button>
-            <button type="button" className="secondary" disabled={busy} onClick={() => void stop()}>停止巡检</button>
+            <button type="button" className="secondary" disabled={busy} onClick={() => void stop(false)}>停止巡检</button>
+            <button type="button" className="secondary" disabled={busy || !selectedId} onClick={() => void stop(true)}>强制结束</button>
           </div>
+          <p className="muted">若提示 Patrol is active / 等待零速确认，点「强制结束」清掉卡住的巡检后再用前往模式或控制台。</p>
         </section>
         <section className="panel">
           <h2>任务状态</h2>

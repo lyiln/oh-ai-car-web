@@ -214,9 +214,9 @@ async function ensureDefaultRoute(db: Database, vehicleId: string, userId: strin
   if (existing.rows[0]) return existing.rows[0].id;
   const routeId = randomUUID();
   await db.query(
-    `INSERT INTO patrol_routes (id, vehicle_id, name, map_version, source_yaml, created_by_user_id)
-     VALUES ($1,$2,'默认巡检路线','platform-default','generated for the selected device',$3)`,
-    [routeId, vehicleId, userId],
+    `INSERT INTO patrol_routes (id, vehicle_id, name, map_version, source_yaml, created_by_user_id, code)
+     VALUES ($1,$2,'默认巡检路线','platform-default','generated for the selected device',$3,$4)`,
+    [routeId, vehicleId, userId, `route-${routeId.replaceAll('-', '')}`],
   );
   await db.query(
     `INSERT INTO patrol_waypoints (id, route_id, ordinal, name, x, y, yaw, dwell_seconds) VALUES
@@ -229,10 +229,50 @@ async function ensureDefaultRoute(db: Database, vehicleId: string, userId: strin
 }
 
 async function ensureMapMetadata(db: Database): Promise<{ name: string; basemap_url: string }> {
-  const existing = await db.query<{ name: string; basemap_url: string }>('SELECT name, basemap_url FROM map_metadata ORDER BY created_at LIMIT 1');
+  const existing = await db.query<{ name: string; basemap_url: string }>('SELECT name, basemap_url FROM map_metadata WHERE vehicle_id IS NULL ORDER BY created_at LIMIT 1');
   if (existing.rows[0]) return existing.rows[0];
   await db.query('INSERT INTO map_metadata (id, name, basemap_url) VALUES ($1, $2, $3)', [randomUUID(), 'default', '']);
   return { name: 'default', basemap_url: '' };
+}
+
+type MapMetaRow = {
+  id: string;
+  name: string;
+  basemap_url: string;
+  map_version: string;
+  resolution: number;
+  origin_x: number;
+  origin_y: number;
+  origin_yaw: number;
+  image_width: number;
+  image_height: number;
+};
+
+function mapMetaDto(row: MapMetaRow | undefined) {
+  if (!row) return null;
+  return {
+    name: row.name,
+    mapVersion: row.map_version,
+    resolution: Number(row.resolution),
+    originX: Number(row.origin_x),
+    originY: Number(row.origin_y),
+    originYaw: Number(row.origin_yaw),
+    imageWidth: row.image_width,
+    imageHeight: row.image_height,
+    imageUrl: row.basemap_url || null,
+  };
+}
+
+const MAP_META_SELECT = 'id, name, basemap_url, map_version, resolution, origin_x, origin_y, origin_yaw, image_width, image_height';
+
+// 优先返回该车辆专属地图；没有则回退到全局默认地图（vehicle_id 为空）。
+async function loadFloorMap(db: Database, vehicleId: string | null): Promise<MapMetaRow | undefined> {
+  if (vehicleId) {
+    const perVehicle = await db.query<MapMetaRow>(`SELECT ${MAP_META_SELECT} FROM map_metadata WHERE vehicle_id=$1 LIMIT 1`, [vehicleId]);
+    if (perVehicle.rows[0]) return perVehicle.rows[0];
+  }
+  const global = await db.query<MapMetaRow>(`SELECT ${MAP_META_SELECT} FROM map_metadata WHERE vehicle_id IS NULL AND image_width>0 ORDER BY updated_at DESC LIMIT 1`);
+  return global.rows[0];
 }
 
 async function ensureGlobalWhitelist(client: PoolClient, user: RouteUser): Promise<string> {
@@ -546,6 +586,7 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
     const body = object(request.body);
     const taskId = typeof body?.taskId === 'string' ? body.taskId.trim() : null;
     const deviceId = typeof body?.deviceId === 'string' ? body.deviceId.trim() : null;
+    const force = body?.force === true;
     if (!taskId && !deviceId) throw httpError('deviceId or taskId is required', 400);
 
     let task: PatrolTaskRow | undefined;
@@ -561,6 +602,23 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
     }
     if (!task) throw httpError('Active patrol task not found', 404);
     if (!await canAccessVehicle(user, task.vehicle_id)) throw httpError('Vehicle access denied', 403);
+
+    // 无调度器确认零速时，cancellation_requested 会一直卡住并挡住前往/控制台；允许强制结束。
+    if (task.status === 'cancellation_requested' || force) {
+      await db.query(
+        `UPDATE patrol_tasks
+         SET status='stopped', finished_at=COALESCE(finished_at, now()),
+             stop_confirmed_at=COALESCE(stop_confirmed_at, now()),
+             zero_velocity_confirmed_at=COALESCE(zero_velocity_confirmed_at, now()),
+             failure_reason=COALESCE(failure_reason, 'operator force stop')
+         WHERE id=$1 AND status IN ('queued','running','cancellation_requested')`,
+        [task.id],
+      );
+      await db.query("INSERT INTO patrol_events (id,task_id,event_type,details) VALUES ($1,$2,'status',$3)", [randomUUID(), task.id, JSON.stringify({ status: 'stopped', source: 'operator_force' })]);
+      await audit('patrol.force-stop', 'success', user.id, task.vehicle_id, { taskId: task.id });
+      hub.publishPatrol?.({ type: 'patrol_status', taskId: task.id, vehicleId: task.vehicle_id, deviceId: task.vehicle_id, status: 'stopped' });
+      return { ok: true as const, forced: true };
+    }
 
     const stopped = await db.query(
       `UPDATE patrol_tasks SET status='cancellation_requested', stop_requested_at=now()
@@ -864,14 +922,87 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     return { name: meta.name, basemapUrl: meta.basemap_url };
   });
 
+  // 楼道 SLAM 底图元数据（分辨率/原点/尺寸/图片）。图片以 data URL 存储于 basemap_url。
+  app.get('/api/map/basemap', async (request) => {
+    const user = await requireUser(request);
+    const vehicleId = optionalString((request.query as { vehicleId?: string }).vehicleId) || null;
+    if (vehicleId && !await canAccessVehicle(user, vehicleId)) throw httpError('Vehicle access denied', 403);
+    const row = await loadFloorMap(db, vehicleId);
+    return { basemap: mapMetaDto(row) };
+  });
+
+  app.post('/api/map/basemap', async (request) => {
+    const admin = await requireAdmin(request);
+    const body = object(request.body);
+    const vehicleId = optionalString(body?.vehicleId) || null;
+    if (vehicleId) {
+      const vehicle = await db.query('SELECT id FROM vehicles WHERE id=$1', [vehicleId]);
+      if (!vehicle.rows[0]) throw httpError('Vehicle not found', 404);
+    }
+    const mapVersion = string(body?.mapVersion, 'mapVersion');
+    const resolution = number(body?.resolution, 'resolution', 1e-6, 100);
+    const originX = number(body?.originX, 'originX', -1e6, 1e6);
+    const originY = number(body?.originY, 'originY', -1e6, 1e6);
+    const originYaw = body?.originYaw === undefined ? 0 : number(body?.originYaw, 'originYaw', -Math.PI * 2, Math.PI * 2);
+    const imageWidth = number(body?.imageWidth, 'imageWidth', 1, 100000);
+    const imageHeight = number(body?.imageHeight, 'imageHeight', 1, 100000);
+    const imageUrl = string(body?.imageDataUrl ?? body?.imageUrl, 'imageDataUrl');
+    if (!Number.isInteger(imageWidth) || !Number.isInteger(imageHeight)) throw httpError('imageWidth/imageHeight must be integers', 400);
+
+    const name = optionalString(body?.name, '楼道地图');
+    const rowId = randomUUID();
+    // 每车最多一张底图（map_metadata_vehicle_idx）；全局图 vehicle_id 为空可多条，上传时先清再插。
+    await db.transaction(async (client) => {
+      if (vehicleId) {
+        await client.query(
+          `INSERT INTO map_metadata (id, vehicle_id, name, basemap_url, map_version, resolution, origin_x, origin_y, origin_yaw, image_width, image_height, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now())
+           ON CONFLICT (vehicle_id) WHERE vehicle_id IS NOT NULL DO UPDATE SET
+             name = EXCLUDED.name,
+             basemap_url = EXCLUDED.basemap_url,
+             map_version = EXCLUDED.map_version,
+             resolution = EXCLUDED.resolution,
+             origin_x = EXCLUDED.origin_x,
+             origin_y = EXCLUDED.origin_y,
+             origin_yaw = EXCLUDED.origin_yaw,
+             image_width = EXCLUDED.image_width,
+             image_height = EXCLUDED.image_height,
+             updated_at = now()`,
+          [rowId, vehicleId, name, imageUrl, mapVersion, resolution, originX, originY, originYaw, imageWidth, imageHeight],
+        );
+      } else {
+        await client.query('DELETE FROM map_metadata WHERE vehicle_id IS NULL');
+        await client.query(
+          `INSERT INTO map_metadata (id, vehicle_id, name, basemap_url, map_version, resolution, origin_x, origin_y, origin_yaw, image_width, image_height, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now())`,
+          [rowId, null, name, imageUrl, mapVersion, resolution, originX, originY, originYaw, imageWidth, imageHeight],
+        );
+      }
+    });
+    await audit('map.basemap.upload', 'success', admin.id, vehicleId ?? undefined, { mapVersion, imageWidth, imageHeight, resolution });
+    const row = await loadFloorMap(db, vehicleId);
+    return { basemap: mapMetaDto(row) };
+  });
+
   app.get('/api/map/waypoints', async (request) => {
     await requireUser(request);
-    const routeId = (request.query as { routeId?: string }).routeId;
+    const query = request.query as { routeId?: string; vehicleId?: string };
+    const routeId = query.routeId;
+    const vehicleId = typeof query.vehicleId === 'string' ? query.vehicleId.trim() : '';
     const result = routeId
       ? await db.query(
         `SELECT id, name, x AS longitude, y AS latitude, ordinal AS "order", route_id AS "routeId"
          FROM patrol_waypoints WHERE route_id=$1 ORDER BY ordinal`,
         [routeId],
+      )
+      : vehicleId
+      ? await db.query(
+        `SELECT w.id, w.name, w.x AS longitude, w.y AS latitude, w.ordinal AS "order", w.route_id AS "routeId"
+         FROM patrol_waypoints w
+         JOIN patrol_routes r ON r.id = w.route_id
+         WHERE r.vehicle_id=$1
+         ORDER BY r.created_at, w.ordinal`,
+        [vehicleId],
       )
       : await db.query(
         `SELECT id, name, x AS longitude, y AS latitude, ordinal AS "order", route_id AS "routeId"
