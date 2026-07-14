@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { PoolClient } from 'pg';
 import type { Database } from '../db/index.js';
+import { saveEvidenceJpeg } from '../evidence-storage.js';
+import { matchWhitelistPlate, normalisePlate } from '../plate-match.js';
 
 type AuthUser = {
   id: string;
@@ -638,7 +640,8 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
     const events = await db.query(
       `SELECT id, task_id AS "taskId", plate, event_type AS "eventType", waypoint,
               confidence, evidence_url AS "evidenceUrl", review_status AS "reviewStatus",
-              occurred_at AS "occurredAt"
+              occurred_at AS "occurredAt",
+              details->'plateMatch' AS "plateMatch"
        FROM patrol_events WHERE task_id=$1 ORDER BY occurred_at DESC`,
       [id],
     );
@@ -959,6 +962,150 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
   });
 
   // --- Violations ---
+  // Console plate-scan workbench: reject whitelist matches; otherwise create violation + review queue item.
+  app.post('/api/violations/from-console-scan', { bodyLimit: 6 * 1024 * 1024 }, async (request) => {
+    const user = await requireUser(request);
+    const body = (request.body && typeof request.body === 'object' && !Array.isArray(request.body))
+      ? request.body as Record<string, unknown>
+      : {};
+    const vehicleId = typeof body.vehicleId === 'string' ? body.vehicleId.trim() : '';
+    if (!vehicleId) throw httpError('vehicleId is required', 400);
+    if (!await canAccessVehicle(user, vehicleId)) throw httpError('Vehicle access denied', 403);
+
+    let plate: string;
+    try {
+      plate = normalisePlate(body.plate);
+    } catch {
+      throw httpError('plate is invalid', 400);
+    }
+
+    const liveWhitelist = await db.query<{ id: string }>(
+      `SELECT id FROM whitelist_imports
+       WHERE vehicle_id IS NULL AND is_snapshot=false
+       ORDER BY created_at DESC, id DESC LIMIT 1`,
+    );
+    if (liveWhitelist.rows[0]) {
+      const entries = await db.query<{ plate: string; category: 'private' | 'visitor' }>(
+        'SELECT plate, category FROM whitelist_entries WHERE whitelist_id=$1',
+        [liveWhitelist.rows[0].id],
+      );
+      const hit = matchWhitelistPlate(plate, entries.rows);
+      if (hit) {
+        const kind = hit.category === 'private' ? '登记私家车' : '登记访客';
+        throw httpError(
+          `白名单车辆：已匹配 ${hit.matchedPlate}（${kind}），不允许添加到违规车辆`,
+          409,
+        );
+      }
+    }
+
+    const jpegRaw = typeof body.jpegBase64 === 'string' ? body.jpegBase64.trim() : '';
+    if (!jpegRaw) throw httpError('jpegBase64 is required', 400);
+    let bytes: Buffer;
+    try {
+      bytes = Buffer.from(jpegRaw.replace(/^data:image\/jpeg;base64,/i, ''), 'base64');
+    } catch {
+      throw httpError('jpegBase64 is invalid', 400);
+    }
+
+    const confidence = typeof body.confidence === 'number' && Number.isFinite(body.confidence)
+      ? Math.min(1, Math.max(0, body.confidence))
+      : 0.5;
+    const waypoint = typeof body.waypoint === 'string' && body.waypoint.trim()
+      ? body.waypoint.trim().slice(0, 120)
+      : '控制台识别测试';
+
+    const route = await db.query<{ id: string }>(
+      'SELECT id FROM patrol_routes WHERE vehicle_id=$1 ORDER BY created_at DESC LIMIT 1',
+      [vehicleId],
+    );
+    if (!route.rows[0]) {
+      throw httpError('请先为该设备创建巡逻路线，测试审核需要挂接到任务事件', 409);
+    }
+    if (!liveWhitelist.rows[0]) {
+      throw httpError('全局白名单为空；请先维护白名单后再测试', 409);
+    }
+
+    const saved = saveEvidenceJpeg(bytes, 'console-scan');
+    const created = await db.transaction(async (client) => {
+      const taskId = randomUUID();
+      const eventId = randomUUID();
+      const reviewId = randomUUID();
+      const violationId = randomUUID();
+
+      await client.query(
+        `INSERT INTO patrol_tasks
+           (id, vehicle_id, route_id, whitelist_id, shift, status, created_by_user_id, started_at, finished_at)
+         VALUES ($1, $2, $3, $4, 'morning', 'completed', $5, now(), now())`,
+        [taskId, vehicleId, route.rows[0].id, liveWhitelist.rows[0].id, user.id],
+      );
+      await client.query(
+        `INSERT INTO patrol_events
+           (id, task_id, event_type, waypoint, plate, confidence, evidence_url, review_status, occurred_at, details)
+         VALUES ($1, $2, 'observation', $3, $4, $5, $6, 'pending', now(), $7)`,
+        [
+          eventId,
+          taskId,
+          waypoint,
+          plate,
+          confidence,
+          saved.publicPath,
+          JSON.stringify({
+            source: 'console_scan_test',
+            vehicleId,
+            plateMatch: null,
+          }),
+        ],
+      );
+      await client.query(
+        `INSERT INTO reviews (id, event_id, reason, status)
+         VALUES ($1, $2, 'console_scan_test', 'pending')`,
+        [reviewId, eventId],
+      );
+      await client.query(
+        `INSERT INTO violations
+           (id, event_id, plate, violation_type, task_id, vehicle_id, waypoint, priority, disposition, evidence_url, occurred_at)
+         VALUES ($1, $2, $3, 'suspected_external', $4, $5, $6, 'normal', 'pending', $7, now())`,
+        [violationId, eventId, plate, taskId, vehicleId, waypoint, saved.publicPath],
+      );
+      return { taskId, eventId, reviewId, violationId };
+    });
+
+    hub.publishPatrol?.({
+      type: 'violation_alert',
+      violationId: created.violationId,
+      vehicleId,
+      plate,
+      evidenceUrl: saved.publicPath,
+      source: 'console_scan_test',
+      confidence,
+      eventId: created.eventId,
+    });
+    await audit('violation.console_scan_test', 'success', user.id, vehicleId, {
+      violationId: created.violationId,
+      eventId: created.eventId,
+      reviewId: created.reviewId,
+      plate,
+      evidenceUrl: saved.publicPath,
+      confidence,
+    });
+    return {
+      violation: {
+        id: created.violationId,
+        plate,
+        evidenceUrl: saved.publicPath,
+        deviceId: vehicleId,
+        waypoint,
+        status: 'pending',
+        type: 'suspected_external',
+      },
+      review: {
+        id: created.reviewId,
+        eventId: created.eventId,
+      },
+    };
+  });
+
   // Observation coords preferred; else nearest telemetry within ±60s of violation time.
   const VIOLATION_FROM = `
        FROM violations v
@@ -1052,7 +1199,8 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     const user = await requireUser(request);
     const result = await db.query(
       `SELECT r.id, r.event_id AS "eventId", r.reason, r.created_at AS "occurredAt",
-              e.plate, e.waypoint, e.evidence_url AS "evidenceUrl",
+              e.plate, e.waypoint, e.evidence_url AS "evidenceUrl", e.confidence,
+              e.details->'plateMatch' AS "plateMatch",
               v.name AS "deviceName"
        FROM reviews r
        JOIN patrol_events e ON e.id = r.event_id
@@ -1085,6 +1233,12 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     if (!event.rows[0]) throw httpError('Event not found', 404);
     if (!await canAccessVehicle(user, event.rows[0].vehicle_id)) throw httpError('Vehicle access denied', 403);
 
+    const violationDisposition =
+      reviewStatus === 'confirmed' ? 'confirmed'
+        : reviewStatus === 'false_positive' ? 'false_positive'
+          : reviewStatus === 'whitelist' || reviewStatus === 'external' ? 'resolved'
+            : 'confirmed';
+
     await db.transaction(async (client) => {
       await client.query(
         `UPDATE reviews SET status='resolved', resolver_id=$1, resolution=$2, resolved_at=now()
@@ -1094,6 +1248,11 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
       await client.query(
         `UPDATE patrol_events SET review_status=$1, plate=COALESCE($2, plate) WHERE id=$3`,
         [reviewStatus, plate, eventId],
+      );
+      // Keep violations list in sync with review outcomes (confirm / false_positive / whitelist / visitor).
+      await client.query(
+        `UPDATE violations SET disposition=$1 WHERE event_id=$2`,
+        [violationDisposition, eventId],
       );
       if (resolution === 'whitelist' && plate) {
         const whitelistId = await ensureGlobalWhitelist(client, user);
@@ -1105,7 +1264,7 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
         );
       }
     });
-    await audit('review.resolve', 'success', user.id, event.rows[0].vehicle_id, { eventId, resolution, plate });
+    await audit('review.resolve', 'success', user.id, event.rows[0].vehicle_id, { eventId, resolution, plate, violationDisposition });
     return { ok: true as const };
   });
 

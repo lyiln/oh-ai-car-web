@@ -12,6 +12,8 @@ scripts/.local/
 vendor/oh-ai-car-YOLOv5/
 yolo-v5/
 edge-agent/evidence-cache/
+backend/data/evidence/
+data/evidence/
 edge-agent/__pycache__/
 scripts/.local-plate-task.json
 *.pt

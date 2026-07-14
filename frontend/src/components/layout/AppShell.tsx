@@ -1,7 +1,8 @@
 import { Car } from 'lucide-react';
-import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
+import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext.js';
 import { useSelectedDevice } from '../../contexts/SelectedDeviceContext.js';
+import { KeepAliveOutlet } from './KeepAliveOutlet.js';
 
 const NAV = [
   { to: '/dashboard', label: '工作台' },
@@ -68,7 +69,7 @@ export function AppShell() {
           </div>
         </header>
         <div className="shell-content">
-          <Outlet />
+          <KeepAliveOutlet />
         </div>
         <footer className="shell-device-bar">
           <span className={`status-dot ${online ? 'online' : ''}`} aria-hidden="true" />
