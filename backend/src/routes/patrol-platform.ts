@@ -645,16 +645,30 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
       return { ok: true as const, forced: true };
     }
 
-    const stopped = await db.query(
-      `UPDATE patrol_tasks SET status='cancellation_requested', stop_requested_at=now()
-       WHERE id=$1 AND status IN ('queued','running') RETURNING id`,
+    const stopped = await db.query<{ id: string; status: string }>(
+      `UPDATE patrol_tasks
+         SET status = CASE WHEN status='queued' THEN 'stopped' ELSE 'cancellation_requested' END,
+             stop_requested_at = now(),
+             stop_confirmed_at = CASE WHEN status='queued' THEN now() ELSE stop_confirmed_at END,
+             zero_velocity_confirmed_at = CASE WHEN status='queued' THEN now() ELSE zero_velocity_confirmed_at END,
+             finished_at = CASE WHEN status='queued' THEN now() ELSE finished_at END
+       WHERE id=$1 AND status IN ('queued','running')
+       RETURNING id, status`,
       [task.id],
     );
     if (!stopped.rowCount) throw httpError('Task cannot be stopped', 409);
-    await db.query("INSERT INTO patrol_events (id,task_id,event_type,details) VALUES ($1,$2,'status',$3)", [randomUUID(), task.id, JSON.stringify({ status: 'cancellation_requested', source: 'operator' })]);
+    const nextStatus = stopped.rows[0].status;
+    await db.query(
+      "INSERT INTO patrol_events (id,task_id,event_type,details) VALUES ($1,$2,'status',$3)",
+      [
+        randomUUID(),
+        task.id,
+        JSON.stringify({ status: nextStatus, source: 'operator', zeroVelocity: nextStatus === 'stopped' }),
+      ],
+    );
     await audit('patrol.stop', 'success', user.id, task.vehicle_id, { taskId: task.id });
-    hub.publishPatrol?.({ type: 'patrol_status', taskId: task.id, vehicleId: task.vehicle_id, deviceId: task.vehicle_id, status: 'cancellation_requested' });
-    return { ok: true as const };
+    hub.publishPatrol?.({ type: 'patrol_status', taskId: task.id, vehicleId: task.vehicle_id, deviceId: task.vehicle_id, status: nextStatus });
+    return { ok: true as const, status: nextStatus };
   });
 
   app.get('/api/patrol/status', async (request) => {
