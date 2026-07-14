@@ -515,3 +515,91 @@ ALTER TABLE patrol_events ADD COLUMN IF NOT EXISTS waypoint_id uuid REFERENCES p
 ALTER TABLE patrol_routes ADD COLUMN IF NOT EXISTS code text;
 UPDATE patrol_routes SET code = 'route-' || substr(id::text, 1, 8) WHERE code IS NULL;
 `;
+
+export const migration012 = `
+CREATE TABLE IF NOT EXISTS ai_daily_reports (
+  id uuid PRIMARY KEY,
+  report_date date NOT NULL,
+  vehicle_id uuid REFERENCES vehicles(id) ON DELETE SET NULL,
+  created_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  stats jsonb NOT NULL DEFAULT '{}'::jsonb,
+  narrative_markdown text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ai_daily_reports_date_idx ON ai_daily_reports(report_date DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS ai_daily_reports_vehicle_date_idx ON ai_daily_reports(vehicle_id, report_date DESC);
+`;
+
+export const migration013 = `
+ALTER TABLE whitelist_entries
+  ADD COLUMN IF NOT EXISTS phone text NOT NULL DEFAULT '';
+
+ALTER TABLE response_tasks
+  ADD COLUMN IF NOT EXISTS owner_phone text NOT NULL DEFAULT '';
+ALTER TABLE response_tasks
+  ADD COLUMN IF NOT EXISTS sms_status text NOT NULL DEFAULT 'none';
+ALTER TABLE response_tasks
+  ADD COLUMN IF NOT EXISTS sms_sent_at timestamptz;
+ALTER TABLE response_tasks
+  ADD COLUMN IF NOT EXISTS sms_error text NOT NULL DEFAULT '';
+
+DO $$ BEGIN
+  ALTER TABLE response_tasks DROP CONSTRAINT IF EXISTS response_tasks_sms_status_check;
+  ALTER TABLE response_tasks ADD CONSTRAINT response_tasks_sms_status_check
+    CHECK (sms_status IN ('none','skipped_no_phone','skipped_not_configured','queued','sent','failed'));
+EXCEPTION WHEN others THEN NULL;
+END $$;
+
+CREATE TABLE IF NOT EXISTS sms_notifications (
+  id uuid PRIMARY KEY,
+  response_task_id uuid REFERENCES response_tasks(id) ON DELETE SET NULL,
+  plate text NOT NULL,
+  phone text NOT NULL,
+  body text NOT NULL,
+  provider text NOT NULL DEFAULT 'aliyun',
+  provider_request_id text,
+  status text NOT NULL CHECK (status IN ('sent','failed','skipped')),
+  error text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS sms_notifications_created_idx ON sms_notifications(created_at DESC);
+CREATE INDEX IF NOT EXISTS sms_notifications_response_task_idx ON sms_notifications(response_task_id);
+`;
+
+export const migration014 = `
+ALTER TABLE whitelist_entries
+  ADD COLUMN IF NOT EXISTS wx_uid text NOT NULL DEFAULT '';
+
+ALTER TABLE response_tasks
+  ADD COLUMN IF NOT EXISTS owner_wx_uid text NOT NULL DEFAULT '';
+
+DO $$ BEGIN
+  ALTER TABLE response_tasks DROP CONSTRAINT IF EXISTS response_tasks_sms_status_check;
+  ALTER TABLE response_tasks ADD CONSTRAINT response_tasks_sms_status_check
+    CHECK (sms_status IN (
+      'none','skipped_no_phone','skipped_no_uid','skipped_not_configured','queued','sent','failed'
+    ));
+EXCEPTION WHEN others THEN NULL;
+END $$;
+`;
+
+export const migration015 = `
+ALTER TABLE whitelist_entries DROP COLUMN IF EXISTS phone;
+ALTER TABLE response_tasks DROP COLUMN IF EXISTS owner_phone;
+
+UPDATE response_tasks SET sms_status='skipped_no_uid' WHERE sms_status='skipped_no_phone';
+
+DO $$ BEGIN
+  ALTER TABLE response_tasks DROP CONSTRAINT IF EXISTS response_tasks_sms_status_check;
+  ALTER TABLE response_tasks ADD CONSTRAINT response_tasks_sms_status_check
+    CHECK (sms_status IN (
+      'none','skipped_no_uid','skipped_not_configured','queued','sent','failed'
+    ));
+EXCEPTION WHEN others THEN NULL;
+END $$;
+
+ALTER TABLE sms_notifications ADD COLUMN IF NOT EXISTS wx_uid text NOT NULL DEFAULT '';
+UPDATE sms_notifications SET wx_uid = phone WHERE wx_uid = '' AND phone IS NOT NULL AND phone <> '';
+ALTER TABLE sms_notifications DROP COLUMN IF EXISTS phone;
+ALTER TABLE sms_notifications ALTER COLUMN provider SET DEFAULT 'wxpusher';
+`;

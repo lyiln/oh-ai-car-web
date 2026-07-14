@@ -1,5 +1,5 @@
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
-import { migration001, migration002, migration003, migration004, migration005, migration006, migration007, migration008, migration009, migration010, migration011 } from './schema.js';
+import { migration001, migration002, migration003, migration004, migration005, migration006, migration007, migration008, migration009, migration010, migration011, migration012, migration013, migration014, migration015 } from './schema.js';
 
 export class Database {
   readonly pool: Pool;
@@ -25,6 +25,10 @@ export class Database {
       { version: '009-global-whitelist', sql: migration009 },
       { version: '010-whitelist-entry-fields', sql: migration010 },
       { version: '011-patrol-event-details', sql: migration011 },
+      { version: '012-ai-agents', sql: migration012 },
+      { version: '013-whitelist-phone-sms', sql: migration013 },
+      { version: '014-wxpusher-uid', sql: migration014 },
+      { version: '015-drop-phone-aliyun', sql: migration015 },
     ]) {
       const applied = await this.pool.query<{ version: string }>('SELECT version FROM schema_migrations WHERE version=$1', [migration.version]);
       if (applied.rowCount) continue;

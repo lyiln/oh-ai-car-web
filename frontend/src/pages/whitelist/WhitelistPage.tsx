@@ -9,6 +9,7 @@ type WhitelistForm = {
   owner: string;
   building: string;
   parkingSpot: string;
+  wxUid: string;
   vehicleType: 'private' | 'visitor';
   validUntil: string;
 };
@@ -18,6 +19,7 @@ const empty: WhitelistForm = {
   owner: '',
   building: '',
   parkingSpot: '',
+  wxUid: '',
   vehicleType: 'private',
   validUntil: '',
 };
@@ -46,6 +48,7 @@ function entryToForm(entry: WhitelistEntry): WhitelistForm {
     owner: entry.owner ?? '',
     building: entry.building ?? '',
     parkingSpot: entry.parkingSpot ?? '',
+    wxUid: entry.wxUid ?? '',
     vehicleType: entry.vehicleType === 'visitor' ? 'visitor' : 'private',
     validUntil: toDateInput(entry.validUntil),
   };
@@ -108,6 +111,7 @@ export function WhitelistPage() {
         owner: form.owner || null,
         building: form.building || null,
         parkingSpot: form.parkingSpot || null,
+        wxUid: form.wxUid || null,
         vehicleType: form.vehicleType,
         validUntil: form.validUntil || null,
       };
@@ -183,7 +187,7 @@ export function WhitelistPage() {
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="车牌 / 车主 / 楼栋 / 车位"
+            placeholder="车牌 / 车主 / 楼栋 / 车位 / WxUID"
           />
         </label>
       </section>
@@ -205,6 +209,7 @@ export function WhitelistPage() {
                 <th>车主</th>
                 <th>楼栋</th>
                 <th>车位</th>
+                <th>WxUID</th>
                 <th>类型</th>
                 <th>有效期</th>
                 {isAdmin && <th>操作</th>}
@@ -217,6 +222,7 @@ export function WhitelistPage() {
                   <td>{displayText(entry.owner)}</td>
                   <td>{displayText(entry.building)}</td>
                   <td>{displayText(entry.parkingSpot)}</td>
+                  <td>{displayText(entry.wxUid)}</td>
                   <td>{vehicleTypeLabel(entry.vehicleType)}</td>
                   <td>{entry.validUntil ? new Date(entry.validUntil).toLocaleDateString() : '长期'}</td>
                   {isAdmin && (
@@ -240,6 +246,7 @@ export function WhitelistPage() {
           <label>车主<input value={form.owner} onChange={(e) => setForm({ ...form, owner: e.target.value })} /></label>
           <label>楼栋<input value={form.building} onChange={(e) => setForm({ ...form, building: e.target.value })} /></label>
           <label>车位<input value={form.parkingSpot} onChange={(e) => setForm({ ...form, parkingSpot: e.target.value })} /></label>
+          <label>WxPusher UID<input value={form.wxUid} onChange={(e) => setForm({ ...form, wxUid: e.target.value })} placeholder="关注应用后获得的 UID_xxx，可选" /></label>
           <label>
             车辆类型
             <select value={form.vehicleType} onChange={(e) => setForm({ ...form, vehicleType: e.target.value as WhitelistForm['vehicleType'] })}>
@@ -256,7 +263,7 @@ export function WhitelistPage() {
       <FormModal open={importOpen} title="批量导入白名单" onClose={closeImportDrawer}>
         <form className="stack-form" onSubmit={(event) => void importCsv(event)}>
           <label className="stack-form">
-            粘贴 CSV（plate,owner,building,parkingSpot,vehicleType,validUntil）
+            粘贴 CSV（plate,owner,building,parkingSpot,wxUid,vehicleType,validUntil）
             <textarea rows={10} value={csv} onChange={(e) => setCsv(e.target.value)} required />
           </label>
           {error && <p className="error">{error}</p>}

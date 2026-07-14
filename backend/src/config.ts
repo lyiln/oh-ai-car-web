@@ -15,6 +15,9 @@ export interface Config {
   aiBaseUrl: string | undefined;
   aiApiKey: string | undefined;
   aiModel: string;
+  aiModelFast: string;
+  wxPusherAppToken: string | undefined;
+  wxPusherEndpoint: string;
 }
 
 export function loadConfig(overrides: Partial<Config> = {}): Config {
@@ -41,7 +44,10 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     otpExposeForClientDelivery: process.env.OTP_EXPOSE_FOR_CLIENT_DELIVERY === 'true',
     aiBaseUrl: process.env.AI_BASE_URL,
     aiApiKey: process.env.AI_API_KEY,
-    aiModel: process.env.AI_MODEL ?? 'gpt-4.1-mini',
+    aiModel: process.env.AI_MODEL ?? 'deepseek-v4-pro',
+    aiModelFast: process.env.AI_MODEL_FAST ?? 'deepseek-v4-flash',
+    wxPusherAppToken: process.env.WXPUSHER_APP_TOKEN,
+    wxPusherEndpoint: process.env.WXPUSHER_ENDPOINT ?? 'https://wxpusher.zjiecode.com',
     ...overrides,
   };
   if (process.env.NODE_ENV === 'production' && !config.publicOrigin) throw new Error('PLATFORM_PUBLIC_ORIGIN is required in production');
