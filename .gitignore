@@ -5,6 +5,7 @@ coverage/
 *.log
 .env*
 !.env.example
+edge-agent/agent.env
 .dbg/
 debug-paddle-pir-ocr.md
 scripts/.local-jetson-gps.json

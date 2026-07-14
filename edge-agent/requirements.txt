@@ -1,2 +1,9 @@
+# ROS 2 packages (only needed on the vehicle / companion computer).
+# Stage C sim mode (NAV_MODE=sim or npm run sim:patrol) needs no ROS packages.
 rclpy
 sensor_msgs
+geometry_msgs
+nav_msgs
+# NAV_MODE=nav2 only:
+nav2_msgs
+action_msgs

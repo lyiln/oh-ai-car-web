@@ -131,7 +131,8 @@ export async function createApp(services: AppServices = {}) {
   const hub = new RealtimeHub();
   const authRateLimits = services.authRateLimits ?? { loginMax: 10, otpRequestMax: 5, otpVerifyMax: 5 };
   const pendingRateLimitAudits = new WeakMap<FastifyRequest, { action: string; metadata: Record<string, unknown> }>();
-  const app = Fastify({ logger: true, trustProxy: config.trustProxy });
+  // bodyLimit 放宽以允许管理员上传楼道底图（data URL）。
+  const app = Fastify({ logger: true, trustProxy: config.trustProxy, bodyLimit: 12 * 1024 * 1024 });
   await app.register(cookie);
   await app.register(rateLimit, {
     global: false,
@@ -449,6 +450,26 @@ export async function createApp(services: AppServices = {}) {
     );
     return { routes: result.rows };
   });
+  // 删除该车全部巡航路线（级联删航点）；用于清掉地图上持久蓝点。
+  app.delete('/api/vehicles/:id/patrol-routes', async (request) => {
+    const admin = await requireAdmin(request);
+    const vehicleId = (request.params as { id: string }).id;
+    const deleted = await db.transaction(async (client) => {
+      // 清除蓝点时一并结束卡住的活跃巡检（含 cancellation_requested），避免永远删不掉。
+      await client.query(
+        `UPDATE patrol_tasks
+         SET status='stopped', finished_at=COALESCE(finished_at, now()),
+             stop_confirmed_at=COALESCE(stop_confirmed_at, now()),
+             failure_reason=COALESCE(failure_reason, 'cleared with routes')
+         WHERE vehicle_id=$1 AND status IN ('queued','running','cancellation_requested')`,
+        [vehicleId],
+      );
+      const result = await client.query('DELETE FROM patrol_routes WHERE vehicle_id=$1 RETURNING id', [vehicleId]);
+      return result.rowCount ?? 0;
+    });
+    await audit('patrol-route.clear', 'success', admin.id, vehicleId, { count: deleted });
+    return { ok: true, deleted };
+  });
   app.post('/api/vehicles/:id/patrol-routes', async (request) => {
     const admin = await requireAdmin(request); const vehicleId = (request.params as { id: string }).id; const body = object(request.body);
     const name = string(body?.name, 'name'); const mapVersion = string(body?.mapVersion, 'mapVersion'); const yaml = string(body?.yaml, 'yaml');
@@ -458,7 +479,7 @@ export async function createApp(services: AppServices = {}) {
       if (!vehicle.rowCount) throw Object.assign(new Error('Vehicle not found'), { statusCode: 404 });
       const duplicate = await client.query('SELECT id FROM patrol_routes WHERE vehicle_id=$1 AND name=$2 AND map_version=$3', [vehicleId, name, mapVersion]);
       if (duplicate.rowCount) throw Object.assign(new Error('该设备已存在相同名称和地图版本的路线'), { statusCode: 409 });
-      await client.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [routeId, vehicleId, name, mapVersion, yaml, admin.id]);
+      await client.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id,code) VALUES ($1,$2,$3,$4,$5,$6,$7)', [routeId, vehicleId, name, mapVersion, yaml, admin.id, `route-${routeId.replaceAll('-', '')}`]);
       for (const [ordinal, waypoint] of waypoints.entries()) {
         await client.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds,no_parking_roi) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)', [randomUUID(), routeId, ordinal, waypoint.name, waypoint.x, waypoint.y, waypoint.yaw, waypoint.dwellSeconds, waypoint.noParkingRoi ? JSON.stringify(waypoint.noParkingRoi) : null]);
       }
@@ -473,6 +494,8 @@ export async function createApp(services: AppServices = {}) {
     if (patrol.rowCount) throw Object.assign(new Error('Patrol is active or awaiting zero-velocity stop confirmation'), { statusCode: 409 });
     const response = await client.query("SELECT status FROM response_tasks WHERE assigned_vehicle_id=$1 AND status IN ('assigned','navigating','arrived','cancellation_requested') LIMIT 1", [vehicleId]);
     if (response.rowCount) throw Object.assign(new Error('Doorstep response is active or awaiting safe completion'), { statusCode: 409 });
+    const gotoActive = await client.query("SELECT 1 FROM goto_goals WHERE vehicle_id=$1 AND status IN ('queued','navigating','cancellation_requested') LIMIT 1", [vehicleId]);
+    if (gotoActive.rowCount) throw Object.assign(new Error('Goto navigation is active; cancel it first'), { statusCode: 409 });
     await client.query("UPDATE control_leases SET released_at=now(),release_reason='expired' WHERE vehicle_id=$1 AND released_at IS NULL AND expires_at<=now()", [vehicleId]);
     const existing = await client.query<{ user_id: string }>('SELECT user_id FROM control_leases WHERE vehicle_id=$1 AND released_at IS NULL AND expires_at>now() LIMIT 1', [vehicleId]);
     if (existing.rows[0] && existing.rows[0].user_id !== user.id) throw Object.assign(new Error('Vehicle is controlled by another operator'), { statusCode: 409 });
@@ -493,6 +516,38 @@ export async function createApp(services: AppServices = {}) {
     const credential = await db.query<{ vehicle_id: string; secret_hash: string }>('SELECT vehicle_id,secret_hash FROM device_credentials WHERE id=$1 AND active=true', [credentialId]); if (!credential.rows[0] || credential.rows[0].secret_hash !== hashSecret(secret)) return reply.status(401).send({ error: 'Invalid device credential' });
     const body = object(request.body); if (!Array.isArray(body?.points) || !body.points.length) throw new Error('points must be a non-empty array'); const vehicleId = credential.rows[0].vehicle_id; let accepted = 0;
     for (const raw of body.points) { const point = object(raw); const occurredAt = string(point?.occurredAt, 'occurredAt'); const longitude = number(point?.longitude, 'longitude', -180, 180); const latitude = number(point?.latitude, 'latitude', -90, 90); const optional = (key: string, min = -Infinity, max = Infinity) => point?.[key] === undefined || point?.[key] === null ? null : number(point?.[key], key, min, max); const row = await db.query('INSERT INTO telemetry_points (id,vehicle_id,occurred_at,longitude,latitude,altitude_m,accuracy_m,speed_kph,heading_deg,battery_pct,mode) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (vehicle_id,occurred_at) DO NOTHING RETURNING id', [randomUUID(), vehicleId, occurredAt, longitude, latitude, optional('altitudeM'), optional('accuracyM', 0), optional('speedKph', 0), optional('headingDeg', 0, 360), optional('batteryPct', 0, 100), typeof point?.mode === 'string' ? point.mode : null]); if (row.rowCount) { accepted++; hub.publish(vehicleId, { occurredAt, longitude, latitude, altitudeM: optional('altitudeM'), accuracyM: optional('accuracyM', 0), speedKph: optional('speedKph', 0), headingDeg: optional('headingDeg', 0, 360), batteryPct: optional('batteryPct', 0, 100), mode: typeof point?.mode === 'string' ? point.mode : null }); } }
+    await db.query('UPDATE vehicles SET last_seen_at=now() WHERE id=$1', [vehicleId]);
+    return { accepted };
+  });
+  // 车端上报 map 坐标位姿（/amcl_pose 或 /odom）。写库并广播 frame:'map' 的 pose_update。
+  app.post('/device/v1/pose', async (request) => {
+    const vehicleId = await deviceVehicle(request);
+    const body = object(request.body);
+    const raw = Array.isArray(body?.points) ? body.points : body ? [body] : [];
+    if (!raw.length) throw new Error('points must be a non-empty array');
+    let accepted = 0;
+    let latest: { occurredAt: string; x: number; y: number; yaw: number; mapVersion: string | null } | null = null;
+    for (const entry of raw) {
+      const point = object(entry);
+      const occurredAt = string(point?.occurredAt, 'occurredAt');
+      if (Number.isNaN(new Date(occurredAt).getTime())) throw Object.assign(new Error('occurredAt is invalid'), { statusCode: 400 });
+      const x = number(point?.x, 'x', -1e6, 1e6);
+      const y = number(point?.y, 'y', -1e6, 1e6);
+      const yaw = number(point?.yaw, 'yaw', -Math.PI * 2, Math.PI * 2);
+      const mapVersion = typeof point?.mapVersion === 'string' ? point.mapVersion : null;
+      // UPSERT so live stream still advances when stamps collide.
+      const row = await db.query(
+        `INSERT INTO pose_points (id,vehicle_id,occurred_at,x,y,yaw,map_version)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT (vehicle_id,occurred_at) DO UPDATE SET x=EXCLUDED.x,y=EXCLUDED.y,yaw=EXCLUDED.yaw,map_version=EXCLUDED.map_version
+         RETURNING id`,
+        [randomUUID(), vehicleId, occurredAt, x, y, yaw, mapVersion],
+      );
+      if (row.rowCount) accepted++;
+      latest = { occurredAt, x, y, yaw, mapVersion };
+    }
+    // Always broadcast the newest sample so the floor-map marker updates even if DB insert was a no-op historically.
+    if (latest) hub.publish(vehicleId, { frame: 'map', occurredAt: latest.occurredAt, x: latest.x, y: latest.y, yaw: latest.yaw, mapVersion: latest.mapVersion });
     await db.query('UPDATE vehicles SET last_seen_at=now() WHERE id=$1', [vehicleId]);
     return { accepted };
   });
@@ -565,6 +620,17 @@ export async function createApp(services: AppServices = {}) {
     const waypoints = await db.query('SELECT id,ordinal,name,x,y,yaw,dwell_seconds AS "dwellSeconds",no_parking_roi AS "noParkingRoi" FROM patrol_waypoints WHERE route_id=$1 ORDER BY ordinal', [task.route_id]);
     hub.publishPatrol({ type: 'patrol_status', taskId: task.id, vehicleId, status: 'running' });
     return { task: { id: task.id, vehicleId, waypoints: waypoints.rows } };
+  });
+  // 调度器导航中轮询本车任务状态，用于检测 cancellation_requested。
+  app.get('/device/v1/patrol/tasks/:id', async (request) => {
+    const vehicleId = await deviceVehicle(request);
+    const taskId = (request.params as { id: string }).id;
+    const result = await db.query<{ id: string; status: string; vehicle_id: string }>(
+      'SELECT id, status, vehicle_id FROM patrol_tasks WHERE id=$1 AND vehicle_id=$2',
+      [taskId, vehicleId],
+    );
+    if (!result.rows[0]) throw Object.assign(new Error('Task not found'), { statusCode: 404 });
+    return { task: { id: result.rows[0].id, vehicleId: result.rows[0].vehicle_id, status: result.rows[0].status } };
   });
   app.post('/device/v1/patrol/tasks/:id/events', async (request) => {
     const vehicleId = await deviceVehicle(request);
@@ -688,7 +754,305 @@ export async function createApp(services: AppServices = {}) {
     await db.query("INSERT INTO patrol_events (id,task_id,event_type,waypoint_id,details) VALUES ($1,$2,'waypoint',$3,$4)", [randomUUID(), taskId, body.waypointId, JSON.stringify(body)]);
     return { ok: true };
   });
+
+  function gotoDto(row: { id: string; vehicle_id: string; x: number; y: number; yaw: number; status: string; created_at: Date; claimed_at: Date | null; finished_at: Date | null; failure_reason: string | null }) {
+    return {
+      id: row.id,
+      vehicleId: row.vehicle_id,
+      x: Number(row.x),
+      y: Number(row.y),
+      yaw: Number(row.yaw),
+      status: row.status,
+      createdAt: row.created_at.toISOString(),
+      claimedAt: row.claimed_at?.toISOString() ?? null,
+      finishedAt: row.finished_at?.toISOString() ?? null,
+      failureReason: row.failure_reason,
+    };
+  }
+
+  // 浏览器：单点前往（对齐 RViz 2D Goal Pose → Nav2 NavigateToPose）
+  app.get('/api/vehicles/:id/goto/active', async (request) => {
+    const user = await requireUser(request);
+    const vehicleId = (request.params as { id: string }).id;
+    if (!await canAccessVehicle(user, vehicleId)) throw Object.assign(new Error('Vehicle access denied'), { statusCode: 403 });
+    const result = await db.query<{ id: string; vehicle_id: string; x: number; y: number; yaw: number; status: string; created_at: Date; claimed_at: Date | null; finished_at: Date | null; failure_reason: string | null }>(
+      "SELECT * FROM goto_goals WHERE vehicle_id=$1 AND status IN ('queued','navigating','cancellation_requested') ORDER BY created_at DESC LIMIT 1",
+      [vehicleId],
+    );
+    return { goal: result.rows[0] ? gotoDto(result.rows[0]) : null };
+  });
+
+  app.post('/api/vehicles/:id/goto', async (request) => {
+    const user = await requireUser(request);
+    const vehicleId = (request.params as { id: string }).id;
+    if (!await canAccessVehicle(user, vehicleId)) throw Object.assign(new Error('Vehicle access denied'), { statusCode: 403 });
+    const body = object(request.body);
+    const x = number(body?.x, 'x', -1e6, 1e6);
+    const y = number(body?.y, 'y', -1e6, 1e6);
+    const yaw = body?.yaw === undefined ? 0 : number(body?.yaw, 'yaw', -Math.PI * 2, Math.PI * 2);
+    const goalId = randomUUID();
+    const row = await db.transaction(async (client) => {
+      const vehicle = await client.query('SELECT id FROM vehicles WHERE id=$1 AND archived=false FOR UPDATE', [vehicleId]);
+      if (!vehicle.rowCount) throw Object.assign(new Error('Vehicle not found'), { statusCode: 404 });
+      const patrol = await client.query("SELECT 1 FROM patrol_tasks WHERE vehicle_id=$1 AND status IN ('queued','running','cancellation_requested') LIMIT 1", [vehicleId]);
+      if (patrol.rowCount) throw Object.assign(new Error('Patrol is active; stop patrol before goto'), { statusCode: 409 });
+      const response = await client.query("SELECT 1 FROM response_tasks WHERE assigned_vehicle_id=$1 AND status IN ('assigned','navigating','arrived','cancellation_requested') LIMIT 1", [vehicleId]);
+      if (response.rowCount) throw Object.assign(new Error('Doorstep response is active'), { statusCode: 409 });
+      const lease = await client.query('SELECT 1 FROM control_leases WHERE vehicle_id=$1 AND released_at IS NULL AND expires_at>now() LIMIT 1', [vehicleId]);
+      if (lease.rowCount) throw Object.assign(new Error('Manual control lease is active; release console control first'), { statusCode: 409 });
+      // 新目标覆盖旧活跃目标（贴近 RViz 连续点 Goal）
+      await client.query(
+        "UPDATE goto_goals SET status='cancelled',finished_at=now(),failure_reason='superseded' WHERE vehicle_id=$1 AND status IN ('queued','navigating','cancellation_requested')",
+        [vehicleId],
+      );
+      const inserted = await client.query<{ id: string; vehicle_id: string; x: number; y: number; yaw: number; status: string; created_at: Date; claimed_at: Date | null; finished_at: Date | null; failure_reason: string | null }>(
+        `INSERT INTO goto_goals (id,vehicle_id,x,y,yaw,status,created_by_user_id)
+         VALUES ($1,$2,$3,$4,$5,'queued',$6)
+         RETURNING *`,
+        [goalId, vehicleId, x, y, yaw, user.id],
+      );
+      return inserted.rows[0];
+    });
+    await audit('goto.create', 'success', user.id, vehicleId, { goalId, x, y, yaw });
+    hub.publishPatrol({ type: 'goto_status', vehicleId, goalId, status: 'queued', x, y, yaw });
+    return { goal: gotoDto(row) };
+  });
+
+  app.post('/api/vehicles/:id/goto/cancel', async (request) => {
+    const user = await requireUser(request);
+    const vehicleId = (request.params as { id: string }).id;
+    if (!await canAccessVehicle(user, vehicleId)) throw Object.assign(new Error('Vehicle access denied'), { statusCode: 403 });
+    const body = object(request.body ?? {}) ?? {};
+    const force = body.force === true;
+    // force：直接结束（含卡在 cancellation_requested、代理离线无法确认停车的情况）
+    const result = force
+      ? await db.query<{ id: string; status: string }>(
+          `UPDATE goto_goals SET status='cancelled', finished_at=now(), failure_reason=COALESCE(failure_reason,'force_cancelled')
+           WHERE vehicle_id=$1 AND status IN ('queued','navigating','cancellation_requested')
+           RETURNING id, status`,
+          [vehicleId],
+        )
+      : await db.query<{ id: string; status: string }>(
+          `UPDATE goto_goals SET
+             status = CASE WHEN status='queued' THEN 'cancelled' ELSE 'cancellation_requested' END,
+             finished_at = CASE WHEN status='queued' THEN now() ELSE finished_at END
+           WHERE vehicle_id=$1 AND status IN ('queued','navigating')
+           RETURNING id, status`,
+          [vehicleId],
+        );
+    if (!result.rows[0]) throw Object.assign(new Error('No active goto goal'), { statusCode: 404 });
+    await audit('goto.cancel', 'success', user.id, vehicleId, { goalId: result.rows[0].id, status: result.rows[0].status, force });
+    hub.publishPatrol({ type: 'goto_status', vehicleId, goalId: result.rows[0].id, status: result.rows[0].status });
+    return { goal: { id: result.rows[0].id, status: result.rows[0].status }, forced: force };
+  });
+
+  // 设备：领取并完成单点前往
+  app.get('/device/v1/goto/next', async (request) => {
+    const vehicleId = await deviceVehicle(request);
+    const claimed = await db.transaction(async (client) => {
+      const row = await client.query<{ id: string; x: number; y: number; yaw: number }>(
+        `UPDATE goto_goals SET status='navigating',claimed_at=COALESCE(claimed_at,now())
+         WHERE id=(SELECT id FROM goto_goals WHERE vehicle_id=$1 AND status='queued' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED)
+         RETURNING id,x,y,yaw`,
+        [vehicleId],
+      );
+      return row.rows[0] ?? null;
+    });
+    if (!claimed) return { goal: null };
+    hub.publishPatrol({ type: 'goto_status', vehicleId, goalId: claimed.id, status: 'navigating', x: Number(claimed.x), y: Number(claimed.y), yaw: Number(claimed.yaw) });
+    return { goal: { id: claimed.id, vehicleId, x: Number(claimed.x), y: Number(claimed.y), yaw: Number(claimed.yaw) } };
+  });
+
+  app.get('/device/v1/goto/:id', async (request) => {
+    const vehicleId = await deviceVehicle(request);
+    const goalId = (request.params as { id: string }).id;
+    const result = await db.query<{ id: string; status: string; vehicle_id: string; x: number; y: number; yaw: number }>(
+      'SELECT id,status,vehicle_id,x,y,yaw FROM goto_goals WHERE id=$1 AND vehicle_id=$2',
+      [goalId, vehicleId],
+    );
+    if (!result.rows[0]) throw Object.assign(new Error('Goal not found'), { statusCode: 404 });
+    const row = result.rows[0];
+    return { goal: { id: row.id, vehicleId: row.vehicle_id, status: row.status, x: Number(row.x), y: Number(row.y), yaw: Number(row.yaw) } };
+  });
+
+  app.post('/device/v1/goto/:id/events', async (request) => {
+    const vehicleId = await deviceVehicle(request);
+    const goalId = (request.params as { id: string }).id;
+    const body = object(request.body);
+    const task = await db.query<{ status: string }>('SELECT status FROM goto_goals WHERE id=$1 AND vehicle_id=$2', [goalId, vehicleId]);
+    if (!task.rows[0]) throw Object.assign(new Error('Goal not found'), { statusCode: 404 });
+    if (body?.type === 'stop_confirmed' || body?.type === 'cancelled') {
+      if (task.rows[0].status !== 'cancellation_requested' && task.rows[0].status !== 'navigating' && task.rows[0].status !== 'queued') {
+        throw Object.assign(new Error('Goal is not cancellable'), { statusCode: 409 });
+      }
+      await db.query("UPDATE goto_goals SET status='cancelled',finished_at=now() WHERE id=$1", [goalId]);
+      hub.publishPatrol({ type: 'goto_status', vehicleId, goalId, status: 'cancelled' });
+      return { ok: true };
+    }
+    if (task.rows[0].status !== 'navigating' && task.rows[0].status !== 'cancellation_requested') {
+      throw Object.assign(new Error('Goal is not accepting events'), { statusCode: 409 });
+    }
+    if (body?.type === 'arrived') {
+      await db.query("UPDATE goto_goals SET status='arrived',finished_at=now() WHERE id=$1", [goalId]);
+      hub.publishPatrol({ type: 'goto_status', vehicleId, goalId, status: 'arrived' });
+      return { ok: true };
+    }
+    if (body?.type === 'failed') {
+      const reason = typeof body.reason === 'string' ? body.reason : 'navigation failed';
+      await db.query("UPDATE goto_goals SET status='failed',finished_at=now(),failure_reason=$1 WHERE id=$2", [reason, goalId]);
+      hub.publishPatrol({ type: 'goto_status', vehicleId, goalId, status: 'failed', reason });
+      return { ok: true };
+    }
+    throw Object.assign(new Error('Unsupported goto event'), { statusCode: 400 });
+  });
+
+  type NavStateRow = {
+    vehicle_id: string;
+    prepare_requested: boolean;
+    prepare_requested_at: Date | null;
+    initial_pose_x: number | null;
+    initial_pose_y: number | null;
+    initial_pose_yaw: number | null;
+    initial_pose_seq: number;
+    initial_pose_consumed_seq: number;
+    supervisor_seen_at: Date | null;
+    pose_ok: boolean;
+    goto_ok: boolean;
+    nav2_ok: boolean;
+    bringup_ok: boolean;
+    ready: boolean;
+    detail: string;
+    updated_at: Date;
+  };
+
+  async function ensureNavState(vehicleId: string): Promise<NavStateRow> {
+    await db.query('INSERT INTO vehicle_nav_state (vehicle_id) VALUES ($1) ON CONFLICT (vehicle_id) DO NOTHING', [vehicleId]);
+    const result = await db.query<NavStateRow>('SELECT * FROM vehicle_nav_state WHERE vehicle_id=$1', [vehicleId]);
+    return result.rows[0];
+  }
+
+  function navStatusDto(row: NavStateRow) {
+    const supervisorOnline = Boolean(row.supervisor_seen_at && Date.now() - row.supervisor_seen_at.getTime() < 15_000);
+    const pendingInitialPose = row.initial_pose_seq > row.initial_pose_consumed_seq
+      && row.initial_pose_x !== null && row.initial_pose_y !== null;
+    return {
+      prepareRequested: row.prepare_requested,
+      prepareRequestedAt: row.prepare_requested_at?.toISOString() ?? null,
+      supervisorOnline,
+      poseOk: row.pose_ok,
+      gotoOk: row.goto_ok,
+      nav2Ok: row.nav2_ok,
+      bringupOk: row.bringup_ok,
+      ready: row.ready && supervisorOnline,
+      detail: row.detail,
+      updatedAt: row.updated_at.toISOString(),
+      pendingInitialPose,
+      initialPose: pendingInitialPose
+        ? { x: Number(row.initial_pose_x), y: Number(row.initial_pose_y), yaw: Number(row.initial_pose_yaw ?? 0), seq: row.initial_pose_seq }
+        : null,
+      hasInitialPoseOnce: row.initial_pose_seq > 0,
+    };
+  }
+
+  app.get('/api/vehicles/:id/nav/status', async (request) => {
+    const user = await requireUser(request);
+    const vehicleId = (request.params as { id: string }).id;
+    if (!await canAccessVehicle(user, vehicleId)) throw Object.assign(new Error('Vehicle access denied'), { statusCode: 403 });
+    const row = await ensureNavState(vehicleId);
+    return { status: navStatusDto(row) };
+  });
+
+  app.post('/api/vehicles/:id/nav/prepare', async (request) => {
+    const user = await requireUser(request);
+    const vehicleId = (request.params as { id: string }).id;
+    if (!await canAccessVehicle(user, vehicleId)) throw Object.assign(new Error('Vehicle access denied'), { statusCode: 403 });
+    await ensureNavState(vehicleId);
+    await db.query(
+      'UPDATE vehicle_nav_state SET prepare_requested=true, prepare_requested_at=now(), updated_at=now() WHERE vehicle_id=$1',
+      [vehicleId],
+    );
+    await audit('nav.prepare', 'success', user.id, vehicleId);
+    hub.publishPatrol({ type: 'nav_prepare', vehicleId, prepareRequested: true });
+    const row = await ensureNavState(vehicleId);
+    return { status: navStatusDto(row) };
+  });
+
+  // 网页设初始位姿（对齐 RViz 2D Pose Estimate）；车端 supervisor 发布到 /initialpose。
+  app.post('/api/vehicles/:id/nav/initial-pose', async (request) => {
+    const user = await requireUser(request);
+    const vehicleId = (request.params as { id: string }).id;
+    if (!await canAccessVehicle(user, vehicleId)) throw Object.assign(new Error('Vehicle access denied'), { statusCode: 403 });
+    const body = object(request.body);
+    const x = number(body?.x, 'x', -1e6, 1e6);
+    const y = number(body?.y, 'y', -1e6, 1e6);
+    const yaw = body?.yaw === undefined ? 0 : number(body?.yaw, 'yaw', -Math.PI * 2, Math.PI * 2);
+    await ensureNavState(vehicleId);
+    await db.query(
+      `UPDATE vehicle_nav_state SET
+         initial_pose_x=$2, initial_pose_y=$3, initial_pose_yaw=$4,
+         initial_pose_seq = initial_pose_seq + 1,
+         updated_at=now()
+       WHERE vehicle_id=$1`,
+      [vehicleId, x, y, yaw],
+    );
+    await audit('nav.initial-pose', 'success', user.id, vehicleId, { x, y, yaw });
+    hub.publishPatrol({ type: 'nav_initial_pose', vehicleId, x, y, yaw });
+    const row = await ensureNavState(vehicleId);
+    return { status: navStatusDto(row) };
+  });
+
+  app.get('/device/v1/nav/state', async (request) => {
+    const vehicleId = await deviceVehicle(request);
+    const row = await ensureNavState(vehicleId);
+    const pending = row.initial_pose_seq > row.initial_pose_consumed_seq
+      && row.initial_pose_x !== null && row.initial_pose_y !== null;
+    return {
+      prepareRequested: row.prepare_requested,
+      initialPose: pending
+        ? {
+            x: Number(row.initial_pose_x),
+            y: Number(row.initial_pose_y),
+            yaw: Number(row.initial_pose_yaw ?? 0),
+            seq: row.initial_pose_seq,
+          }
+        : null,
+    };
+  });
+
+  app.post('/device/v1/nav/status', async (request) => {
+    const vehicleId = await deviceVehicle(request);
+    const body = object(request.body) ?? {};
+    await ensureNavState(vehicleId);
+    const poseOk = body.poseOk === true;
+    const gotoOk = body.gotoOk === true;
+    const nav2Ok = body.nav2Ok === true;
+    const bringupOk = body.bringupOk === true;
+    const detail = typeof body.detail === 'string' ? body.detail.slice(0, 500) : '';
+    // ready：pose/goto 桥接在线，且 Nav2 action 可用；仅 sim 可用 bringupOk 代替 nav2Ok。
+    const simMode = body.navMode === 'sim' || detail.includes('sim bridges');
+    const ready = poseOk && gotoOk && (nav2Ok || (bringupOk && simMode));
+    const consumedSeq = typeof body.consumedInitialPoseSeq === 'number' && Number.isInteger(body.consumedInitialPoseSeq)
+      ? body.consumedInitialPoseSeq
+      : null;
+    await db.query(
+      `UPDATE vehicle_nav_state SET
+         supervisor_seen_at=now(),
+         pose_ok=$2, goto_ok=$3, nav2_ok=$4, bringup_ok=$5, ready=$6, detail=$7,
+         initial_pose_consumed_seq = CASE
+           WHEN $8::int IS NOT NULL AND $8 >= initial_pose_consumed_seq THEN $8
+           ELSE initial_pose_consumed_seq
+         END,
+         updated_at=now()
+       WHERE vehicle_id=$1`,
+      [vehicleId, poseOk, gotoOk, nav2Ok, bringupOk, ready, detail, consumedSeq],
+    );
+    const row = await ensureNavState(vehicleId);
+    hub.publishPatrol({ type: 'nav_status', vehicleId, ...navStatusDto(row) });
+    return { status: navStatusDto(row) };
+  });
+
   app.get('/api/vehicles/:id/track', async (request) => { const user = await requireUser(request); const vehicleId = (request.params as { id: string }).id; if (!await canAccessVehicle(user, vehicleId)) throw Object.assign(new Error('Vehicle access denied'), { statusCode: 403 }); const query = request.query as { from?: string; to?: string }; const result = await db.query('SELECT occurred_at AS "occurredAt",longitude,latitude,altitude_m AS "altitudeM",accuracy_m AS "accuracyM",speed_kph AS "speedKph",heading_deg AS "headingDeg",battery_pct AS "batteryPct",mode FROM telemetry_points WHERE vehicle_id=$1 AND occurred_at >= COALESCE($2::timestamptz,now()-interval \'24 hours\') AND occurred_at <= COALESCE($3::timestamptz,now()) ORDER BY occurred_at', [vehicleId, query.from ?? null, query.to ?? null]); return { points: result.rows }; });
+  app.get('/api/vehicles/:id/pose-track', async (request) => { const user = await requireUser(request); const vehicleId = (request.params as { id: string }).id; if (!await canAccessVehicle(user, vehicleId)) throw Object.assign(new Error('Vehicle access denied'), { statusCode: 403 }); const query = request.query as { from?: string; to?: string; limit?: string }; const limit = Math.min(Math.max(Number(query.limit) || 1000, 1), 5000); const result = await db.query('SELECT occurred_at AS "occurredAt",x,y,yaw,map_version AS "mapVersion" FROM pose_points WHERE vehicle_id=$1 AND occurred_at >= COALESCE($2::timestamptz,now()-interval \'24 hours\') AND occurred_at <= COALESCE($3::timestamptz,now()) ORDER BY occurred_at DESC LIMIT $4', [vehicleId, query.from ?? null, query.to ?? null, limit]); return { points: result.rows.reverse() }; });
   app.get('/api/audit-logs', async (request) => { await requireAdmin(request); const result = await db.query('SELECT id,actor_user_id AS "actorUserId",vehicle_id AS "vehicleId",action,outcome,metadata,created_at AS "createdAt" FROM audit_logs ORDER BY created_at DESC LIMIT 200'); return { logs: result.rows }; });
 
   app.get('/ws', { websocket: true }, async (socket, request) => { if (!isTrustedOrigin(request.headers.origin)) return socket.close(1008, 'Untrusted WebSocket origin'); const user = await currentUser(request); if (!user) return socket.close(1008, 'Authentication required'); let unsubscribe: (() => void) | undefined; socket.on('message', async (raw: Buffer) => { try { const message = JSON.parse(raw.toString()) as { type?: string; vehicleId?: string }; if (message.type !== 'subscribe' || !message.vehicleId || !await canAccessVehicle(user, message.vehicleId)) return socket.send(JSON.stringify({ type: 'error', message: 'Vehicle access denied' })); unsubscribe?.(); unsubscribe = hub.subscribe(message.vehicleId, socket); socket.send(JSON.stringify({ type: 'subscribed', vehicleId: message.vehicleId })); } catch { socket.send(JSON.stringify({ type: 'error', message: 'Invalid message' })); } }); socket.on('close', () => unsubscribe?.()); });

@@ -875,6 +875,18 @@ h1, h2, p { margin: 0; } h1 { font-size: 28px; font-weight: 700; } h2 { font-siz
   max-height: 620px;
   overflow: auto;
 }
+.floor-map-canvas-wrap {
+  overflow: auto;
+  background: #1f2933;
+  display: block;
+  min-height: 360px;
+}
+.floor-map-canvas {
+  display: block;
+}
+.floor-map-empty {
+  padding: 16px;
+}
 .zone-list {
   list-style: none;
   margin: 0;

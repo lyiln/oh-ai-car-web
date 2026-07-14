@@ -5,6 +5,7 @@ import {
   migration011, migration012, migration012AiAgents, migration013ViolationReviewDisposition,
   migration013WhitelistPhoneSms,
   migration014, migration015, migration016,
+  migration017, migration018, migration019, migration020,
 } from './schema.js';
 
 export class Database {
@@ -44,6 +45,10 @@ export class Database {
         { version: '014-wxpusher-uid', sql: migration014 },
         { version: '015-drop-phone-aliyun', sql: migration015 },
         { version: '016-auth-otp-attempt-limit', sql: migration016 },
+        { version: '017-floor-map-pose', sql: migration017 },
+        { version: '018-patrol-routes-code', sql: migration018 },
+        { version: '019-goto-goals', sql: migration019 },
+        { version: '020-vehicle-nav-state', sql: migration020 },
       ]) {
         await client.query('BEGIN');
         try {

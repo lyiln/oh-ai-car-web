@@ -13,6 +13,7 @@
 | [`change-report-doorstep-response.md`](change-report-doorstep-response.md) | migrations 007–008 和 Web 阶段 0 的实现、回归证据。 |
 | [`web-business-closure-and-ui-plan.md`](web-business-closure-and-ui-plan.md) | 本次网页业务闭环范围与明确延期的 ROS/真车边界。 |
 | [`change-report-web-business-closure-ui.md`](change-report-web-business-closure-ui.md) | 控制台、平台契约和管理端收口记录。 |
+| [`change-report-patrol-scheduler.md`](change-report-patrol-scheduler.md) | 巡航调度器与阶段 C sim 闭环；阶段 D 仅为现场手册。 |
 
 ## 历史变更记录
 
