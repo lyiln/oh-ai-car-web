@@ -8,6 +8,10 @@
    `https://cars.example.edu`). It is required in production and is used to
    restrict CORS and Cookie-authenticated write requests. Use
    `PLATFORM_ALLOWED_ORIGINS` only for additional trusted development origins.
+   Compose sets `PLATFORM_TRUST_PROXY=true` because its backend is reachable only
+   through the bundled single-hop Nginx proxy. Nginx overwrites the forwarded IP
+   headers. Keep this setting false for a directly reachable backend, and never
+   enable it behind a proxy that passes through client-supplied forwarding headers.
    Set `BOOTSTRAP_ADMIN_EMAIL` to a mailbox that can receive administrator
    login codes, and configure all `SMTP_*` values for a controlled SMTP
    account. SMTP credentials and codes stay in the backend runtime; neither
@@ -57,7 +61,8 @@ Run
 environment before deployment; it starts a temporary PostGIS database and does
 not use the deployment data volume.
 
-Use `npm run test:deploy-live` to build the Compose stack, authenticate, verify
-an authorised `/patrol/live` subscription through Nginx, and verify that an
-unauthenticated connection closes with policy code 1008. It creates an isolated
-Compose project and removes its containers and volumes when finished.
+Use `npm run test:deploy-live` to build the Compose stack, verify the frontend
+HTML entry, authenticate, verify an authorised `/patrol/live` subscription
+through Nginx, and verify that an unauthenticated connection closes with policy
+code 1008. It creates an isolated Compose project and removes its containers and
+volumes when finished.

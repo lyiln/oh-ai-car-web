@@ -61,6 +61,19 @@ function httpJson(path, method = 'GET', payload, cookie) {
   });
 }
 
+function httpText(path) {
+  return new Promise((resolve, reject) => {
+    const req = request(`${origin}${path}`, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body }));
+    });
+    req.once('error', reject);
+    req.end();
+  });
+}
+
 async function waitForPlatform() {
   let lastError;
   for (let attempt = 0; attempt < 90; attempt++) {
@@ -99,6 +112,10 @@ function closesUnauthenticated() {
 try {
   compose(['up', '--build', '-d']);
   await waitForPlatform();
+  const frontend = await httpText('/');
+  if (frontend.status !== 200 || !String(frontend.headers['content-type']).includes('text/html') || !frontend.body.includes('id="root"')) {
+    throw new Error(`Frontend entry verification failed with ${frontend.status}`);
+  }
   const login = await httpJson('/api/auth/login', 'POST', { username: 'integration-admin', password: 'integration-password' });
   if (login.status !== 200) throw new Error(`Login failed with ${login.status}`);
   const cookie = String(login.headers['set-cookie']).split(';')[0];
@@ -106,7 +123,7 @@ try {
   if (vehicle.status !== 200) throw new Error(`Vehicle creation failed with ${vehicle.status}`);
   await connectAndSubscribe(cookie, vehicle.body.vehicle.id);
   await closesUnauthenticated();
-  console.log('Deployment live WebSocket verification passed');
+  console.log('Deployment frontend and live WebSocket verification passed');
 } catch (error) {
   console.error('Deployment live WebSocket verification failed; collecting project diagnostics.');
   compose(['ps'], true);

@@ -511,8 +511,8 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
 
       {!health?.ok && (
         <p className="notice">
-          请先在本机启动 YOLO 推理服务（:8010）：
-          <code>python scripts/start-plate-web-api.py</code>
+          请先在本机启动 YOLO 推理服务（:8010；车牌识别工作台必需）：
+          <code>npm run dev:plate-api</code>
         </p>
       )}
 

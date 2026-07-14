@@ -32,6 +32,7 @@ services:
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       PLATFORM_PUBLIC_ORIGIN: ${PLATFORM_PUBLIC_ORIGIN:?set PLATFORM_PUBLIC_ORIGIN}
       PLATFORM_ALLOWED_ORIGINS: ${PLATFORM_ALLOWED_ORIGINS:-}
+      PLATFORM_TRUST_PROXY: "true"
     depends_on: { postgres: { condition: service_healthy } }
   web:
     build:

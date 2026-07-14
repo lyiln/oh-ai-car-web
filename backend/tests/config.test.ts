@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { loadConfig } from '../src/config.js';
 
-const productionKeys = ['NODE_ENV', 'SESSION_SECRET', 'COOKIE_SECURE', 'PLATFORM_PUBLIC_ORIGIN', 'PLATFORM_ALLOWED_ORIGINS', 'SMTP_HOST', 'SMTP_USER', 'SMTP_PASSWORD', 'SMTP_FROM'] as const;
+const productionKeys = ['NODE_ENV', 'SESSION_SECRET', 'COOKIE_SECURE', 'PLATFORM_PUBLIC_ORIGIN', 'PLATFORM_ALLOWED_ORIGINS', 'PLATFORM_TRUST_PROXY', 'SMTP_HOST', 'SMTP_USER', 'SMTP_PASSWORD', 'SMTP_FROM'] as const;
 const original = Object.fromEntries(productionKeys.map((key) => [key, process.env[key]]));
 
 function production(overrides: Record<string, string | undefined> = {}) {
@@ -45,5 +45,14 @@ describe('production configuration', () => {
   ])('rejects %s', (_name, overrides) => {
     production(overrides);
     expect(() => loadConfig()).toThrow();
+  });
+});
+
+describe('trusted proxy configuration', () => {
+  it('is disabled by default and enabled only explicitly', () => {
+    delete process.env.PLATFORM_TRUST_PROXY;
+    expect(loadConfig().trustProxy).toBe(false);
+    process.env.PLATFORM_TRUST_PROXY = 'true';
+    expect(loadConfig().trustProxy).toBe(true);
   });
 });

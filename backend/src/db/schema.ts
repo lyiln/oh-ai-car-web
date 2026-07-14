@@ -647,3 +647,10 @@ UPDATE sms_notifications SET wx_uid = phone WHERE wx_uid = '' AND phone IS NOT N
 ALTER TABLE sms_notifications DROP COLUMN IF EXISTS phone;
 ALTER TABLE sms_notifications ALTER COLUMN provider SET DEFAULT 'wxpusher';
 `;
+
+export const migration016 = `
+ALTER TABLE auth_otps ADD COLUMN IF NOT EXISTS failed_attempts smallint NOT NULL DEFAULT 0;
+ALTER TABLE auth_otps DROP CONSTRAINT IF EXISTS auth_otps_failed_attempts_check;
+ALTER TABLE auth_otps ADD CONSTRAINT auth_otps_failed_attempts_check
+  CHECK (failed_attempts BETWEEN 0 AND 5);
+`;
