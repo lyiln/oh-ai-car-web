@@ -4,7 +4,9 @@
 
 ## 认证
 
-所有 `/api/*`（除 `/device/v1/*`、`/internal/*`）需已登录会话 Cookie `oh_ai_session`，且请求 Origin 受信任。密码登录适用于活跃账号；邮箱 OTP 仅对已绑定邮箱的管理员可用。验证码只在后端生成、哈希存储并经 SMTP 投递，API 不返回验证码或收件地址。密码登录按规范化用户名限制为 10 次/15 分钟，OTP 申请为 5 次/15 分钟，OTP 验证为 5 次/5 分钟；超限返回 429。单个 OTP 连续失败 5 次后立即失效。
+所有 `/api/*`（除 `/device/v1/*`、`/internal/*`）需已登录会话 Cookie `oh_ai_session`，且请求 Origin 受信任。密码登录适用于活跃账号；邮箱 OTP 仅对已绑定邮箱的管理员可用。验证码只在后端生成、哈希存储并经 SMTP 投递，API 不返回验证码或收件地址。密码登录按规范化用户名限制为 10 次/15 分钟，OTP 申请为 5 次/15 分钟，OTP 验证为 5 次/5 分钟；超限返回 429，并在响应前等待写入 `throttled` 审计。单个 OTP 连续失败 5 次后立即失效。
+
+`PLATFORM_TRUST_PROXY` 默认关闭。只有 backend 位于覆盖 `X-Forwarded-For` 的受控单跳代理后方时才可启用；仓库 Compose 符合该拓扑并显式启用，以便非法或缺失用户名按真实客户端 IP 限流。直接暴露的 backend 必须保持关闭。
 
 ## 设备 `/api/devices`
 
@@ -157,7 +159,7 @@
 
 `reviews`、`violations`、`reports`、`dashboard` 等端点使用 `$N::uuid IS NULL OR EXISTS (... AND vm.user_id=$N)` 模式：管理员传 `NULL`（全量访问），操作员传自身 user_id（仅限授权车辆）。
 
-`GET /api/evidence/:fileName` 还会反查巡检事件、观测、违规或上门任务的车辆关联。未关联文件和无权证据统一返回 404。AI 顾问只为管理员注册全局白名单查询工具，底层工具仍独立校验管理员角色。
+`GET /api/evidence/:fileName` 还会反查巡检事件、观测、违规或上门任务的车辆关联。历史违规缺少 `vehicle_id` 时依次从 `task_id`、`event_id` 所属任务回退解析车辆；直接车辆字段存在时优先使用，避免异常关联扩大权限。未关联文件和无权证据统一返回 404。AI 顾问只为管理员注册全局白名单查询工具，底层工具仍独立校验管理员角色。
 
 ## 数据库迁移
 

@@ -190,12 +190,32 @@ describe('platform API against PostGIS', () => {
 
     const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, ...Array(64).fill(0), 0xff, 0xd9]);
     const linked = saveEvidenceJpeg(jpeg, 'authz');
+    const taskLinked = saveEvidenceJpeg(jpeg, 'authz-task');
+    const eventLinked = saveEvidenceJpeg(jpeg, 'authz-event');
     const unlinked = saveEvidenceJpeg(jpeg, 'unlinked');
     await db.query('INSERT INTO violations (id,vehicle_id,evidence_url) VALUES ($1,$2,$3)', [randomUUID(), vehicleA, linked.publicPath]);
+    const whitelistId = randomUUID(); const taskId = randomUUID(); const eventId = randomUUID();
+    await db.query(
+      'INSERT INTO whitelist_imports (id,vehicle_id,name,created_by_user_id,is_snapshot) VALUES ($1,$2,$3,$4,true)',
+      [whitelistId, vehicleA, '历史证据授权快照', ids.admin],
+    );
+    await db.query(
+      "INSERT INTO patrol_tasks (id,vehicle_id,route_id,whitelist_id,shift,status,created_by_user_id) VALUES ($1,$2,$3,$4,'history','completed',$5)",
+      [taskId, vehicleA, routeA, whitelistId, ids.admin],
+    );
+    await db.query("INSERT INTO patrol_events (id,task_id,event_type) VALUES ($1,$2,'status')", [eventId, taskId]);
+    await db.query('INSERT INTO violations (id,task_id,evidence_url) VALUES ($1,$2,$3)', [randomUUID(), taskId, taskLinked.publicPath]);
+    await db.query('INSERT INTO violations (id,event_id,evidence_url) VALUES ($1,$2,$3)', [randomUUID(), eventId, eventLinked.publicPath]);
     const evidenceUrl = `/api/evidence/${linked.fileName}`;
     expect((await app.inject({ method: 'GET', url: evidenceUrl, headers: { cookie: operatorACookie } })).statusCode).toBe(200);
     expect((await app.inject({ method: 'GET', url: evidenceUrl, headers: { cookie: operatorBCookie } })).statusCode).toBe(404);
     expect((await app.inject({ method: 'GET', url: evidenceUrl, headers: { cookie: adminCookie } })).statusCode).toBe(200);
+    for (const historical of [taskLinked, eventLinked]) {
+      const historicalUrl = `/api/evidence/${historical.fileName}`;
+      expect((await app.inject({ method: 'GET', url: historicalUrl, headers: { cookie: operatorACookie } })).statusCode).toBe(200);
+      expect((await app.inject({ method: 'GET', url: historicalUrl, headers: { cookie: operatorBCookie } })).statusCode).toBe(404);
+      expect((await app.inject({ method: 'GET', url: historicalUrl, headers: { cookie: adminCookie } })).statusCode).toBe(200);
+    }
     expect((await app.inject({ method: 'GET', url: `/api/evidence/${unlinked.fileName}`, headers: { cookie: adminCookie } })).statusCode).toBe(404);
     expect((await app.inject({ method: 'GET', url: '/api/evidence/not-valid.png', headers: { cookie: adminCookie } })).statusCode).toBe(404);
   });
@@ -266,6 +286,11 @@ describe('platform API against PostGIS', () => {
       const throttledVerify = await limitedApp.inject({ method: 'POST', url: '/api/auth/verify-otp', headers: { origin }, payload: { username: 'rate-admin', passcode: '000000' } });
       expect(throttledVerify.statusCode).toBe(429);
       expect(throttledVerify.headers['retry-after']).toBeDefined();
+      const verifyAudits = await db.query<{ outcome: string; metadata: Record<string, unknown> }>(
+        "SELECT outcome,metadata FROM audit_logs WHERE action='auth.otp.verify' AND metadata->>'username'='rate-admin' ORDER BY created_at DESC",
+      );
+      expect(verifyAudits.rows.some((row) => row.outcome === 'attempt_limit_reached')).toBe(true);
+      expect(verifyAudits.rows.some((row) => row.outcome === 'throttled')).toBe(true);
 
       await limitedApp.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'concurrent-admin' } });
       const concurrentCode = rateDelivered.find((entry) => entry.to === 'concurrent-admin@example.test')!.passcode;
@@ -287,10 +312,25 @@ describe('platform API against PostGIS', () => {
         expect((await limitedApp.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'request-limit-admin' } })).statusCode).toBe(200);
       }
       expect((await limitedApp.inject({ method: 'POST', url: '/api/auth/request-otp', headers: { origin }, payload: { username: 'request-limit-admin' } })).statusCode).toBe(429);
+      const requestLimitAudit = await db.query(
+        "SELECT 1 FROM audit_logs WHERE action='auth.otp.request' AND outcome='throttled' AND metadata->>'username'='request-limit-admin' AND NOT (metadata ? 'email')",
+      );
+      expect(requestLimitAudit.rowCount).toBeGreaterThan(0);
       for (let attempt = 0; attempt < 10; attempt++) {
         expect((await limitedApp.inject({ method: 'POST', url: '/api/auth/login', headers: { origin }, payload: { username: 'missing-rate-user', password: 'wrong' } })).statusCode).toBe(401);
       }
       expect((await limitedApp.inject({ method: 'POST', url: '/api/auth/login', headers: { origin }, payload: { username: 'missing-rate-user', password: 'wrong' } })).statusCode).toBe(429);
+      const loginLimitAudit = await db.query(
+        "SELECT 1 FROM audit_logs WHERE action='auth.login' AND outcome='throttled' AND metadata->>'username'='missing-rate-user'",
+      );
+      expect(loginLimitAudit.rowCount).toBeGreaterThan(0);
+      const authAuditMetadata = await db.query<{ metadata: Record<string, unknown> }>(
+        "SELECT metadata FROM audit_logs WHERE metadata->>'username' IN ('rate-admin','request-limit-admin','missing-rate-user')",
+      );
+      const serializedMetadata = JSON.stringify(authAuditMetadata.rows);
+      expect(serializedMetadata).not.toContain(defaultPassword);
+      expect(serializedMetadata).not.toContain('000000');
+      expect(serializedMetadata).not.toContain(rateDelivered[0]?.passcode ?? 'unavailable-passcode');
     } finally {
       await limitedApp.close();
     }

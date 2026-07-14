@@ -4,6 +4,7 @@ export interface Config {
   host: string;
   port: number;
   cookieSecure: boolean;
+  trustProxy: boolean;
   publicOrigin: string | undefined;
   allowedOrigins: string[];
   bootstrapAdminUsername: string | undefined;
@@ -39,6 +40,7 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     host: process.env.HOST ?? '127.0.0.1',
     port: Number(process.env.PORT ?? 8788),
     cookieSecure: process.env.COOKIE_SECURE === 'true',
+    trustProxy: process.env.PLATFORM_TRUST_PROXY === 'true',
     publicOrigin,
     allowedOrigins,
     bootstrapAdminUsername: process.env.BOOTSTRAP_ADMIN_USERNAME,

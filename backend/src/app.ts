@@ -55,9 +55,12 @@ function bboxIntersectsRoi(box: unknown, roi: unknown): boolean {
 }
 function normalizeEmail(value: string): string { return value.trim().toLowerCase(); }
 function isEmail(value: string): boolean { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value); }
-function authRateKey(request: FastifyRequest): string {
+function normalizedAuthUsername(request: FastifyRequest): string {
   const body = object(request.body);
-  const username = typeof body?.username === 'string' ? body.username.trim().toLowerCase() : '';
+  return typeof body?.username === 'string' ? body.username.trim().toLowerCase() : '';
+}
+function authRateKey(request: FastifyRequest): string {
+  const username = normalizedAuthUsername(request);
   const usableUsername = username.length <= 128 && !/[\u0000-\u001f\u007f]/.test(username);
   return username && usableUsername ? `username:${username}` : `ip:${request.ip}`;
 }
@@ -127,7 +130,8 @@ export async function createApp(services: AppServices = {}) {
   const mailer = services.mailer ?? createSmtpOtpMailer(config);
   const hub = new RealtimeHub();
   const authRateLimits = services.authRateLimits ?? { loginMax: 10, otpRequestMax: 5, otpVerifyMax: 5 };
-  const app = Fastify({ logger: true });
+  const pendingRateLimitAudits = new WeakMap<FastifyRequest, { action: string; metadata: Record<string, unknown> }>();
+  const app = Fastify({ logger: true, trustProxy: config.trustProxy });
   await app.register(cookie);
   await app.register(rateLimit, {
     global: false,
@@ -147,12 +151,11 @@ export async function createApp(services: AppServices = {}) {
   async function audit(action: string, outcome: string, actorUserId?: string, vehicleId?: string, metadata: Record<string, unknown> = {}) {
     await db.query('INSERT INTO audit_logs (id, actor_user_id, vehicle_id, action, outcome, metadata) VALUES ($1,$2,$3,$4,$5,$6)', [randomUUID(), actorUserId ?? null, vehicleId ?? null, action, outcome, JSON.stringify(metadata)]);
   }
-  function auditRateLimit(action: string) {
+  function markRateLimitAudit(action: string) {
     return (request: FastifyRequest) => {
-      const body = object(request.body);
-      const username = typeof body?.username === 'string' ? body.username.trim() : '';
-      void audit(action, 'throttled', undefined, undefined, username ? { username } : {})
-        .catch((error) => request.log.error({ error }, 'Failed to audit authentication rate limit'));
+      const username = normalizedAuthUsername(request);
+      const usableUsername = username.length <= 128 && !/[\u0000-\u001f\u007f]/.test(username);
+      pendingRateLimitAudits.set(request, { action, metadata: username && usableUsername ? { username } : {} });
     };
   }
   function session(request: FastifyRequest): SessionPayload | null { const value = request.cookies[SESSION_COOKIE]; return value ? verify<SessionPayload>(value, config.sessionSecret) : null; }
@@ -198,11 +201,23 @@ export async function createApp(services: AppServices = {}) {
   }
   function leaseToken(leaseId: string, vehicleId: string, user: UserRow, expiresAt: Date) { return sign({ sub: user.id, role: user.role, leaseId, vehicleId, exp: expiresAt.getTime() }, config.sessionSecret); }
 
-  app.setErrorHandler((error, _request, reply) => reply.status((error as { statusCode?: number }).statusCode ?? 400).send({ error: error instanceof Error ? error.message : 'Request failed' }));
+  app.setErrorHandler(async (error, request, reply) => {
+    const statusCode = (error as { statusCode?: number }).statusCode ?? 400;
+    const pendingAudit = statusCode === 429 ? pendingRateLimitAudits.get(request) : undefined;
+    if (pendingAudit) {
+      pendingRateLimitAudits.delete(request);
+      try {
+        await audit(pendingAudit.action, 'throttled', undefined, undefined, pendingAudit.metadata);
+      } catch (auditError) {
+        request.log.error({ error: auditError }, 'Failed to audit authentication rate limit');
+      }
+    }
+    return reply.status(statusCode).send({ error: error instanceof Error ? error.message : 'Request failed' });
+  });
   app.get('/health', async () => ({ ok: true }));
 
   app.post('/api/auth/login', {
-    config: { rateLimit: { max: authRateLimits.loginMax, timeWindow: '15 minutes', keyGenerator: authRateKey, onExceeded: auditRateLimit('auth.login') } },
+    config: { rateLimit: { max: authRateLimits.loginMax, timeWindow: '15 minutes', keyGenerator: authRateKey, onExceeded: markRateLimitAudit('auth.login') } },
   }, async (request, reply) => {
     const body = object(request.body); const username = string(body?.username, 'username'); const password = string(body?.password, 'password');
     const result = await db.query<UserRow>(`SELECT ${USER_SELECT} FROM users WHERE username=$1`, [username]);
@@ -212,7 +227,7 @@ export async function createApp(services: AppServices = {}) {
     await audit('auth.login', 'success', user.id); return { user: userDto(user) };
   });
   app.post('/api/auth/request-otp', {
-    config: { rateLimit: { max: authRateLimits.otpRequestMax, timeWindow: '15 minutes', keyGenerator: authRateKey, onExceeded: auditRateLimit('auth.otp.request') } },
+    config: { rateLimit: { max: authRateLimits.otpRequestMax, timeWindow: '15 minutes', keyGenerator: authRateKey, onExceeded: markRateLimitAudit('auth.otp.request') } },
   }, async (request, reply) => {
     const body = object(request.body); const username = string(body?.username, 'username');
     const sent = { ok: true as const, message: '如该管理员账号已登记邮箱，验证码将发送至绑定邮箱', time: String(config.otpExpiryMinutes) };
@@ -247,7 +262,7 @@ export async function createApp(services: AppServices = {}) {
     return sent;
   });
   app.post('/api/auth/verify-otp', {
-    config: { rateLimit: { max: authRateLimits.otpVerifyMax, timeWindow: '5 minutes', keyGenerator: authRateKey, onExceeded: auditRateLimit('auth.otp.verify') } },
+    config: { rateLimit: { max: authRateLimits.otpVerifyMax, timeWindow: '5 minutes', keyGenerator: authRateKey, onExceeded: markRateLimitAudit('auth.otp.verify') } },
   }, async (request, reply) => {
     const body = object(request.body); const username = string(body?.username, 'username'); const passcode = string(body?.passcode, 'passcode');
     if (!/^\d{6}$/.test(passcode)) throw Object.assign(new Error('passcode is invalid'), { statusCode: 400 });
@@ -518,7 +533,12 @@ export async function createApp(services: AppServices = {}) {
          SELECT t.vehicle_id FROM plate_observations po JOIN patrol_tasks t ON t.id=po.task_id
            WHERE po.evidence_image_url=$1 OR po.annotated_image_url=$1
          UNION
-         SELECT v.vehicle_id FROM violations v WHERE v.evidence_url=$1
+         SELECT COALESCE(v.vehicle_id, direct_task.vehicle_id, event_task.vehicle_id)
+         FROM violations v
+         LEFT JOIN patrol_tasks direct_task ON direct_task.id=v.task_id
+         LEFT JOIN patrol_events violation_event ON violation_event.id=v.event_id
+         LEFT JOIN patrol_tasks event_task ON event_task.id=violation_event.task_id
+         WHERE v.evidence_url=$1
          UNION
          SELECT rt.source_vehicle_id FROM response_tasks rt WHERE rt.arrival_evidence_url=$1
          UNION

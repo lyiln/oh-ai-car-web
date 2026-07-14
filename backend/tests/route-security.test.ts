@@ -80,8 +80,42 @@ describe('route-level security controls', () => {
       expect(throttled.statusCode).toBe(429);
       expect(throttled.headers['retry-after']).toBeDefined();
       expect(throttled.json()).toEqual({ error: '请求过于频繁，请稍后重试' });
+      const auditCall = query.mock.calls.find(([sql, params]) => String(sql).includes('INSERT INTO audit_logs') && params?.[4] === 'throttled');
+      expect(auditCall).toBeDefined();
+      expect(JSON.parse(String(auditCall?.[1]?.[5]))).toEqual({ username: 'missing-user' });
     } finally {
       await app.close();
+    }
+  });
+
+  it('uses forwarded client IP only when the trusted proxy setting is enabled', async () => {
+    const invalidUsername = 'x'.repeat(129);
+    const createLimitedApp = (trustProxy: boolean) => createApp({
+      db: { query: vi.fn(async () => result()) } as unknown as Database,
+      config: { sessionSecret: secret, publicOrigin: origin, allowedOrigins: [origin], trustProxy },
+      authRateLimits: { loginMax: 1, otpRequestMax: 1_000, otpVerifyMax: 1_000 },
+    });
+
+    const trusted = await createLimitedApp(true);
+    try {
+      const first = await trusted.inject({ method: 'POST', url: '/api/auth/login', headers: { origin, 'x-forwarded-for': '198.51.100.10' }, payload: { username: invalidUsername, password: 'wrong' } });
+      const sameClient = await trusted.inject({ method: 'POST', url: '/api/auth/login', headers: { origin, 'x-forwarded-for': '198.51.100.10' }, payload: { username: invalidUsername, password: 'wrong' } });
+      const otherClient = await trusted.inject({ method: 'POST', url: '/api/auth/login', headers: { origin, 'x-forwarded-for': '198.51.100.11' }, payload: { username: invalidUsername, password: 'wrong' } });
+      expect(first.statusCode).toBe(401);
+      expect(sameClient.statusCode).toBe(429);
+      expect(otherClient.statusCode).toBe(401);
+    } finally {
+      await trusted.close();
+    }
+
+    const direct = await createLimitedApp(false);
+    try {
+      const first = await direct.inject({ method: 'POST', url: '/api/auth/login', headers: { origin, 'x-forwarded-for': '198.51.100.20' }, payload: { username: invalidUsername, password: 'wrong' } });
+      const spoofed = await direct.inject({ method: 'POST', url: '/api/auth/login', headers: { origin, 'x-forwarded-for': '198.51.100.21' }, payload: { username: invalidUsername, password: 'wrong' } });
+      expect(first.statusCode).toBe(401);
+      expect(spoofed.statusCode).toBe(429);
+    } finally {
+      await direct.close();
     }
   });
 });

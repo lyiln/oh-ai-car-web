@@ -57,7 +57,7 @@ C ROS2 workspace is maintained in the sibling project `../oh-ai-car-ros2`.
 - Stage 0 implementation commit: `7ebcabc` (`feat: add safe doorstep response workflow`).
 - 生产与 ROS 接入的软件门禁已在当前工作区修复：Nginx `/patrol/live` 代理、
   生产配置 fail-fast、候选车辆健康门禁、migration advisory lock 和 WebSocket Origin。
-- typecheck、build、workspace 单元测试、10 项 PostGIS 集成测试和 Docker/Nginx
+- typecheck、build、workspace 单元测试、20 项 PostGIS 集成测试和 Docker/Nginx
   认证 WebSocket 冒烟验证已通过。
 - migration 008 已增加可恢复分配、`cancellation_requested` 与零速度停止确认。
 - ROS response scheduler 尚不存在于本仓库。
@@ -72,7 +72,7 @@ C ROS2 workspace is maintained in the sibling project `../oh-ai-car-ros2`.
 - 2026-07-14 已完成 Web 安全收口：地图航点、AI 白名单和证据读取按角色/车辆授权隔离；认证端点增加限流，migration 016 增加 OTP 五次失败失效；Nodemailer 已升级至 9.0.3，生产依赖审计为 0 漏洞。
 - 本次 workspace 单元测试、typecheck 和 build 已通过；PostGIS 集成测试 20/20 通过，
   migration 016、车辆级授权和 OTP 并发/限流已有临时数据库运行证据；Docker Compose
-  完整栈的登录、车辆创建及认证 WebSocket 冒烟验证也已通过。目标数据库仍未应用 migration 016。
+  完整栈的前端入口、登录、车辆创建及认证 WebSocket 冒烟验证也已通过。目标数据库仍未应用 migration 016。
 
 ## When this handoff is finished
 
