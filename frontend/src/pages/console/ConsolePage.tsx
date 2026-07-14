@@ -385,7 +385,12 @@ export function ConsolePage() {
         </aside>
       </div>
       <div className="console-plate-section">
-        <PlateScanPanel host={host} videoPort={videoPort} disabled={disabled} />
+        <PlateScanPanel
+          host={host}
+          videoPort={videoPort}
+          vehicleId={selectedId}
+          disabled={disabled}
+        />
       </div>
     </div>
   );

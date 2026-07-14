@@ -540,3 +540,22 @@ ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS dedupe_window_sec integer NOT 
 CREATE UNIQUE INDEX IF NOT EXISTS patrol_routes_vehicle_name_version_idx
   ON patrol_routes(vehicle_id, name, map_version);
 `;
+
+export const migration013 = `
+ALTER TABLE violations DROP CONSTRAINT IF EXISTS violations_disposition_check;
+ALTER TABLE violations ADD CONSTRAINT violations_disposition_check
+  CHECK (disposition IN ('pending', 'processed', 'dismissed', 'confirmed', 'false_positive', 'resolved'));
+
+UPDATE violations v
+SET disposition = CASE
+  WHEN e.review_status IN ('confirmed', 'confirm') THEN 'confirmed'
+  WHEN e.review_status = 'false_positive' THEN 'false_positive'
+  WHEN e.review_status IN ('whitelist', 'external', 'visitor') THEN 'resolved'
+  ELSE v.disposition
+END
+FROM patrol_events e
+WHERE v.event_id = e.id
+  AND e.review_status IS NOT NULL
+  AND e.review_status <> 'pending'
+  AND v.disposition = 'pending';
+`;

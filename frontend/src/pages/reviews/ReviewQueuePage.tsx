@@ -1,7 +1,26 @@
 import { useEffect, useState } from 'react';
-import type { Review } from '../../services/api.js';
+import { EvidenceImage } from '../../components/EvidenceImage.js';
+import type { PlateMatchInfo, Review } from '../../services/api.js';
 import * as opsClient from '../../services/opsClient.js';
 import { useAuth } from '../../contexts/AuthContext.js';
+
+function plateMatchLabel(match: PlateMatchInfo): string {
+  if (match.mode === 'exact') {
+    return `精确匹配白名单：${match.matchedPlate}`;
+  }
+  const direction =
+    match.direction === 'whitelist_in_scan'
+      ? '白名单包含在扫描结果中'
+      : '扫描片段命中白名单';
+  const fragment = match.fragment ? `（片段 ${match.fragment}）` : '';
+  return `模糊匹配到 ${match.matchedPlate}${fragment} · ${direction}`;
+}
+
+function reviewReasonLabel(reason: string): string {
+  if (reason === 'console_scan_test') return '控制台识别测试';
+  if (reason === 'low_confidence') return '低置信度';
+  return reason;
+}
 
 export function ReviewQueuePage() {
   const { user } = useAuth();
@@ -38,7 +57,7 @@ export function ReviewQueuePage() {
       <header className="page-header">
         <div>
           <h1>待人工审核</h1>
-          <p>OCR 失败 / 低置信度事件队列</p>
+          <p>对照小车上传的车牌截图，确认 OCR 结果或误报</p>
         </div>
       </header>
       <section className="kpi-grid">
@@ -55,15 +74,25 @@ export function ReviewQueuePage() {
             <article key={review.id} className="panel review-card">
               <div className="panel-heading">
                 <h2>{review.plate || '未识别'}</h2>
-                <span className="tag tag-warning">{review.reason}</span>
+                <span className="tag tag-warning">{reviewReasonLabel(review.reason)}</span>
               </div>
               <p className="muted">{new Date(review.occurredAt).toLocaleString()} · {review.waypoint ?? '未知航点'} · {review.deviceName ?? '设备'}</p>
-              {review.suggestion && <p>AI 建议：{review.suggestion}</p>}
-              {review.evidenceUrl && (
-                <img className="review-thumb" src={review.evidenceUrl} alt="证据截图" />
+              {typeof review.confidence === 'number' && (
+                <p className="muted">识别置信度 {(review.confidence * 100).toFixed(0)}%</p>
               )}
+              {review.plateMatch ? (
+                <p className="plate-match-hint">
+                  <span className="tag tag-success">匹配依据</span>
+                  {' '}
+                  OCR：{review.plate || '—'} → {plateMatchLabel(review.plateMatch)}
+                </p>
+              ) : (
+                <p className="muted">未命中白名单模糊/精确匹配，请对照证据图人工判断</p>
+              )}
+              {review.suggestion && <p>AI 建议：{review.suggestion}</p>}
+              <EvidenceImage url={review.evidenceUrl} alt={`证据 ${review.plate || '未识别'}`} />
               <div className="button-row">
-                <button type="button" className="primary" disabled={busyId === review.eventId} onClick={() => void resolve(review, 'confirm')}>确认</button>
+                <button type="button" className="primary" disabled={busyId === review.eventId} onClick={() => void resolve(review, 'confirm')}>确认违规</button>
                 <button type="button" className="secondary" disabled={busyId === review.eventId} onClick={() => void resolve(review, 'false_positive')}>误报</button>
                 {user?.role === 'admin' && (
                   <button type="button" className="secondary" disabled={busyId === review.eventId} onClick={() => void resolve(review, 'whitelist')}>加入白名单</button>

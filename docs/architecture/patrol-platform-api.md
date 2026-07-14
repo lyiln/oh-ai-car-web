@@ -53,7 +53,18 @@
 禁停区使用 PostGIS `geometry(Polygon,4326)`，API 返回坐标环。
 
 设备侧使用 `/device/v1/patrol/tasks/:id/events` 发送 `observation`。观测必须属于
-任务快照路线中的航点；低于 0.75 的置信度进入待复核，其余车牌使用任务快照的白名单分类；
+任务快照路线中的航点；低于任务置信度阈值（默认 0.75）的观测进入待复核；达到阈值后：
+
+1. **完整匹配**：OCR 车牌与白名单条目完全一致 → 按该条目分类（私家车 / 访客）
+2. **部分匹配**：满足任一方向即判非外来（`registered_private` / `visitor`），响应带
+   `plateMatch.mode=partial`：
+   - `scan_in_whitelist`：OCR 连续 ≥3 位 `A-Z0-9` 落在白名单车牌内（如 `A123`→`京A12345`）
+   - `whitelist_in_scan`：白名单字母数字体是 OCR 的子串（如 `京A12345X`→`京A12345`）
+3. 否则 → `suspected_external`
+
+上门候选与分类共用同一套 `matchWhitelistPlate` / `matchedPlate` 查目的地，不再要求 OCR
+与白名单整牌精确相等。`GET /api/reviews/pending` 与任务事件详情会返回 `plateMatch` 供人工对照。
+
 同一任务、航点、车牌和 30 分钟窗口会合并计数，禁停 ROI 相交独立记录。
 
 **白名单快照隔离（FR-002）**：白名单是小区全局数据，只有管理员可读取、导入或修改。首次创建与写入在事务级 advisory lock 下串行；批量导入的有效行在一个事务中提交。任务启动在持锁事务内将当前全局 live 白名单复制为不可变快照（`whitelist_imports.is_snapshot=true`）。因此任务只会看到完整的导入前或导入后版本，后续导入只影响下一次巡检，不影响正在运行任务的分类。

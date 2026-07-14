@@ -145,8 +145,18 @@ def run_loop() -> None:
             best = max(detections, key=lambda item: item.confidence)
             evidence_bytes = _encode_jpeg(frame)
             annotated_bytes = _encode_jpeg(_annotate(frame, detections))
-            evidence_url = store.save_jpeg(evidence_bytes, "evidence")
-            annotated_url = store.save_jpeg(annotated_bytes, "annotated")
+            # Prefer host-platform storage so Web admin can view without reaching Jetson.
+            upload_to_platform = os.environ.get("EVIDENCE_UPLOAD_TO_PLATFORM", "1") == "1"
+            if upload_to_platform:
+                evidence_url = client.upload_evidence(evidence_bytes, "evidence")
+                annotated_url = client.upload_evidence(annotated_bytes, "annotated")
+            else:
+                evidence_url = store.save_jpeg(evidence_bytes, "evidence")
+                annotated_url = store.save_jpeg(annotated_bytes, "annotated")
+            # Keep a local copy for edge debugging even when uploaded to host.
+            if os.environ.get("EVIDENCE_KEEP_LOCAL", "1") == "1":
+                store.save_jpeg(evidence_bytes, "local-evidence")
+                store.save_jpeg(annotated_bytes, "local-annotated")
             longitude, latitude = _latest_gps()
 
             event = {
