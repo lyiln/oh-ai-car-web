@@ -16,3 +16,7 @@ edge-agent/__pycache__/
 scripts/.local-plate-task.json
 *.pt
 !YOLOv5/oh-ai-car-YOLOv5/**/*.pt
+/tmp
+日报*.md
+learning/
+project-map.md

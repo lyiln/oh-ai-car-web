@@ -65,7 +65,6 @@ typecheck / unit tests      integration + Compose smoke test
 3. `npm run build`：构建 shared、backend、frontend（Vite）和 gateway。
 4. `npm test`：运行 shared、frontend、backend、gateway 的 Vitest 测试。
 5. `python -m unittest discover -s edge-agent/tests -p 'test_*.py'`：运行 mock 适配器和纯映射测试。
-
 所有写入日志的命令都启用 `pipefail`，因此测试命令失败时不会被 `tee` 掩盖。
 
 失败时，Actions 会上传 `quality-logs-*` artifact，保留 14 天。
