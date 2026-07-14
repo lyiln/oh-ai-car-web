@@ -3,9 +3,10 @@
 ## Active objective
 
 完成网页控制台收口后的运行验证与交接。先在具备 Docker/Testcontainers 的环境补跑
-平台集成测试，再按部署流程应用 migration 011；随后进行浏览器人工验收。阶段 1 的
-只读发现已完成，但 Jetson 仍缺失 ROS 2 runtime 且没有运行中的 ROS/Nav2 graph；
-ROS/Nav2 恢复与导航架构冻结仍需单独批准。当前版本**仍不得直接用于物理车辆自主导航**。
+平台集成测试，再按部署流程应用 migration 011；随后进行浏览器人工验收。Jetson 宿主机
+仍缺失 ROS 2 runtime 且没有运行中的 ROS/Nav2 graph，但厂商 ROS 2 Foxy Docker 镜像
+已在车上发现。容器启动、导航架构冻结和任何真车动作仍需单独批准。当前版本**仍不得直接
+用于物理车辆自主导航**。
 
 ## Read in this order
 
@@ -23,6 +24,20 @@ ROS/Nav2 恢复与导航架构冻结仍需单独批准。当前版本**仍不得
 
 ## Start here
 
+### Web local stack
+
+For local browser development, run these commands in three terminals:
+
+```sh
+npm run dev:backend
+npm run dev:frontend
+PLATFORM_API_URL=http://127.0.0.1:8788 npm run dev:gateway
+```
+
+Open `http://127.0.0.1:5173`. This stack is local Web-only and does not start
+Jetson Docker, ROS nodes, the vendor App, or a vehicle-control process. The member
+C ROS2 workspace is maintained in the sibling project `../oh-ai-car-ros2`.
+
 按以下顺序处理网页收口后的下一步任务：
 
 1. 在具备 Docker/Testcontainers runtime 的环境执行
@@ -33,9 +48,9 @@ ROS/Nav2 恢复与导航架构冻结仍需单独批准。当前版本**仍不得
    `patrol_routes` 唯一索引已生效。不得在此工作区假定迁移已部署。
 3. 用真实平台服务进行浏览器人工验收：登录、管理员路线导入、规则保存、巡检任务
    快照、告警/报告预览下载，以及租约控制的按键与失焦停止。验收中不得连接真实车辆。
-4. 只有获得单独批准后，才可回到阶段 1.5：在 Jetson 恢复 ROS 运行时并冻结导航
-   架构。没有对 Jetson 软件安装、ROS 节点启动或底盘测试的批准时，只可读取；不得
-   发送导航目标。
+4. 只有获得单独批准后，才可进入 Docker ROS 环境的非运动验证：先核验 USB 映射并
+   启动正确容器，再冻结导航架构。没有对 Docker 启动、ROS 节点启动或底盘测试的批准
+   时，只可读取；不得发送导航目标。
 
 ## Current evidence and boundaries
 
@@ -46,9 +61,10 @@ ROS/Nav2 恢复与导航架构冻结仍需单独批准。当前版本**仍不得
   认证 WebSocket 冒烟验证已通过。
 - migration 008 已增加可恢复分配、`cancellation_requested` 与零速度停止确认。
 - ROS response scheduler 尚不存在于本仓库。
-- Jetson `10.82.66.12` 的 SSH 只读发现已确认 Ubuntu 20.04.5 / JetPack R35.3.1、
-  Yahboom X3 工作区、RPLidar/Orbbec 设备，但 `/opt/ros`、`ros2`、运行图、
-  Nav2 lifecycle、TCP 6000 和视频 6500 均不可用；候选地图路径失效，急停未知。
+- Jetson `172.20.10.13` 的 SSH 只读发现确认 Ubuntu 20.04.5 / JetPack R35.3.1、
+  Yahboom X3 工作区、RPLidar/Orbbec 设备和两套 ROS Foxy Docker 镜像。宿主
+  `/opt/ros`、`ros2` 与运行图仍不可用；相关容器均停止，Nav2 lifecycle、地图、急停
+  与真车零速度仍未验证。
 - Nav2 暂停/恢复、到达照片生产和真车零速度均未验证。
 - `Front` TCP 报文仍有冲突，必须遵守 `PROTOCOL_STATUS.md`。
 - 未跟踪的 `tmp/` 是用户已有内容，不要删除或纳入提交。
