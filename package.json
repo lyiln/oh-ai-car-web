@@ -15,9 +15,9 @@
     "dev:stack": "node scripts/print-dev-stack.mjs",
     "setup:env": "node scripts/setup-env.mjs",
     "test:deploy-live": "node deploy/tests/live-websocket.mjs",
-    "setup:yolo": "python scripts/setup-yolo-plate.py",
-    "dev:plate-api": "python scripts/start-plate-web-api.py",
-    "test:edge-plate": "python edge-agent/tests/test_plate_adapter.py",
+    "setup:yolo": "node scripts/run-python.mjs scripts/setup-yolo-plate.py",
+    "dev:plate-api": "node scripts/run-python.mjs scripts/start-plate-web-api.py",
+    "test:edge-plate": "node scripts/run-python.mjs edge-agent/tests/test_plate_adapter.py",
     "start": "npm run build && npm run start --workspace=@oh-ai-car-web/gateway"
   },
   "devDependencies": { "ws": "^8.18.2" }

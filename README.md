@@ -32,11 +32,16 @@ npm install
 npm run dev:backend
 npm run dev:frontend
 PLATFORM_API_URL=http://127.0.0.1:8788 npm run dev:gateway
+# 使用控制台“车牌识别工作台”时，还需在第四个终端运行：
+npm run dev:plate-api
 ```
 
-请在三个终端中分别运行上述命令。后端监听
+基础控制在三个终端中分别运行前述前三个命令即可；车牌识别工作台需要第四个终端的
+YOLO 服务。后端监听
 `http://127.0.0.1:8788`，网关监听 `http://127.0.0.1:8787`，其 WebSocket 地址为
-`ws://127.0.0.1:8787/control`；Vite 开发界面使用 `http://127.0.0.1:5173`。
+`ws://127.0.0.1:8787/control`；YOLO 服务监听 `http://127.0.0.1:8010`；Vite 开发界面使用
+`http://127.0.0.1:5173`。`dev:plate-api` 在 macOS/Linux 使用 `python3`，在 Windows 使用
+`python`；还需先按[YOLO 集成说明](docs/integration/yolo-plate-recognition.md)安装 Python 依赖及模型权重。
 
 后端启动时会读取 `.env`，并对其中配置的 `DATABASE_URL` 执行仓库迁移；本地运行时请使用
 已获批准的开发数据库。

@@ -51,7 +51,7 @@ c:\Users\jfkyx\Desktop\小车web\YOLOv5\oh-ai-car-YOLOv5
 如需重新克隆或修复目录，也可以在本仓库根目录执行：
 
 ```bash
-python scripts/setup-yolo-plate.py
+npm run setup:yolo
 ```
 
 克隆目标：`YOLOv5/oh-ai-car-YOLOv5/`。兼容旧路径 `yolo-v5/oh-ai-car-YOLOv5/` 与 `vendor/oh-ai-car-YOLOv5/`。
@@ -155,13 +155,15 @@ ConsolePage
 
 ### 启动四进程
 
+使用控制台车牌识别工作台时，以下四个进程都必须运行；仅遥控或查看平台时，YOLO 的第四个进程不是必需项。
+
 ```bash
 npm run dev:backend
 npm run dev:frontend
 # PowerShell:
 $env:PLATFORM_API_URL="http://127.0.0.1:8788"; npm run dev:gateway
 npm run dev:plate-api
-# 或: python scripts/start-plate-web-api.py
+# `npm run dev:plate-api` 在 macOS/Linux 调用 python3，在 Windows 调用 python。
 ```
 
 依赖：`pip install fastapi uvicorn`，以及 YOLO 仓库所需的 torch / paddleocr / ultralytics。
@@ -206,5 +208,3 @@ npm run dev:plate-api
 | `[edge-agent/platform_client.py](../../edge-agent/platform_client.py)`                   | Device API 客户端            |
 | `[backend/src/app.ts](../../backend/src/app.ts)`                                         | observation 入库与分类（支持中文车牌） |
 | `[docs/flows/illegal-parking-localization.md](../flows/illegal-parking-localization.md)` | 坐标与车主信息                   |
-
-

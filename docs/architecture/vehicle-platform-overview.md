@@ -121,7 +121,8 @@ npm run dev:frontend
 2. 在一个终端运行 `npm run dev:backend`；首次启动会迁移数据库。
 3. 以 `VITE_PLATFORM_ENABLED=true npm run dev:frontend` 启动前端。Vite 已将 `/api` 和 `/ws` 代理到 `127.0.0.1:8788`。
 4. 在操作员机器上，以 `PLATFORM_API_URL=http://127.0.0.1:8788 npm run dev:gateway` 启动本机网关。
-5. 配置高德 Key 和 ROS2 边缘代理后，才可以看到真实底图与实时轨迹。
+5. 若要使用控制台的「车牌识别工作台」，另开终端运行 `npm run dev:plate-api`。这是第四个本机进程，监听 `127.0.0.1:8010`；它需要 YOLO/PaddleOCR Python 依赖、模型权重和可发现的 YOLO 仓库。基础遥控不依赖它，详见[YOLO 集成说明](../integration/yolo-plate-recognition.md)。
+6. 配置高德 Key 和 ROS2 边缘代理后，才可以看到真实底图与实时轨迹。
 
 面向统一服务器的 Docker 配置、环境变量与 ROS2 命令见[部署说明](../deployment/vehicle-platform.md)。生产环境必须使用 HTTPS、强随机密钥、`COOKIE_SECURE=true` 和外部备份策略。
 
