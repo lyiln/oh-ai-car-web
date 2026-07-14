@@ -31,13 +31,15 @@ class RuntimeConfig:
     device: str
     car_imgsz: int = 512
     plate_imgsz: int = 512
-    car_conf_thres: float = 0.15
+    car_conf_thres: float = 0.10
     car_iou_thres: float = 0.45
     plate_conf_thres: float = 0.25
     plate_iou_thres: float = 0.45
-    ocr_min_score: float = 0.75
+    image_ocr_min_score: float = 0.60
+    video_ocr_min_score: float = 0.75
     ocr_lang: str = "ch"
-    full_ocr_det_conf_thres: float = 0.75
+    image_full_ocr_det_conf_thres: float = 0.60
+    video_full_ocr_det_conf_thres: float = 0.75
     video_plate_conf_thres: float = 0.55
     video_min_plate_area_ratio: float = 0.003
     video_plate_aspect_ratio_min: float = 2.0
@@ -199,6 +201,12 @@ class WebInferenceRuntime:
 
     def _run_locked(self, source_image: Path, run_root: Path, profile: str = "image") -> dict[str, Any]:
         pipeline_start = time.perf_counter()
+        ocr_min_score = self.config.video_ocr_min_score if profile == "video" else self.config.image_ocr_min_score
+        full_ocr_det_conf_thres = (
+            self.config.video_full_ocr_det_conf_thres
+            if profile == "video"
+            else self.config.image_full_ocr_det_conf_thres
+        )
         car_visual_path = run_root / "car_detector" / source_image.name
         car_detections, car_detection_elapsed_sec = self.car_detector.infer(source_image, car_visual_path)
 
@@ -267,16 +275,16 @@ class WebInferenceRuntime:
                 ocr_result = recognize_plate_image(
                     self.ocr_model,
                     crop_path,
-                    self.config.ocr_min_score,
+                    ocr_min_score,
                     variant_preset="fast",
                 )
-                fast_pass = bool(ocr_result["is_valid_plate"]) and float(ocr_result["ocr_confidence"]) >= self.config.ocr_min_score
+                fast_pass = bool(ocr_result["is_valid_plate"]) and float(ocr_result["ocr_confidence"]) >= ocr_min_score
                 ran_full_ocr = False
-                if det_confidence >= self.config.full_ocr_det_conf_thres and not fast_pass:
+                if det_confidence >= full_ocr_det_conf_thres and not fast_pass:
                     ocr_result = recognize_plate_image(
                         self.ocr_model,
                         crop_path,
-                        self.config.ocr_min_score,
+                        ocr_min_score,
                         variant_preset="full",
                     )
                     ran_full_ocr = True

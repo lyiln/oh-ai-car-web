@@ -36,8 +36,9 @@ INFERENCE_RUNTIME = WebInferenceRuntime(
     RUNTIME_PATHS,
     RuntimeConfig(
         device=PIPELINE_DEVICE,
-        car_imgsz=int(os.environ.get("PLATE_WEB_CAR_IMGSZ", "512")),
+        car_imgsz=int(os.environ.get("PLATE_WEB_CAR_IMGSZ", "576")),
         plate_imgsz=int(os.environ.get("PLATE_WEB_PLATE_IMGSZ", "512")),
+        car_conf_thres=float(os.environ.get("PLATE_WEB_CAR_CONF_THRES", "0.10")),
     ),
 )
 

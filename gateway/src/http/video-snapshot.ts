@@ -6,7 +6,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { URL } from 'node:url';
 
-const FETCH_TIMEOUT_MS = 4000;
+const FETCH_TIMEOUT_MS = 2000;
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
 
@@ -34,6 +34,14 @@ function isPrivateOrLocalHost(host: string): boolean {
 
 function lookLikeJpeg(buf: Buffer): boolean {
   return buf.length > 4 && buf[0] === 0xff && buf[1] === 0xd8;
+}
+
+function extractCompleteJpeg(buf: Buffer): Buffer | null {
+  const start = buf.indexOf(JPEG_SOI);
+  if (start < 0) return null;
+  const end = buf.indexOf(JPEG_EOI, start + 2);
+  if (end < 0) return null;
+  return buf.subarray(start, end + 2);
 }
 
 function fetchBuffer(url: string, maxBytes = 8 * 1024 * 1024): Promise<{ status: number; contentType: string; body: Buffer }> {
@@ -84,14 +92,15 @@ function fetchBuffer(url: string, maxBytes = 8 * 1024 * 1024): Promise<{ status:
 }
 
 function extractJpegFromMjpeg(body: Buffer): Buffer | null {
+  const complete = extractCompleteJpeg(body);
+  if (complete) return complete;
   const start = body.indexOf(JPEG_SOI);
   if (start < 0) return null;
-  const end = body.indexOf(JPEG_EOI, start + 2);
-  if (end < 0) {
+  if (body.indexOf(JPEG_EOI, start + 2) < 0) {
     // Incomplete frame — return what we have if it starts like JPEG
     return lookLikeJpeg(body.subarray(start)) ? body.subarray(start) : null;
   }
-  return body.subarray(start, end + 2);
+  return null;
 }
 
 function resolveRelativeUrl(base: string, href: string): string | null {
@@ -118,6 +127,7 @@ function parseStreamUrlsFromHtml(html: string, pageUrl: string): string[] {
     /<img[^>]+src=["']([^"']+)["']/gi,
     /url\s*[:=]\s*["']([^"']+)["']/gi,
     /src\s*[:=]\s*["']([^"']+\.(?:mjpg|mjpeg|jpg|jpeg)[^"']*)["']/gi,
+    /["']([^"']*(?:action=stream|stream(?:\.mjpg|\.mjpeg)?|mjpg|mjpeg|snapshot)[^"']*)["']/gi,
   ];
   for (const pattern of patterns) {
     let match: RegExpExecArray | null;
@@ -130,6 +140,12 @@ function parseStreamUrlsFromHtml(html: string, pageUrl: string): string[] {
 }
 
 async function tryFetchJpeg(url: string): Promise<Buffer | null> {
+  try {
+    const jpeg = await fetchFirstJpeg(url);
+    if (jpeg) return jpeg;
+  } catch {
+    // Fall back to buffered read below for small one-shot responses.
+  }
   try {
     const result = await fetchBuffer(url);
     if (result.status < 200 || result.status >= 300) return null;
@@ -144,6 +160,72 @@ async function tryFetchJpeg(url: string): Promise<Buffer | null> {
   }
 }
 
+function fetchFirstJpeg(url: string, maxBytes = 8 * 1024 * 1024): Promise<Buffer | null> {
+  return new Promise((resolve, reject) => {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      reject(new Error(`Invalid URL: ${url}`));
+      return;
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      reject(new Error(`Unsupported protocol: ${parsed.protocol}`));
+      return;
+    }
+    const lib = parsed.protocol === 'https:' ? https : http;
+    let settled = false;
+    const finish = (value: Buffer | null, error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const req = lib.get(
+      url,
+      { timeout: FETCH_TIMEOUT_MS, headers: { Accept: 'image/jpeg,image/*,*/*' } },
+      (res) => {
+        if ((res.statusCode ?? 0) < 200 || (res.statusCode ?? 0) >= 300) {
+          res.resume();
+          finish(null);
+          return;
+        }
+        let body = Buffer.alloc(0);
+        res.on('data', (chunk: Buffer) => {
+          if (settled) return;
+          body = Buffer.concat([body, chunk]);
+          if (body.length > maxBytes) {
+            req.destroy();
+            finish(null, new Error('Response too large'));
+            return;
+          }
+          const jpeg = extractCompleteJpeg(body);
+          if (jpeg) {
+            finish(jpeg);
+            req.destroy();
+          }
+        });
+        res.on('end', () => {
+          if (settled) return;
+          finish(lookLikeJpeg(body) ? body : extractJpegFromMjpeg(body));
+        });
+        res.on('error', (error) => {
+          if (settled) return;
+          finish(null, error);
+        });
+      },
+    );
+    req.on('timeout', () => {
+      req.destroy();
+      finish(null, new Error(`Fetch timed out: ${url}`));
+    });
+    req.on('error', (error) => {
+      if (settled) return;
+      finish(null, error);
+    });
+  });
+}
+
 /**
  * Pull one JPEG frame from the car video HTTP service.
  */
@@ -156,19 +238,6 @@ export async function fetchCarVideoSnapshot(target: SnapshotTarget): Promise<Buf
   }
 
   const base = `http://${target.host}:${target.videoPort}`;
-  const candidates = [
-    `${base}/snapshot`,
-    `${base}/?action=snapshot`,
-    `${base}/stream?action=snapshot`,
-    `${base}/jpg`,
-    `${base}/jpeg`,
-  ];
-
-  for (const url of candidates) {
-    const jpeg = await tryFetchJpeg(url);
-    if (jpeg) return jpeg;
-  }
-
   // Parse index2 for embedded stream/img URLs
   const index2 = `${base}/index2`;
   try {
@@ -185,8 +254,26 @@ export async function fetchCarVideoSnapshot(target: SnapshotTarget): Promise<Buf
     // continue
   }
 
-  // Last resort: treat index2 / stream as MJPEG and extract first frame
-  for (const url of [`${base}/stream`, `${base}/?action=stream`, index2]) {
+  // Try the endpoints most likely to serve the live MJPEG stream first.
+  for (const url of [
+    `${base}/?action=stream`,
+    `${base}/stream`,
+    `${base}/stream.mjpg`,
+    `${base}/mjpg/video.mjpg`,
+    index2,
+  ]) {
+    const jpeg = await tryFetchJpeg(url);
+    if (jpeg) return jpeg;
+  }
+
+  // Fallback to one-shot snapshot endpoints exposed by some camera servers.
+  for (const url of [
+    `${base}/snapshot`,
+    `${base}/?action=snapshot`,
+    `${base}/stream?action=snapshot`,
+    `${base}/jpg`,
+    `${base}/jpeg`,
+  ]) {
     const jpeg = await tryFetchJpeg(url);
     if (jpeg) return jpeg;
   }
