@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { PoolClient } from 'pg';
 import type { Database } from '../db/index.js';
+import { saveEvidenceJpeg } from '../evidence-storage.js';
+import { matchWhitelistPlate, normalisePlate } from '../plate-match.js';
 
 type AuthUser = {
   id: string;
@@ -158,12 +160,22 @@ function patrolRules(rows: Array<{ key: string; value: unknown }>) {
   };
 }
 
+function optionalWxUid(value: unknown): string {
+  if (value === null || value === undefined || value === '') return '';
+  if (typeof value !== 'string') throw httpError('wxUid is invalid', 400);
+  const wxUid = value.trim();
+  if (!wxUid) return '';
+  if (wxUid.length > 128) throw httpError('wxUid is too long', 400);
+  return wxUid;
+}
+
 type WhitelistEntryRow = {
   id: string;
   plate: string;
   owner: string | null;
   building: string | null;
   parkingSpot?: string | null;
+  wxUid?: string | null;
   vehicleType: string | null;
   validUntil?: Date | string | null;
 };
@@ -175,6 +187,7 @@ function whitelistEntryDto(row: WhitelistEntryRow) {
     owner: row.owner ?? '',
     building: row.building ?? '',
     parkingSpot: row.parkingSpot ?? '',
+    wxUid: row.wxUid ?? '',
     vehicleType: row.vehicleType,
     validUntil: iso(row.validUntil ?? null),
   };
@@ -182,7 +195,7 @@ function whitelistEntryDto(row: WhitelistEntryRow) {
 
 const WHITELIST_ENTRY_SELECT = `
   SELECT e.id, e.plate, e.owner_name AS owner, e.building,
-         e.parking_spot AS "parkingSpot", e.category AS "vehicleType",
+         e.parking_spot AS "parkingSpot", e.wx_uid AS "wxUid", e.category AS "vehicleType",
          e.valid_until AS "validUntil"
   FROM whitelist_entries e
   JOIN whitelist_imports i ON i.id=e.whitelist_id
@@ -530,8 +543,8 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
       );
       if (!snapshot.rowCount) throw httpError('Whitelist changed while starting patrol; retry the request', 409);
       await client.query(
-        `INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, parking_spot, valid_until)
-         SELECT gen_random_uuid(), $1, plate, owner_name, building, category, parking_spot, valid_until
+        `INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, parking_spot, valid_until, wx_uid)
+         SELECT gen_random_uuid(), $1, plate, owner_name, building, category, parking_spot, valid_until, wx_uid
          FROM whitelist_entries WHERE whitelist_id=$2`,
         [snapshotId, whitelist.rows[0].id],
       );
@@ -638,7 +651,8 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
     const events = await db.query(
       `SELECT id, task_id AS "taskId", plate, event_type AS "eventType", waypoint,
               confidence, evidence_url AS "evidenceUrl", review_status AS "reviewStatus",
-              occurred_at AS "occurredAt"
+              occurred_at AS "occurredAt",
+              details->'plateMatch' AS "plateMatch"
        FROM patrol_events WHERE task_id=$1 ORDER BY occurred_at DESC`,
       [id],
     );
@@ -959,6 +973,150 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
   });
 
   // --- Violations ---
+  // Console plate-scan workbench: reject whitelist matches; otherwise create violation + review queue item.
+  app.post('/api/violations/from-console-scan', { bodyLimit: 6 * 1024 * 1024 }, async (request) => {
+    const user = await requireUser(request);
+    const body = (request.body && typeof request.body === 'object' && !Array.isArray(request.body))
+      ? request.body as Record<string, unknown>
+      : {};
+    const vehicleId = typeof body.vehicleId === 'string' ? body.vehicleId.trim() : '';
+    if (!vehicleId) throw httpError('vehicleId is required', 400);
+    if (!await canAccessVehicle(user, vehicleId)) throw httpError('Vehicle access denied', 403);
+
+    let plate: string;
+    try {
+      plate = normalisePlate(body.plate);
+    } catch {
+      throw httpError('plate is invalid', 400);
+    }
+
+    const liveWhitelist = await db.query<{ id: string }>(
+      `SELECT id FROM whitelist_imports
+       WHERE vehicle_id IS NULL AND is_snapshot=false
+       ORDER BY created_at DESC, id DESC LIMIT 1`,
+    );
+    if (liveWhitelist.rows[0]) {
+      const entries = await db.query<{ plate: string; category: 'private' | 'visitor' }>(
+        'SELECT plate, category FROM whitelist_entries WHERE whitelist_id=$1',
+        [liveWhitelist.rows[0].id],
+      );
+      const hit = matchWhitelistPlate(plate, entries.rows);
+      if (hit) {
+        const kind = hit.category === 'private' ? '登记私家车' : '登记访客';
+        throw httpError(
+          `白名单车辆：已匹配 ${hit.matchedPlate}（${kind}），不允许添加到违规车辆`,
+          409,
+        );
+      }
+    }
+
+    const jpegRaw = typeof body.jpegBase64 === 'string' ? body.jpegBase64.trim() : '';
+    if (!jpegRaw) throw httpError('jpegBase64 is required', 400);
+    let bytes: Buffer;
+    try {
+      bytes = Buffer.from(jpegRaw.replace(/^data:image\/jpeg;base64,/i, ''), 'base64');
+    } catch {
+      throw httpError('jpegBase64 is invalid', 400);
+    }
+
+    const confidence = typeof body.confidence === 'number' && Number.isFinite(body.confidence)
+      ? Math.min(1, Math.max(0, body.confidence))
+      : 0.5;
+    const waypoint = typeof body.waypoint === 'string' && body.waypoint.trim()
+      ? body.waypoint.trim().slice(0, 120)
+      : '控制台识别测试';
+
+    const route = await db.query<{ id: string }>(
+      'SELECT id FROM patrol_routes WHERE vehicle_id=$1 ORDER BY created_at DESC LIMIT 1',
+      [vehicleId],
+    );
+    if (!route.rows[0]) {
+      throw httpError('请先为该设备创建巡逻路线，测试审核需要挂接到任务事件', 409);
+    }
+    if (!liveWhitelist.rows[0]) {
+      throw httpError('全局白名单为空；请先维护白名单后再测试', 409);
+    }
+
+    const saved = saveEvidenceJpeg(bytes, 'console-scan');
+    const created = await db.transaction(async (client) => {
+      const taskId = randomUUID();
+      const eventId = randomUUID();
+      const reviewId = randomUUID();
+      const violationId = randomUUID();
+
+      await client.query(
+        `INSERT INTO patrol_tasks
+           (id, vehicle_id, route_id, whitelist_id, shift, status, created_by_user_id, started_at, finished_at)
+         VALUES ($1, $2, $3, $4, 'morning', 'completed', $5, now(), now())`,
+        [taskId, vehicleId, route.rows[0].id, liveWhitelist.rows[0].id, user.id],
+      );
+      await client.query(
+        `INSERT INTO patrol_events
+           (id, task_id, event_type, waypoint, plate, confidence, evidence_url, review_status, occurred_at, details)
+         VALUES ($1, $2, 'observation', $3, $4, $5, $6, 'pending', now(), $7)`,
+        [
+          eventId,
+          taskId,
+          waypoint,
+          plate,
+          confidence,
+          saved.publicPath,
+          JSON.stringify({
+            source: 'console_scan_test',
+            vehicleId,
+            plateMatch: null,
+          }),
+        ],
+      );
+      await client.query(
+        `INSERT INTO reviews (id, event_id, reason, status)
+         VALUES ($1, $2, 'console_scan_test', 'pending')`,
+        [reviewId, eventId],
+      );
+      await client.query(
+        `INSERT INTO violations
+           (id, event_id, plate, violation_type, task_id, vehicle_id, waypoint, priority, disposition, evidence_url, occurred_at)
+         VALUES ($1, $2, $3, 'suspected_external', $4, $5, $6, 'normal', 'pending', $7, now())`,
+        [violationId, eventId, plate, taskId, vehicleId, waypoint, saved.publicPath],
+      );
+      return { taskId, eventId, reviewId, violationId };
+    });
+
+    hub.publishPatrol?.({
+      type: 'violation_alert',
+      violationId: created.violationId,
+      vehicleId,
+      plate,
+      evidenceUrl: saved.publicPath,
+      source: 'console_scan_test',
+      confidence,
+      eventId: created.eventId,
+    });
+    await audit('violation.console_scan_test', 'success', user.id, vehicleId, {
+      violationId: created.violationId,
+      eventId: created.eventId,
+      reviewId: created.reviewId,
+      plate,
+      evidenceUrl: saved.publicPath,
+      confidence,
+    });
+    return {
+      violation: {
+        id: created.violationId,
+        plate,
+        evidenceUrl: saved.publicPath,
+        deviceId: vehicleId,
+        waypoint,
+        status: 'pending',
+        type: 'suspected_external',
+      },
+      review: {
+        id: created.reviewId,
+        eventId: created.eventId,
+      },
+    };
+  });
+
   // Observation coords preferred; else nearest telemetry within ±60s of violation time.
   const VIOLATION_FROM = `
        FROM violations v
@@ -1052,7 +1210,8 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     const user = await requireUser(request);
     const result = await db.query(
       `SELECT r.id, r.event_id AS "eventId", r.reason, r.created_at AS "occurredAt",
-              e.plate, e.waypoint, e.evidence_url AS "evidenceUrl",
+              e.plate, e.waypoint, e.evidence_url AS "evidenceUrl", e.confidence,
+              e.details->'plateMatch' AS "plateMatch",
               v.name AS "deviceName"
        FROM reviews r
        JOIN patrol_events e ON e.id = r.event_id
@@ -1085,6 +1244,12 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     if (!event.rows[0]) throw httpError('Event not found', 404);
     if (!await canAccessVehicle(user, event.rows[0].vehicle_id)) throw httpError('Vehicle access denied', 403);
 
+    const violationDisposition =
+      reviewStatus === 'confirmed' ? 'confirmed'
+        : reviewStatus === 'false_positive' ? 'false_positive'
+          : reviewStatus === 'whitelist' || reviewStatus === 'external' ? 'resolved'
+            : 'confirmed';
+
     await db.transaction(async (client) => {
       await client.query(
         `UPDATE reviews SET status='resolved', resolver_id=$1, resolution=$2, resolved_at=now()
@@ -1094,6 +1259,11 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
       await client.query(
         `UPDATE patrol_events SET review_status=$1, plate=COALESCE($2, plate) WHERE id=$3`,
         [reviewStatus, plate, eventId],
+      );
+      // Keep violations list in sync with review outcomes (confirm / false_positive / whitelist / visitor).
+      await client.query(
+        `UPDATE violations SET disposition=$1 WHERE event_id=$2`,
+        [violationDisposition, eventId],
       );
       if (resolution === 'whitelist' && plate) {
         const whitelistId = await ensureGlobalWhitelist(client, user);
@@ -1105,7 +1275,7 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
         );
       }
     });
-    await audit('review.resolve', 'success', user.id, event.rows[0].vehicle_id, { eventId, resolution, plate });
+    await audit('review.resolve', 'success', user.id, event.rows[0].vehicle_id, { eventId, resolution, plate, violationDisposition });
     return { ok: true as const };
   });
 
@@ -1121,6 +1291,7 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
       values.push(`%${q}%`);
       where += ` AND (
         e.plate ILIKE $1 OR e.owner_name ILIKE $1 OR e.building ILIKE $1 OR e.parking_spot ILIKE $1
+        OR e.wx_uid ILIKE $1
       )`;
     }
     const result = await db.query<WhitelistEntryRow>(
@@ -1148,6 +1319,7 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     const owner = optionalString(body?.owner);
     const building = optionalString(body?.building);
     const parkingSpot = optionalString(body?.parkingSpot ?? body?.slot);
+    const wxUid = optionalWxUid(body?.wxUid ?? body?.wx_uid);
     const vehicleTypeRaw = optionalString(body?.vehicleType, 'private');
     if (vehicleTypeRaw !== 'private' && vehicleTypeRaw !== 'visitor') throw httpError('vehicleType is invalid', 400);
     const vehicleType = vehicleTypeRaw;
@@ -1155,14 +1327,14 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     const entry = await db.transaction(async (client) => {
       const whitelistId = await ensureGlobalWhitelist(client, admin);
       const result = await client.query<WhitelistEntryRow>(
-        `INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, parking_spot, valid_until)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        `INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, parking_spot, valid_until, wx_uid)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
          ON CONFLICT (whitelist_id, plate) DO UPDATE SET
            owner_name=EXCLUDED.owner_name, building=EXCLUDED.building, category=EXCLUDED.category,
-           parking_spot=EXCLUDED.parking_spot, valid_until=EXCLUDED.valid_until
+           parking_spot=EXCLUDED.parking_spot, valid_until=EXCLUDED.valid_until, wx_uid=EXCLUDED.wx_uid
          RETURNING id, plate, owner_name AS owner, building, parking_spot AS "parkingSpot",
-                   category AS "vehicleType", valid_until AS "validUntil"`,
-        [randomUUID(), whitelistId, plate, owner, building, vehicleType, parkingSpot, validUntil],
+                   wx_uid AS "wxUid", category AS "vehicleType", valid_until AS "validUntil"`,
+        [randomUUID(), whitelistId, plate, owner, building, vehicleType, parkingSpot, validUntil, wxUid],
       );
       return result.rows[0];
     });
@@ -1190,6 +1362,9 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     const parkingSpot = body?.parkingSpot !== undefined || body?.slot !== undefined
       ? optionalString(body?.parkingSpot ?? body?.slot)
       : null;
+    const wxUid = body?.wxUid !== undefined || body?.wx_uid !== undefined
+      ? optionalWxUid(body?.wxUid ?? body?.wx_uid)
+      : null;
     const vehicleTypeRaw = body?.vehicleType !== undefined ? optionalString(body.vehicleType, 'private') : null;
     if (vehicleTypeRaw !== null && vehicleTypeRaw !== 'private' && vehicleTypeRaw !== 'visitor') {
       throw httpError('vehicleType is invalid', 400);
@@ -1206,10 +1381,11 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
            building=COALESCE($3, building),
            category=COALESCE($4, category),
            parking_spot=COALESCE($5, parking_spot),
-           valid_until=CASE WHEN $6::boolean THEN $7::timestamptz ELSE valid_until END
-         WHERE id=$8
+           valid_until=CASE WHEN $6::boolean THEN $7::timestamptz ELSE valid_until END,
+           wx_uid=COALESCE($8, wx_uid)
+         WHERE id=$9
          RETURNING id, plate, owner_name AS owner, building, parking_spot AS "parkingSpot",
-                   category AS "vehicleType", valid_until AS "validUntil"`,
+                   wx_uid AS "wxUid", category AS "vehicleType", valid_until AS "validUntil"`,
         [
           plate,
           owner,
@@ -1218,6 +1394,7 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
           parkingSpot,
           validUntil !== undefined,
           validUntil ?? null,
+          wxUid,
           id,
         ],
       );
@@ -1247,24 +1424,45 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
   app.post('/api/whitelist/import', async (request) => {
     const admin = await requireAdmin(request);
     const body = object(request.body);
-    type RowIn = { plate?: string; owner?: string; building?: string; slot?: string; parkingSpot?: string; vehicleType?: string; expiresAt?: string; validUntil?: string };
+    type RowIn = {
+      plate?: string; owner?: string; building?: string; slot?: string; parkingSpot?: string;
+      wxUid?: string; wx_uid?: string; vehicleType?: string; expiresAt?: string; validUntil?: string;
+    };
     let rows: RowIn[] = [];
 
     if (Array.isArray(body?.rows)) {
       rows = body.rows as RowIn[];
     } else if (typeof body?.csv === 'string') {
       const lines = body.csv.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-      const start = lines[0]?.toLowerCase().includes('plate') ? 1 : 0;
+      const header = lines[0]?.toLowerCase() ?? '';
+      const hasHeader = header.includes('plate');
+      const headers = hasHeader ? header.split(/[,;\t]/).map((c) => c.trim()) : [];
+      const start = hasHeader ? 1 : 0;
       for (let i = start; i < lines.length; i++) {
         const cols = lines[i].split(/[,;\t]/).map((c) => c.trim());
-        rows.push({
-          plate: cols[0],
-          owner: cols[1] ?? '',
-          building: cols[2] ?? '',
-          slot: cols[3] ?? '',
-          vehicleType: cols[4] ?? 'private',
-          expiresAt: cols[5] || undefined,
-        });
+        if (hasHeader) {
+          const idx = (name: string) => headers.indexOf(name);
+          rows.push({
+            plate: cols[idx('plate')],
+            owner: cols[idx('owner')] ?? '',
+            building: cols[idx('building')] ?? '',
+            parkingSpot: cols[idx('parkingspot')] ?? cols[idx('slot')] ?? '',
+            wxUid: cols[idx('wxuid')] ?? '',
+            vehicleType: cols[idx('vehicletype')] ?? 'private',
+            expiresAt: cols[idx('validuntil')] || cols[idx('expiresat')] || undefined,
+          });
+        } else {
+          // plate,owner,building,parkingSpot,wxUid,vehicleType,validUntil
+          rows.push({
+            plate: cols[0],
+            owner: cols[1] ?? '',
+            building: cols[2] ?? '',
+            parkingSpot: cols[3] ?? '',
+            wxUid: cols[4] ?? '',
+            vehicleType: cols[5] ?? 'private',
+            expiresAt: cols[6] || undefined,
+          });
+        }
       }
     } else {
       throw httpError('rows or csv is required', 400);
@@ -1273,7 +1471,10 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     let success = 0;
     let failed = 0;
     const errors: Array<{ index: number; plate?: string; error: string }> = [];
-    const validRows: Array<{ plate: string; owner: string; building: string; parkingSpot: string; vehicleType: 'private' | 'visitor'; validUntil: string | null }> = [];
+    const validRows: Array<{
+      plate: string; owner: string; building: string; parkingSpot: string;
+      wxUid: string; vehicleType: 'private' | 'visitor'; validUntil: string | null;
+    }> = [];
 
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
@@ -1282,10 +1483,11 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
         const owner = optionalString(row.owner);
         const building = optionalString(row.building);
         const parkingSpot = optionalString(row.parkingSpot ?? row.slot);
+        const wxUid = optionalWxUid(row.wxUid ?? row.wx_uid);
         const vehicleTypeRaw = optionalString(row.vehicleType, 'private');
         if (vehicleTypeRaw !== 'private' && vehicleTypeRaw !== 'visitor') throw httpError('vehicleType is invalid', 400);
         const validUntil = optionalValidUntil(row.validUntil ?? row.expiresAt);
-        validRows.push({ plate, owner, building, parkingSpot, vehicleType: vehicleTypeRaw, validUntil });
+        validRows.push({ plate, owner, building, parkingSpot, wxUid, vehicleType: vehicleTypeRaw, validUntil });
         success++;
       } catch (error) {
         failed++;
@@ -1297,12 +1499,12 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
       const whitelistId = await ensureGlobalWhitelist(client, admin);
       for (const row of validRows) {
         await client.query(
-          `INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, parking_spot, valid_until)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+          `INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, parking_spot, valid_until, wx_uid)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
            ON CONFLICT (whitelist_id, plate) DO UPDATE SET
              owner_name=EXCLUDED.owner_name, building=EXCLUDED.building, category=EXCLUDED.category,
-             parking_spot=EXCLUDED.parking_spot, valid_until=EXCLUDED.valid_until`,
-          [randomUUID(), whitelistId, row.plate, row.owner, row.building, row.vehicleType, row.parkingSpot, row.validUntil],
+             parking_spot=EXCLUDED.parking_spot, valid_until=EXCLUDED.valid_until, wx_uid=EXCLUDED.wx_uid`,
+          [randomUUID(), whitelistId, row.plate, row.owner, row.building, row.vehicleType, row.parkingSpot, row.validUntil, row.wxUid],
         );
       }
     });

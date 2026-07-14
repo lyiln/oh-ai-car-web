@@ -46,7 +46,14 @@ function httpJson(path, method = 'GET', payload, cookie) {
       let text = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => { text += chunk; });
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: text ? JSON.parse(text) : null }));
+      res.on('end', () => {
+        if (!text) return resolve({ status: res.statusCode, headers: res.headers, body: null });
+        try {
+          resolve({ status: res.statusCode, headers: res.headers, body: JSON.parse(text) });
+        } catch {
+          reject(new Error(`Expected JSON from ${path}, received HTTP ${res.statusCode ?? 'unknown'}: ${text.slice(0, 200)}`));
+        }
+      });
     });
     req.once('error', reject);
     if (body) req.write(body);
@@ -100,6 +107,11 @@ try {
   await connectAndSubscribe(cookie, vehicle.body.vehicle.id);
   await closesUnauthenticated();
   console.log('Deployment live WebSocket verification passed');
+} catch (error) {
+  console.error('Deployment live WebSocket verification failed; collecting project diagnostics.');
+  compose(['ps'], true);
+  compose(['logs', '--no-color'], true);
+  throw error;
 } finally {
   compose(['down', '-v', '--remove-orphans'], true);
 }
