@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -13,6 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 EDGE = ROOT / "edge-agent"
 SECRETS = ROOT / "scripts" / ".local-jetson-gps.json"
 PASSWORD = os.environ["JETSON_SSH_PASSWORD"]
+HOST = os.environ.get("JETSON_HOST", "10.82.66.179")
+USER = os.environ.get("JETSON_SSH_USER", "jetson")
 REMOTE = "/home/jetson/oh-ai-car-edge"
 NAME = "oh-ai-gps"
 
@@ -25,10 +28,14 @@ def run(client, cmd, timeout=180):
 
 
 def main():
+    if os.environ.get("JETSON_ALLOW_CONTAINER_REPLACE") != "1":
+        print("Set JETSON_ALLOW_CONTAINER_REPLACE=1 before replacing a remote container", file=sys.stderr)
+        return 2
     secrets = json.loads(SECRETS.read_text(encoding="utf-8"))
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect("10.82.66.179", username="jetson", password=PASSWORD, timeout=20, allow_agent=False, look_for_keys=False)
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())
+    client.connect(HOST, username=USER, password=PASSWORD, timeout=20, allow_agent=False, look_for_keys=False)
 
     run(client, f"mkdir -p {REMOTE}")
     sftp = client.open_sftp()

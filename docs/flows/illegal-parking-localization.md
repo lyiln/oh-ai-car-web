@@ -4,13 +4,13 @@
 
 ## 坐标来源优先级
 
-1. **观测直传（`coordinateSource: observation`）**  
+1. **观测直传（`coordinateSource: observation`）**
    设备在 `POST /device/v1/patrol/tasks/:id/events` 的 `observation` 事件中携带 `longitude` / `latitude`（与当前 `/gps/fix` 同步）。平台写入 `plate_observations`，查询违规时直接使用。
 
-2. **遥测回填（`coordinateSource: telemetry`）**  
+2. **遥测回填（`coordinateSource: telemetry`）**
    若观测未带坐标，`GET /api/violations` 会在违规发生时刻前后 **±60 秒**内，取同车 `telemetry_points` 中时间最近的一点作为坐标。依赖边缘侧 `edge-agent` 持续上报 `POST /device/v1/telemetry`。
 
-3. **暂无（`coordinateSource: none`）**  
+3. **暂无（`coordinateSource: none`）**
    观测无坐标且窗口内无遥测时，地图不绘制标记；列表与抽屉仍展示航点名、禁停区、白名单车主信息。
 
 ## 设备侧建议
@@ -49,4 +49,5 @@
 
 - 观测去重保留坐标：`backend/src/app.ts`
 - 违规查询回填：`backend/src/routes/patrol-platform.ts`（`GET /api/violations`）
+- 真实设备的 ROS/GPS 运行时恢复：按 `NEXT_SESSION.md` 的阶段 1.5 门禁单独审批
 - Jetson GPS 遥测部署：`docs/deployment/jetson-gps-setup.md`

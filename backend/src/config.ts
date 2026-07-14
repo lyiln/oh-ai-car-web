@@ -4,6 +4,7 @@ export interface Config {
   host: string;
   port: number;
   cookieSecure: boolean;
+  trustProxy: boolean;
   publicOrigin: string | undefined;
   allowedOrigins: string[];
   bootstrapAdminUsername: string | undefined;
@@ -11,7 +12,12 @@ export interface Config {
   bootstrapAdminEmail: string | undefined;
   otpExpiryMinutes: number;
   otpResendCooldownSeconds: number;
-  otpExposeForClientDelivery: boolean;
+  smtpHost: string | undefined;
+  smtpPort: number;
+  smtpSecure: boolean;
+  smtpUser: string | undefined;
+  smtpPassword: string | undefined;
+  smtpFrom: string | undefined;
   aiBaseUrl: string | undefined;
   aiApiKey: string | undefined;
   aiModel: string;
@@ -34,6 +40,7 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     host: process.env.HOST ?? '127.0.0.1',
     port: Number(process.env.PORT ?? 8788),
     cookieSecure: process.env.COOKIE_SECURE === 'true',
+    trustProxy: process.env.PLATFORM_TRUST_PROXY === 'true',
     publicOrigin,
     allowedOrigins,
     bootstrapAdminUsername: process.env.BOOTSTRAP_ADMIN_USERNAME,
@@ -41,7 +48,12 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     bootstrapAdminEmail: process.env.BOOTSTRAP_ADMIN_EMAIL,
     otpExpiryMinutes: Number(process.env.OTP_EXPIRY_MINUTES ?? 5),
     otpResendCooldownSeconds: Number(process.env.OTP_RESEND_COOLDOWN_SECONDS ?? 60),
-    otpExposeForClientDelivery: process.env.OTP_EXPOSE_FOR_CLIENT_DELIVERY === 'true',
+    smtpHost: process.env.SMTP_HOST,
+    smtpPort: Number(process.env.SMTP_PORT ?? 587),
+    smtpSecure: process.env.SMTP_SECURE === 'true',
+    smtpUser: process.env.SMTP_USER,
+    smtpPassword: process.env.SMTP_PASSWORD,
+    smtpFrom: process.env.SMTP_FROM,
     aiBaseUrl: process.env.AI_BASE_URL,
     aiApiKey: process.env.AI_API_KEY,
     aiModel: process.env.AI_MODEL ?? 'deepseek-v4-pro',
@@ -50,6 +62,15 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     wxPusherEndpoint: process.env.WXPUSHER_ENDPOINT ?? 'https://wxpusher.zjiecode.com',
     ...overrides,
   };
-  if (process.env.NODE_ENV === 'production' && !config.publicOrigin) throw new Error('PLATFORM_PUBLIC_ORIGIN is required in production');
+  if (process.env.NODE_ENV === 'production') {
+    if (!config.publicOrigin) throw new Error('PLATFORM_PUBLIC_ORIGIN is required in production');
+    if (config.sessionSecret === 'development-only-change-me' || config.sessionSecret.length < 32) {
+      throw new Error('SESSION_SECRET must be at least 32 characters and must not use the development default in production');
+    }
+    if (!config.cookieSecure) throw new Error('COOKIE_SECURE=true is required in production');
+    if (!config.smtpHost || !config.smtpUser || !config.smtpPassword || !config.smtpFrom) {
+      throw new Error('SMTP_HOST, SMTP_USER, SMTP_PASSWORD, and SMTP_FROM are required in production');
+    }
+  }
   return config;
 }

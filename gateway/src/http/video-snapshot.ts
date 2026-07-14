@@ -102,6 +102,16 @@ function resolveRelativeUrl(base: string, href: string): string | null {
   }
 }
 
+function matchesVideoTarget(url: string, target: SnapshotTarget): boolean {
+  try {
+    const parsed = new URL(url);
+    const port = Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80));
+    return parsed.protocol === 'http:' && parsed.hostname === target.host && port === target.videoPort;
+  } catch {
+    return false;
+  }
+}
+
 function parseStreamUrlsFromHtml(html: string, pageUrl: string): string[] {
   const urls: string[] = [];
   const patterns = [
@@ -166,6 +176,7 @@ export async function fetchCarVideoSnapshot(target: SnapshotTarget): Promise<Buf
     if (page.status >= 200 && page.status < 300) {
       const html = page.body.toString('utf8');
       for (const streamUrl of parseStreamUrlsFromHtml(html, index2)) {
+        if (!matchesVideoTarget(streamUrl, target)) continue;
         const jpeg = await tryFetchJpeg(streamUrl);
         if (jpeg) return jpeg;
       }

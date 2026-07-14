@@ -75,12 +75,13 @@ export function WhitelistPage() {
   }, [query]);
 
   const refresh = async (q = debouncedQuery) => {
+    if (!isAdmin) return;
     setEntries(await opsClient.whitelist(q || undefined));
   };
 
   useEffect(() => {
     void refresh(debouncedQuery).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : '加载失败'));
-  }, [debouncedQuery]);
+  }, [debouncedQuery, isAdmin]);
 
   const closeFormDrawer = () => {
     setAddOpen(false);
@@ -163,6 +164,10 @@ export function WhitelistPage() {
   };
 
   const formOpen = addOpen || Boolean(editId);
+
+  if (!isAdmin) {
+    return <div className="page"><p className="error">仅管理员可以查看和管理全局白名单。</p></div>;
+  }
 
   return (
     <div className="page">

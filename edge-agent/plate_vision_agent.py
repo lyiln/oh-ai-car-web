@@ -3,7 +3,7 @@
 Run YOLO plate detection on a camera stream and post patrol observations.
 
 Requires:
-  - yolo-v5/oh-ai-car-YOLOv5 (or vendor/oh-ai-car-YOLOv5) with platform_hook.py
+  - YOLOv5/oh-ai-car-YOLOv5 (or legacy yolo-v5/vendor path) with platform_hook.py
   - PLATFORM_API_URL + DEVICE_CREDENTIAL
   - Active patrol task (queued on platform) or PLATE_VISION_TASK_ID + PLATE_VISION_WAYPOINT_ID
 """
@@ -96,7 +96,7 @@ def run_loop() -> None:
     detector = load_plate_detector()
     store = default_store()
     if os.environ.get("EVIDENCE_SERVE", "1") == "1":
-        host = os.environ.get("EVIDENCE_HOST", "0.0.0.0")
+        host = os.environ.get("EVIDENCE_HOST", "127.0.0.1")
         port = int(os.environ.get("EVIDENCE_PORT", "8089"))
         store.start_server(host, port)
         print(f"Evidence server http://{host}:{port}/", flush=True)
@@ -145,8 +145,18 @@ def run_loop() -> None:
             best = max(detections, key=lambda item: item.confidence)
             evidence_bytes = _encode_jpeg(frame)
             annotated_bytes = _encode_jpeg(_annotate(frame, detections))
-            evidence_url = store.save_jpeg(evidence_bytes, "evidence")
-            annotated_url = store.save_jpeg(annotated_bytes, "annotated")
+            # Prefer host-platform storage so Web admin can view without reaching Jetson.
+            upload_to_platform = os.environ.get("EVIDENCE_UPLOAD_TO_PLATFORM", "1") == "1"
+            if upload_to_platform:
+                evidence_url = client.upload_evidence(evidence_bytes, "evidence")
+                annotated_url = client.upload_evidence(annotated_bytes, "annotated")
+            else:
+                evidence_url = store.save_jpeg(evidence_bytes, "evidence")
+                annotated_url = store.save_jpeg(annotated_bytes, "annotated")
+            # Keep a local copy for edge debugging even when uploaded to host.
+            if os.environ.get("EVIDENCE_KEEP_LOCAL", "1") == "1":
+                store.save_jpeg(evidence_bytes, "local-evidence")
+                store.save_jpeg(annotated_bytes, "local-annotated")
             longitude, latitude = _latest_gps()
 
             event = {

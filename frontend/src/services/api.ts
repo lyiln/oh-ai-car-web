@@ -9,7 +9,7 @@ export interface Device {
   videoPort: number;
   bridgeUrl?: string;
   description?: string;
-  status?: 'online' | 'offline' | 'patrolling' | 'fault';
+  status?: 'online' | 'offline' | 'patrolling';
   lastPatrolAt?: string | null;
   archived?: boolean;
 }
@@ -42,6 +42,7 @@ export interface PatrolEvent {
   confidence?: number | null;
   thumbnailUrl?: string | null;
   message?: string;
+  plateMatch?: PlateMatchInfo | null;
 }
 
 export interface MapZone {
@@ -75,6 +76,13 @@ export interface Violation {
   confidence?: number | null;
 }
 
+export interface PlateMatchInfo {
+  mode: 'exact' | 'partial';
+  matchedPlate: string;
+  fragment?: string | null;
+  direction?: 'scan_in_whitelist' | 'whitelist_in_scan';
+}
+
 export interface Review {
   id: string;
   eventId: string;
@@ -84,6 +92,8 @@ export interface Review {
   waypoint?: string | null;
   deviceName?: string | null;
   evidenceUrl?: string | null;
+  confidence?: number | null;
+  plateMatch?: PlateMatchInfo | null;
   suggestion?: string | null;
 }
 
@@ -114,9 +124,8 @@ export interface PatrolReport {
   date?: string;
   violationCount?: number;
   visitorCount?: number;
-  htmlUrl?: string | null;
-  csvUrl?: string | null;
-  zipUrl?: string | null;
+  htmlContent?: string;
+  csvContent?: string;
   summary?: string;
 }
 
@@ -155,6 +164,15 @@ export interface Waypoint {
   longitude: number;
   latitude: number;
   order?: number;
+}
+
+// map 坐标系（米）下的位姿点，用于楼道 SLAM 地图。
+export interface PosePoint {
+  occurredAt: string;
+  x: number;
+  y: number;
+  yaw: number;
+  mapVersion?: string | null;
 }
 
 export interface ResidentDestination {

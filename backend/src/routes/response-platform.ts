@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
-import type { Database } from '../db/index.js';
 import { generateAdvice } from '../ai-advisor.js';
+import type { Database } from '../db/index.js';
+import { matchWhitelistPlate, type PlateMatchResult } from '../plate-match.js';
 import { isWxPusherConfigured, sendWxPusherMessage, type WxPusherConfig } from '../notify/wxpusher.js';
 
 type User = { id: string; role: 'admin' | 'operator' };
@@ -60,16 +61,48 @@ const RESPONSE_SELECT = `
 export async function createResponseCandidate(
   db: Database,
   hub: Hub,
-  input: { observationId: string; taskId: string; vehicleId: string; plate: string | null; confidence: number; noParking: boolean; evidenceUrl: string | null },
+  input: {
+    observationId: string;
+    taskId: string;
+    vehicleId: string;
+    plate: string | null;
+    /** Full whitelist plate resolved by exact/partial match; defaults to scanned plate. */
+    matchedPlate?: string | null;
+    plateMatch?: PlateMatchResult | null;
+    confidence: number;
+    noParking: boolean;
+    evidenceUrl: string | null;
+  },
 ): Promise<{ responseEligible: boolean; responseTaskId?: string; reason: string; ownerName?: string; building?: string; destinationId?: string }> {
   if (!input.noParking) return { responseEligible: false, reason: 'not_in_no_parking_roi' };
   if (!input.evidenceUrl) return { responseEligible: false, reason: 'evidence_required' };
   if (!input.plate || input.confidence < 0.75) return { responseEligible: false, reason: 'plate_review_required' };
+
+  // Prefer the plateMatch from observation classification so doorstep follows the same rules
+  // (exact + partial scan⊆whitelist + whitelist⊆scan). Recompute if not provided.
+  let resolvedMatch: PlateMatchResult | null = input.plateMatch && input.plateMatch.category === 'private'
+    ? input.plateMatch
+    : null;
+  if (!resolvedMatch) {
+    const entries = await db.query<{ plate: string; category: 'private' | 'visitor' }>(
+      `SELECT e.plate, e.category
+       FROM patrol_tasks t JOIN whitelist_entries e ON e.whitelist_id=t.whitelist_id
+       WHERE t.id=$1`,
+      [input.taskId],
+    );
+    const recomputed = matchWhitelistPlate(input.plate, entries.rows);
+    if (!recomputed || recomputed.category !== 'private') {
+      return { responseEligible: false, reason: 'registered_private_vehicle_required' };
+    }
+    resolvedMatch = recomputed;
+  }
+
+  const lookupPlate = resolvedMatch.matchedPlate || input.matchedPlate || input.plate;
   const match = await db.query<{ owner_name: string; building: string; destination_id: string | null; wx_uid: string }>(
     `SELECT e.owner_name,e.building,e.destination_id,COALESCE(e.wx_uid,'') AS wx_uid
      FROM patrol_tasks t JOIN whitelist_entries e ON e.whitelist_id=t.whitelist_id
      WHERE t.id=$1 AND e.plate=$2 AND e.category='private' LIMIT 1`,
-    [input.taskId, input.plate],
+    [input.taskId, lookupPlate],
   );
   const entry = match.rows[0];
   if (!entry) return { responseEligible: false, reason: 'registered_private_vehicle_required' };
@@ -84,6 +117,8 @@ export async function createResponseCandidate(
   if (!destinationId) return { responseEligible: false, reason: 'resident_destination_required', ownerName: entry.owner_name, building: entry.building };
   const responseTaskId = randomUUID();
   const violationId = randomUUID();
+  // Persist the resolved full plate so operators see the whitelist identity, not the OCR fragment.
+  const plateForRecord = lookupPlate;
   const created = await db.transaction(async (client) => {
     const existing = await client.query<{ id: string; violation_id: string | null }>('SELECT id,violation_id FROM response_tasks WHERE observation_id=$1 FOR UPDATE', [input.observationId]);
     if (existing.rows[0]) return { id: existing.rows[0].id, violationId: existing.rows[0].violation_id, newlyCreated: false };
@@ -94,19 +129,19 @@ export async function createResponseCandidate(
     await client.query(
       `INSERT INTO violations (id,plate,violation_type,task_id,vehicle_id,waypoint,priority,disposition,evidence_url,occurred_at)
        SELECT $1,$2,'no_parking',$3,$4,$5,'high','pending',$6,occurred_at FROM plate_observations WHERE id=$7`,
-      [violationId, input.plate, input.taskId, input.vehicleId, waypoint.rows[0]?.name ?? '', input.evidenceUrl, input.observationId],
+      [violationId, plateForRecord, input.taskId, input.vehicleId, waypoint.rows[0]?.name ?? '', input.evidenceUrl, input.observationId],
     );
     await client.query(
       `INSERT INTO response_tasks
        (id,observation_id,violation_id,source_patrol_task_id,source_vehicle_id,destination_id,plate,owner_name,building,owner_wx_uid,status,eligibility_reason)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending_review','eligible_after_operator_confirmation')`,
-      [responseTaskId, input.observationId, violationId, input.taskId, input.vehicleId, destinationId, input.plate, entry.owner_name, entry.building, entry.wx_uid],
+      [responseTaskId, input.observationId, violationId, input.taskId, input.vehicleId, destinationId, plateForRecord, entry.owner_name, entry.building, entry.wx_uid],
     );
     return { id: responseTaskId, violationId, newlyCreated: true };
   });
   if (created.newlyCreated) {
     hub.publishPatrol({ type: 'response_status', responseTaskId: created.id, vehicleId: input.vehicleId, status: 'pending_review' });
-    hub.publishPatrol({ type: 'violation_alert', violationId: created.violationId, vehicleId: input.vehicleId, plate: input.plate });
+    hub.publishPatrol({ type: 'violation_alert', violationId: created.violationId, vehicleId: input.vehicleId, plate: plateForRecord });
   }
   return { responseEligible: true, responseTaskId: created.id, reason: 'operator_confirmation_required', ownerName: entry.owner_name, building: entry.building, destinationId };
 }
@@ -124,10 +159,10 @@ async function assignVehicle(db: Database, taskId: string): Promise<string> {
          AND NOT EXISTS (SELECT 1 FROM response_tasks r WHERE r.assigned_vehicle_id=v.id AND r.status IN ('assigned','navigating','arrived','cancellation_requested'))
          AND NOT EXISTS (SELECT 1 FROM control_leases l WHERE l.vehicle_id=v.id AND l.released_at IS NULL AND l.expires_at>now())
          AND (v.id=$1 OR NOT EXISTS (SELECT 1 FROM patrol_tasks p WHERE p.vehicle_id=v.id AND p.status IN ('queued','running','cancellation_requested')))
-         AND (v.id=$1 OR EXISTS (SELECT 1 FROM patrol_routes pr WHERE pr.vehicle_id=v.id AND pr.map_version=$2))
-         AND (v.id=$1 OR v.last_seen_at>now()-interval '2 minutes' OR EXISTS
+         AND EXISTS (SELECT 1 FROM patrol_routes pr WHERE pr.vehicle_id=v.id AND pr.map_version=$2)
+         AND (v.last_seen_at>now()-interval '2 minutes' OR EXISTS
            (SELECT 1 FROM telemetry_points online WHERE online.vehicle_id=v.id AND online.occurred_at>now()-interval '2 minutes'))
-         AND (v.id=$1 OR COALESCE((SELECT battery_pct FROM telemetry_points battery WHERE battery.vehicle_id=v.id ORDER BY occurred_at DESC LIMIT 1),100)>=20)
+         AND (SELECT battery_pct FROM telemetry_points battery WHERE battery.vehicle_id=v.id ORDER BY occurred_at DESC LIMIT 1)>=20
        ORDER BY
          CASE WHEN v.id=$1 THEN 1 ELSE 0 END,
          CASE WHEN v.last_seen_at>now()-interval '2 minutes' THEN 0 ELSE 1 END,

@@ -5,15 +5,21 @@ coverage/
 *.log
 .env*
 !.env.example
+edge-agent/agent.env
+.dbg/
+debug-paddle-pir-ocr.md
 scripts/.local-jetson-gps.json
 scripts/.local/
 vendor/oh-ai-car-YOLOv5/
+yolo-v5/
 edge-agent/evidence-cache/
-
-# YOLO plate repo: commit source + weights under yolo-v5/**/weights/*.pt
-# Ignore local inference/runtime artifacts only
-yolo-v5/**/demo_output/
-yolo-v5/**/__pycache__/
-yolo-v5/**/.pytest_cache/
-yolo-v5/**/web_test_app/node_modules/
-yolo-v5/**/web_test_app/dist/
+backend/data/evidence/
+data/evidence/
+edge-agent/__pycache__/
+scripts/.local-plate-task.json
+*.pt
+!YOLOv5/oh-ai-car-YOLOv5/**/*.pt
+/tmp
+日报*.md
+learning/
+project-map.md

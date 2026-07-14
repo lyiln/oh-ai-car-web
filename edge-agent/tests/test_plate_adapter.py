@@ -15,11 +15,13 @@ os.environ["PLATE_DETECTOR_MODE"] = "mock"
 
 class PlateAdapterTests(unittest.TestCase):
     def test_mock_detector_returns_bbox(self) -> None:
-        import numpy as np
         from yolo_plate_adapter import load_plate_detector
 
         detector = load_plate_detector()
-        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        class Frame:
+            shape = (480, 640, 3)
+
+        frame = Frame()
         results = detector.detect(frame)
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].plate, "DEMO001")

@@ -6,8 +6,6 @@ const DEFAULT_PROBE_TIMEOUT_MS = 2000;
 export class CarTcpClient {
   private socket: net.Socket | null = null;
   private target: ConnectionConfig | null = null;
-  /** Preserved after unexpected close so write() can reconnect once. */
-  private lastTarget: ConnectionConfig | null = null;
   private connected = false;
   private readonly stateListeners = new Set<(connected: boolean, target: ConnectionConfig | null, error?: string) => void>();
 
@@ -23,7 +21,6 @@ export class CarTcpClient {
   async connect(target: ConnectionConfig): Promise<void> {
     this.disconnect();
     this.target = target;
-    this.lastTarget = target;
     const socket = new net.Socket();
     this.socket = socket;
     const timeoutMs = target.timeoutMs ?? 3000;
@@ -73,21 +70,9 @@ export class CarTcpClient {
     });
   }
 
-  /**
-   * Write a control packet. If the socket is down, reconnect once to lastTarget
-   * and retry (APP-like TCPClientManager reconnect behavior, plus resend).
-   */
   async write(message: string): Promise<void> {
-    try {
-      await this.writeOnce(message);
-    } catch (firstError) {
-      const retryTarget = this.target ?? this.lastTarget;
-      if (!retryTarget) throw firstError;
-      await this.connect(retryTarget);
-      await this.writeOnce(message);
-    }
+    await this.writeOnce(message);
   }
-
   /** Short TCP reachability check without claiming the control session. */
   static async probe(host: string, tcpPort: number, timeoutMs = DEFAULT_PROBE_TIMEOUT_MS): Promise<ProbeResult> {
     const trimmed = host.trim();
@@ -130,13 +115,6 @@ export class CarTcpClient {
     this.emit();
   }
 
-  /** Clear reconnect target when the operator explicitly disconnects. */
-  clearLastTarget(): void {
-    this.lastTarget = null;
-  }
-
   get isConnected(): boolean { return this.connected; }
   get currentTarget(): ConnectionConfig | null { return this.target; }
-  /** True when an unexpected drop left a target we can reconnect to. */
-  get hasReconnectTarget(): boolean { return this.lastTarget !== null; }
 }

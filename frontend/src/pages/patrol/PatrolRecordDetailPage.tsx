@@ -1,11 +1,18 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { LiveMap } from '../../components/map/LiveMap.js';
-import type { PatrolEvent, PatrolReport, PatrolTask, TrackPoint } from '../../services/api.js';
+import type { PatrolEvent, PatrolReport, PatrolTask, PlateMatchInfo, TrackPoint } from '../../services/api.js';
 import * as deviceClient from '../../services/deviceClient.js';
 import * as patrolClient from '../../services/patrolClient.js';
 
 type Tab = 'timeline' | 'map' | 'report' | 'disposition';
+
+function plateMatchHint(match: PlateMatchInfo): string {
+  if (match.mode === 'exact') return `精确→${match.matchedPlate}`;
+  const frag = match.fragment ? `/${match.fragment}` : '';
+  const dir = match.direction === 'whitelist_in_scan' ? '白名单⊆扫描' : '扫描⊆白名单';
+  return `模糊→${match.matchedPlate}${frag}（${dir}）`;
+}
 
 export function PatrolRecordDetailPage() {
   const { id = '' } = useParams();
@@ -15,6 +22,17 @@ export function PatrolRecordDetailPage() {
   const [report, setReport] = useState<PatrolReport | null>(null);
   const [points, setPoints] = useState<TrackPoint[]>([]);
   const [error, setError] = useState('');
+
+  const previewHtml = () => {
+    if (!report?.htmlContent) return;
+    const url = URL.createObjectURL(new Blob([report.htmlContent], { type: 'text/html;charset=utf-8' }));
+    window.open(url, '_blank', 'noopener,noreferrer'); window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  };
+  const downloadCsv = () => {
+    if (!report?.csvContent) return;
+    const url = URL.createObjectURL(new Blob([`\uFEFF${report.csvContent}`], { type: 'text/csv;charset=utf-8' }));
+    const anchor = document.createElement('a'); anchor.href = url; anchor.download = `patrol-report-${report.taskId.slice(0, 8)}.csv`; anchor.click(); URL.revokeObjectURL(url);
+  };
 
   useEffect(() => {
     if (!id) return;
@@ -77,12 +95,13 @@ export function PatrolRecordDetailPage() {
         {tab === 'timeline' && (
           events.length === 0 ? <div className="empty-state">暂无识别事件</div> : (
             <table>
-              <thead><tr><th>时间</th><th>车牌</th><th>判定</th><th>航点</th></tr></thead>
+              <thead><tr><th>时间</th><th>车牌</th><th>匹配依据</th><th>判定</th><th>航点</th></tr></thead>
               <tbody>
                 {events.map((event) => (
                   <tr key={event.id}>
                     <td>{new Date(event.occurredAt).toLocaleString()}</td>
                     <td>{event.plate ?? '未识别'}</td>
+                    <td className="muted">{event.plateMatch ? plateMatchHint(event.plateMatch) : '-'}</td>
                     <td>{event.verdict ?? '-'}</td>
                     <td>{event.waypoint ?? '-'}</td>
                   </tr>
@@ -97,9 +116,8 @@ export function PatrolRecordDetailPage() {
             <div className="stack-form">
               <p>{report.summary ?? `任务 ${report.taskId} 报告`}</p>
               <div className="button-row">
-                {report.htmlUrl && <a href={report.htmlUrl} target="_blank" rel="noreferrer">HTML 预览</a>}
-                {report.csvUrl && <a href={report.csvUrl}>下载 CSV</a>}
-                {report.zipUrl && <a href={report.zipUrl}>下载 ZIP</a>}
+                <button type="button" className="secondary" disabled={!report.htmlContent} onClick={previewHtml}>HTML 预览</button>
+                <button type="button" className="secondary" disabled={!report.csvContent} onClick={downloadCsv}>下载 CSV</button>
               </div>
             </div>
           )

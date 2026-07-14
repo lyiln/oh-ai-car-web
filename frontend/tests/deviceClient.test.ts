@@ -63,7 +63,7 @@ describe('deviceClient', () => {
     expect(fetchMock.mock.calls[0]?.[1]?.method).toBe('PUT');
   });
 
-  it('applies host/port overrides on connectDevice after lease', async () => {
+  it('uses the lease-approved target from connectDevice', async () => {
     const fetchMock = vi.fn<typeof fetch>(async (input) => {
       const url = String(input);
       if (url.includes('/api/devices/') && url.includes('/connect')) {
@@ -80,15 +80,11 @@ describe('deviceClient', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const session = await deviceClient.connectDevice('device-1', {
-      host: '10.82.66.179',
-      tcpPort: 6000,
-      videoPort: 6501,
-    });
+    const session = await deviceClient.connectDevice('device-1');
     expect(session).toMatchObject({
-      host: '10.82.66.179',
+      host: '10.0.0.1',
       tcpPort: 6000,
-      videoPort: 6501,
+      videoPort: 6500,
       leaseId: 'lease-1',
       gatewayToken: 'token-1',
     });

@@ -123,15 +123,22 @@ Reachability check that does **not** claim the controller session:
   "payload": {
     "host": "192.168.1.11",
     "tcpPort": 6000,
+    "videoPort": 6500,
+    "vehicleId": "vehicle-id",
+    "leaseToken": "platform-control-lease",
     "timeoutMs": 2000
   }
 }
 ```
 
-Result includes `probe.status`: `REACHABLE`, `TIMEOUT`, `REFUSED`, or `ERROR`.
+Probe is available only when the local gateway is configured with platform lease
+verification. Its target must exactly match the lease-approved vehicle and it
+does not claim the controller session. Result includes `probe.status`:
+`REACHABLE`, `TIMEOUT`, `REFUSED`, or `ERROR`.
 
-When a TCP socket drops after a successful `connect`, the gateway may reconnect
-once to the last target and resend the pending command (APP-like reconnect).
+When a TCP socket closes unexpectedly, the gateway does not reconnect or resend
+any command. It reports a disconnected state and requires a new operator
+connection.
 
 ### `button`
 

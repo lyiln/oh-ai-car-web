@@ -1,6 +1,6 @@
 import {
   DIRECTIONS, encodeButton, encodePhoto, encodeRocker, encodeStartRecording, encodeStopRecording, encodeTracking, encodeWheelSpeeds,
-  isPort, isSpeed, type ConnectionConfig, type ProbeResult,
+  isPort, isSpeed, type ConnectionConfig,
 } from '@oh-ai-car-web/shared';
 import { CarTcpClient } from '../tcp/car-tcp-client.js';
 
@@ -46,11 +46,6 @@ export function parseProbeConfig(payload: unknown): { host: string; tcpPort: num
   return { host: value.host.trim(), tcpPort: value.tcpPort, timeoutMs };
 }
 
-export async function probeTarget(payload: unknown): Promise<ProbeResult> {
-  const config = parseProbeConfig(payload);
-  return CarTcpClient.probe(config.host, config.tcpPort, config.timeoutMs);
-}
-
 function speeds(payload: unknown, keys: string[]): number[] {
   const value = object(payload);
   const result = keys.map((key) => value[key]);
@@ -60,7 +55,7 @@ function speeds(payload: unknown, keys: string[]): number[] {
 
 export async function dispatch(client: CarTcpClient, envelope: ParsedCommand): Promise<{ requestId: string; encoded?: string }> {
   const { requestId, payload } = envelope;
-  if (!client.isConnected && !client.hasReconnectTarget) {
+  if (!client.isConnected) {
     throw new CommandError('NOT_CONNECTED', 'TCP socket is not connected');
   }
 

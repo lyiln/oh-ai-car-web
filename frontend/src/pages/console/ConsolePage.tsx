@@ -46,9 +46,6 @@ export function ConsolePage() {
   const [expiresAt, setExpiresAt] = useState<string | null>(null);
   const [connectStep, setConnectStep] = useState<ConnectStep>('idle');
   const [gatewayReachable, setGatewayReachable] = useState(false);
-  const [host, setHost] = useState('');
-  const [tcpPort, setTcpPort] = useState(6000);
-  const [videoPort, setVideoPort] = useState(6500);
   const [recording, setRecording] = useState(false);
   const [tracking, setTracking] = useState(false);
   const [mediaPending, setMediaPending] = useState(false);
@@ -56,13 +53,9 @@ export function ConsolePage() {
   const [speeds, setSpeeds] = useState({ l1: 0, l2: 0, r1: 0, r2: 0 });
   const [connecting, setConnecting] = useState(false);
   const leaseRef = useRef<{ leaseId: string; gatewayToken: string; host: string; tcpPort: number; videoPort: number } | null>(null);
-
-  useEffect(() => {
-    if (!selectedDevice) return;
-    setHost(selectedDevice.host);
-    setTcpPort(selectedDevice.tcpPort);
-    setVideoPort(selectedDevice.videoPort);
-  }, [selectedDevice]);
+  const host = selectedDevice?.host ?? '';
+  const tcpPort = selectedDevice?.tcpPort ?? 6000;
+  const videoPort = selectedDevice?.videoPort ?? 6500;
 
   useEffect(() => gateway.onState((next) => {
     setState(next);
@@ -110,7 +103,7 @@ export function ConsolePage() {
   }, [gateway]);
 
   useEffect(() => {
-    if (!leaseId || !gatewayToken || !state.connected || !state.ownsControl) return;
+    if (!leaseId || !gatewayToken || !state.connected || !state.ownsControl || !selectedDevice || !selectedId) return;
     const timer = window.setInterval(() => {
       void deviceClient.renewLease(leaseId).then(async (renewed) => {
         setExpiresAt(renewed.expiresAt);
@@ -118,14 +111,14 @@ export function ConsolePage() {
         leaseRef.current = {
           leaseId,
           gatewayToken: renewed.gatewayToken,
-          host,
-          tcpPort,
-          videoPort,
+          host: selectedDevice.host,
+          tcpPort: selectedDevice.tcpPort,
+          videoPort: selectedDevice.videoPort,
         };
         await gateway.send('leaseRefresh', {
-          host,
-          tcpPort,
-          videoPort,
+          host: selectedDevice.host,
+          tcpPort: selectedDevice.tcpPort,
+          videoPort: selectedDevice.videoPort,
           vehicleId: selectedId,
           leaseToken: renewed.gatewayToken,
         });
@@ -141,7 +134,7 @@ export function ConsolePage() {
       });
     }, 20_000);
     return () => window.clearInterval(timer);
-  }, [leaseId, gatewayToken, state.connected, state.ownsControl, gateway, host, tcpPort, videoPort, selectedId]);
+  }, [leaseId, gatewayToken, state.connected, state.ownsControl, gateway, selectedDevice, selectedId]);
 
   const send = useCallback(async (command: string, payload: unknown) => {
     try {
@@ -170,6 +163,8 @@ export function ConsolePage() {
     setError(null);
     setStatus('');
     setConnectStep('gateway');
+    let leaseToRelease: string | null = null;
+    let connected = false;
     try {
       setStatus('① 正在连接本地网关…');
       await gateway.open();
@@ -177,17 +172,26 @@ export function ConsolePage() {
 
       setConnectStep('lease');
       setStatus('② 正在申请控制租约…');
-      const session = await deviceClient.connectDevice(selectedId, { host, tcpPort, videoPort });
+      const session = await deviceClient.connectDevice(selectedId);
+      leaseToRelease = session.leaseId ?? null;
 
       setConnectStep('probe');
       setStatus(`③ 正在探测小车 TCP ${session.host}:${session.tcpPort}…`);
-      const probed = await gateway.send('probe', { host: session.host, tcpPort: session.tcpPort, timeoutMs: 2000 });
+      const probed = await gateway.send('probe', {
+        host: session.host,
+        tcpPort: session.tcpPort,
+        videoPort: session.videoPort,
+        vehicleId: selectedDevice.id,
+        leaseToken: session.gatewayToken,
+        timeoutMs: 2000,
+      });
       if (!probed.probe || probed.probe.status !== 'REACHABLE') {
         const hint = probed.probe ? probeHint(probed.probe) : '小车 TCP 探测失败';
         setConnectStep('error');
         setError(hint);
         setStatus('探测失败，未建立控制连接');
-        if (session.leaseId) await deviceClient.releaseLease(session.leaseId).catch(() => undefined);
+        if (leaseToRelease) await deviceClient.releaseLease(leaseToRelease).catch(() => undefined);
+        leaseToRelease = null;
         return;
       }
 
@@ -200,6 +204,7 @@ export function ConsolePage() {
         vehicleId: selectedDevice.id,
         leaseToken: session.gatewayToken,
       });
+      connected = true;
 
       setLeaseId(session.leaseId ?? null);
       setGatewayToken(session.gatewayToken ?? null);
@@ -213,12 +218,10 @@ export function ConsolePage() {
           videoPort: session.videoPort,
         };
       }
-      setHost(session.host);
-      setTcpPort(session.tcpPort);
-      setVideoPort(session.videoPort);
       setConnectStep('ready');
       setStatus(`已连接 ${selectedDevice.name}（${session.host}:${session.tcpPort}）`);
     } catch (reason) {
+      if (!connected && leaseToRelease) await deviceClient.releaseLease(leaseToRelease).catch(() => undefined);
       setConnectStep('error');
       const message = reason instanceof Error ? reason.message : '连接失败';
       setError(message);
@@ -277,7 +280,6 @@ export function ConsolePage() {
   if (!selectedId || !selectedDevice) return <Navigate to="/fleet" replace />;
 
   const disabled = !state.connected || !state.ownsControl;
-  const configLocked = state.connected && state.ownsControl;
   const leaseExpiringSoon = expiresAt
     ? new Date(expiresAt).getTime() - Date.now() < 25_000
     : false;
@@ -313,41 +315,14 @@ export function ConsolePage() {
         <span className="tag">步骤 {connectStep}</span>
       </section>
 
-      <section className="panel connection-settings" aria-label="网络连接">
-        <h2>网络连接（对齐 APP NetworkSettings）</h2>
+      <section className="panel connection-settings" aria-label="已批准的网络连接">
+        <h2>已批准的设备连接</h2>
         <div className="console-network-grid">
-          <label>小车 IP
-            <input
-              aria-label="小车 IP"
-              value={host}
-              disabled={configLocked || connecting}
-              onChange={(event) => setHost(event.target.value)}
-            />
-          </label>
-          <label>TCP 端口
-            <input
-              aria-label="TCP 端口"
-              type="number"
-              min={1}
-              max={65535}
-              value={tcpPort}
-              disabled={configLocked || connecting}
-              onChange={(event) => setTcpPort(Number(event.target.value))}
-            />
-          </label>
-          <label>视频端口
-            <input
-              aria-label="视频端口"
-              type="number"
-              min={1}
-              max={65535}
-              value={videoPort}
-              disabled={configLocked || connecting}
-              onChange={(event) => setVideoPort(Number(event.target.value))}
-            />
-          </label>
+          <span>小车 IP：{host}</span>
+          <span>TCP 端口：{tcpPort}</span>
+          <span>视频端口：{videoPort}</span>
         </div>
-        <p className="muted">默认取自设备档案；连接前可临时覆盖 IP/端口（与鸿蒙 APP 首屏一致）。需本机已启动 gateway。</p>
+        <p className="muted">地址由设备档案和控制租约共同限定；请由管理员在设备管理页更新。需本机已启动 gateway。</p>
       </section>
 
       {status && <p className="notice">{status}</p>}
@@ -379,7 +354,6 @@ export function ConsolePage() {
             </div>
           </section>
           <VideoPanel host={host} port={videoPort} />
-          <PlateScanPanel host={host} videoPort={videoPort} disabled={disabled} />
           <MediaControls
             disabled={disabled}
             pending={mediaPending}
@@ -409,6 +383,14 @@ export function ConsolePage() {
             <p className="muted">松开方向键 / 窗口失焦自动停止（对齐 APP）</p>
           </section>
         </aside>
+      </div>
+      <div className="console-plate-section">
+        <PlateScanPanel
+          host={host}
+          videoPort={videoPort}
+          vehicleId={selectedId}
+          disabled={disabled}
+        />
       </div>
     </div>
   );

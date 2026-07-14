@@ -18,14 +18,12 @@ const emptyForm = {
 function statusClass(status?: string) {
   if (status === 'online') return 'tag tag-success';
   if (status === 'patrolling') return 'tag tag-info';
-  if (status === 'fault') return 'tag tag-danger';
   return 'tag';
 }
 
 function statusLabel(status?: string) {
   if (status === 'online') return '在线';
   if (status === 'patrolling') return '巡逻中';
-  if (status === 'fault') return '故障';
   return '离线';
 }
 

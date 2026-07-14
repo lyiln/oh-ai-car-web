@@ -1,6 +1,7 @@
 # Vendor: oh-ai-car-YOLOv5
 
-This directory holds the external YOLOv5 license-plate project (not vendored in Git).
+This directory is the legacy fallback location for the external YOLOv5 license-plate project.
+The repository now vendors the primary copy under `../YOLOv5/oh-ai-car-YOLOv5/`.
 
 ## Clone (after accepting GitHub invitation)
 
@@ -14,7 +15,7 @@ Or from repo root:
 python scripts/setup-yolo-plate.py
 ```
 
-Expected layout after clone:
+Expected legacy layout after clone:
 
 ```text
 vendor/oh-ai-car-YOLOv5/

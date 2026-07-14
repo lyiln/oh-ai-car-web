@@ -76,6 +76,15 @@ CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_
 `;
 
 export const migration002 = `
+CREATE TABLE IF NOT EXISTS patrol_routes (
+  id uuid PRIMARY KEY,
+  vehicle_id uuid NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  map_version text NOT NULL,
+  source_yaml text NOT NULL,
+  created_by_user_id uuid NOT NULL REFERENCES users(id),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
 ALTER TABLE patrol_routes ADD COLUMN IF NOT EXISTS vehicle_id uuid REFERENCES vehicles(id) ON DELETE CASCADE;
 ALTER TABLE patrol_routes ADD COLUMN IF NOT EXISTS map_version text;
 ALTER TABLE patrol_routes ADD COLUMN IF NOT EXISTS source_yaml text;
@@ -90,15 +99,6 @@ WHERE vehicle_id IS NULL
    OR map_version IS NULL
    OR source_yaml IS NULL
    OR created_by_user_id IS NULL;
-CREATE TABLE IF NOT EXISTS patrol_routes (
-  id uuid PRIMARY KEY,
-  vehicle_id uuid NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
-  name text NOT NULL,
-  map_version text NOT NULL,
-  source_yaml text NOT NULL,
-  created_by_user_id uuid NOT NULL REFERENCES users(id),
-  created_at timestamptz NOT NULL DEFAULT now()
-);
 CREATE INDEX IF NOT EXISTS patrol_routes_vehicle_created_idx ON patrol_routes(vehicle_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS patrol_waypoints (
   id uuid PRIMARY KEY,
@@ -369,7 +369,7 @@ DO $$
 BEGIN
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_name='whitelist_entries' AND column_name='owner'
+    WHERE table_name='whitelist_entries' AND column_name='plate'
   ) AND NOT EXISTS (
     SELECT 1 FROM information_schema.columns
     WHERE table_name='whitelist_entries' AND column_name='whitelist_id'
@@ -394,6 +394,8 @@ ALTER TABLE whitelist_imports ALTER COLUMN vehicle_id DROP NOT NULL;
 
 -- Ensure destination_id exists on modern table.
 ALTER TABLE whitelist_entries ADD COLUMN IF NOT EXISTS destination_id uuid REFERENCES resident_destinations(id) ON DELETE SET NULL;
+ALTER TABLE whitelist_entries ADD COLUMN IF NOT EXISTS parking_spot text NOT NULL DEFAULT '';
+ALTER TABLE whitelist_entries ADD COLUMN IF NOT EXISTS valid_until timestamptz;
 
 -- Ensure patrol_tasks.whitelist_id exists for snapshot linkage.
 ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS whitelist_id uuid REFERENCES whitelist_imports(id);
@@ -440,11 +442,11 @@ BEGIN
       SELECT 1 FROM information_schema.columns
       WHERE table_name='whitelist_entries' AND column_name='whitelist_id'
     ) THEN
-      INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, destination_id)
-      SELECT gen_random_uuid(), global_id, plate, owner_name, building, category, destination_id
+      INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, destination_id, parking_spot, valid_until)
+      SELECT gen_random_uuid(), global_id, plate, owner_name, building, category, destination_id, parking_spot, valid_until
       FROM (
         SELECT DISTINCT ON (e.plate)
-          e.plate, e.owner_name, e.building, e.category, e.destination_id
+          e.plate, e.owner_name, e.building, e.category, e.destination_id, e.parking_spot, e.valid_until
         FROM whitelist_entries e
         JOIN whitelist_imports i ON i.id = e.whitelist_id
         WHERE i.is_snapshot=false AND i.vehicle_id IS NOT NULL
@@ -454,26 +456,40 @@ BEGIN
         owner_name=EXCLUDED.owner_name,
         building=EXCLUDED.building,
         category=EXCLUDED.category,
-        destination_id=COALESCE(EXCLUDED.destination_id, whitelist_entries.destination_id);
+        destination_id=COALESCE(EXCLUDED.destination_id, whitelist_entries.destination_id),
+        parking_spot=EXCLUDED.parking_spot,
+        valid_until=EXCLUDED.valid_until;
     END IF;
 
     IF to_regclass('public.whitelist_entries_legacy_009') IS NOT NULL THEN
-      INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, destination_id)
-      SELECT gen_random_uuid(), global_id, plate,
-             COALESCE(owner, ''),
-             COALESCE(building, ''),
-             CASE WHEN vehicle_type='visitor' THEN 'visitor' ELSE 'private' END,
-             destination_id
-      FROM (
-        SELECT DISTINCT ON (plate) plate, owner, building, vehicle_type, destination_id
-        FROM whitelist_entries_legacy_009
-        ORDER BY plate, created_at DESC, id DESC
-      ) AS legacy
+      -- Old installations used several flat-table shapes. Read rows through JSONB so
+      -- absent optional columns do not abort the entire migration transaction.
+      WITH legacy_rows AS (
+        SELECT to_jsonb(e) AS payload FROM whitelist_entries_legacy_009 e
+      ), deduplicated AS (
+        SELECT DISTINCT ON (payload ->> 'plate') payload
+        FROM legacy_rows
+        WHERE COALESCE(payload ->> 'plate', '') <> ''
+        ORDER BY payload ->> 'plate', COALESCE(payload ->> 'created_at', '') DESC, COALESCE(payload ->> 'id', '') DESC
+      )
+      INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, destination_id, parking_spot, valid_until)
+      SELECT gen_random_uuid(), global_id, payload ->> 'plate',
+             COALESCE(payload ->> 'owner', payload ->> 'owner_name', ''),
+             COALESCE(payload ->> 'building', ''),
+             CASE WHEN COALESCE(payload ->> 'vehicle_type', payload ->> 'category')='visitor' THEN 'visitor' ELSE 'private' END,
+             CASE WHEN COALESCE(payload ->> 'destination_id', '') ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+               THEN (payload ->> 'destination_id')::uuid ELSE NULL END,
+             COALESCE(payload ->> 'slot', payload ->> 'parking_spot', ''),
+             CASE WHEN COALESCE(payload ->> 'expires_at', payload ->> 'valid_until', '') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+               THEN COALESCE(payload ->> 'expires_at', payload ->> 'valid_until')::timestamptz ELSE NULL END
+      FROM deduplicated
       ON CONFLICT (whitelist_id, plate) DO UPDATE SET
         owner_name=EXCLUDED.owner_name,
         building=EXCLUDED.building,
         category=EXCLUDED.category,
-        destination_id=COALESCE(EXCLUDED.destination_id, whitelist_entries.destination_id);
+        destination_id=COALESCE(EXCLUDED.destination_id, whitelist_entries.destination_id),
+        parking_spot=EXCLUDED.parking_spot,
+        valid_until=EXCLUDED.valid_until;
       DROP TABLE whitelist_entries_legacy_009;
     END IF;
 
@@ -517,6 +533,34 @@ UPDATE patrol_routes SET code = 'route-' || substr(id::text, 1, 8) WHERE code IS
 `;
 
 export const migration012 = `
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS review_confidence_threshold double precision NOT NULL DEFAULT 0.75
+  CHECK (review_confidence_threshold >= 0 AND review_confidence_threshold <= 1);
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS dedupe_window_sec integer NOT NULL DEFAULT 1800
+  CHECK (dedupe_window_sec BETWEEN 60 AND 86400);
+CREATE UNIQUE INDEX IF NOT EXISTS patrol_routes_vehicle_name_version_idx
+  ON patrol_routes(vehicle_id, name, map_version);
+`;
+
+export const migration013ViolationReviewDisposition = `
+ALTER TABLE violations DROP CONSTRAINT IF EXISTS violations_disposition_check;
+ALTER TABLE violations ADD CONSTRAINT violations_disposition_check
+  CHECK (disposition IN ('pending', 'processed', 'dismissed', 'confirmed', 'false_positive', 'resolved'));
+
+UPDATE violations v
+SET disposition = CASE
+  WHEN e.review_status IN ('confirmed', 'confirm') THEN 'confirmed'
+  WHEN e.review_status = 'false_positive' THEN 'false_positive'
+  WHEN e.review_status IN ('whitelist', 'external', 'visitor') THEN 'resolved'
+  ELSE v.disposition
+END
+FROM patrol_events e
+WHERE v.event_id = e.id
+  AND e.review_status IS NOT NULL
+  AND e.review_status <> 'pending'
+  AND v.disposition = 'pending';
+`;
+
+export const migration012AiAgents = `
 CREATE TABLE IF NOT EXISTS ai_daily_reports (
   id uuid PRIMARY KEY,
   report_date date NOT NULL,
@@ -530,7 +574,7 @@ CREATE INDEX IF NOT EXISTS ai_daily_reports_date_idx ON ai_daily_reports(report_
 CREATE INDEX IF NOT EXISTS ai_daily_reports_vehicle_date_idx ON ai_daily_reports(vehicle_id, report_date DESC);
 `;
 
-export const migration013 = `
+export const migration013WhitelistPhoneSms = `
 ALTER TABLE whitelist_entries
   ADD COLUMN IF NOT EXISTS phone text NOT NULL DEFAULT '';
 
@@ -602,4 +646,107 @@ ALTER TABLE sms_notifications ADD COLUMN IF NOT EXISTS wx_uid text NOT NULL DEFA
 UPDATE sms_notifications SET wx_uid = phone WHERE wx_uid = '' AND phone IS NOT NULL AND phone <> '';
 ALTER TABLE sms_notifications DROP COLUMN IF EXISTS phone;
 ALTER TABLE sms_notifications ALTER COLUMN provider SET DEFAULT 'wxpusher';
+`;
+
+export const migration016 = `
+ALTER TABLE auth_otps ADD COLUMN IF NOT EXISTS failed_attempts smallint NOT NULL DEFAULT 0;
+ALTER TABLE auth_otps DROP CONSTRAINT IF EXISTS auth_otps_failed_attempts_check;
+ALTER TABLE auth_otps ADD CONSTRAINT auth_otps_failed_attempts_check
+  CHECK (failed_attempts BETWEEN 0 AND 5);
+`;
+
+// 楼道室内 SLAM 地图与 map 坐标位姿。
+// - map_metadata 扩展分辨率/原点/尺寸，用于前端把栅格底图与 Nav2 坐标对齐。
+// - pose_points 保存 map 坐标系下的实时/历史位姿（x/y/yaw，单位米/弧度）。
+export const migration017 = `
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS vehicle_id uuid REFERENCES vehicles(id) ON DELETE CASCADE;
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS map_version text NOT NULL DEFAULT 'floor-map-v1';
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS resolution double precision NOT NULL DEFAULT 0.05;
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS origin_x double precision NOT NULL DEFAULT 0;
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS origin_y double precision NOT NULL DEFAULT 0;
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS origin_yaw double precision NOT NULL DEFAULT 0;
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS image_width integer NOT NULL DEFAULT 0;
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS image_height integer NOT NULL DEFAULT 0;
+ALTER TABLE map_metadata ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+CREATE UNIQUE INDEX IF NOT EXISTS map_metadata_vehicle_idx ON map_metadata(vehicle_id) WHERE vehicle_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS pose_points (
+  id uuid PRIMARY KEY,
+  vehicle_id uuid NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+  occurred_at timestamptz NOT NULL,
+  x double precision NOT NULL,
+  y double precision NOT NULL,
+  yaw double precision NOT NULL,
+  map_version text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (vehicle_id, occurred_at)
+);
+CREATE INDEX IF NOT EXISTS pose_points_vehicle_time_idx ON pose_points(vehicle_id, occurred_at DESC);
+`;
+
+// 部分环境（旧 Neon / 手工改表）仍有 patrol_routes.code NOT NULL，与当前应用插入列不一致。
+// 补齐缺失值，并允许无 code 的插入；应用侧保存路线时仍会写入稳定 code。
+export const migration018 = `
+ALTER TABLE patrol_routes ADD COLUMN IF NOT EXISTS code text;
+UPDATE patrol_routes
+SET code = COALESCE(NULLIF(TRIM(code), ''), 'route-' || REPLACE(id::text, '-', ''))
+WHERE code IS NULL OR TRIM(code) = '';
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'patrol_routes' AND column_name = 'code'
+      AND is_nullable = 'NO'
+  ) THEN
+    ALTER TABLE patrol_routes ALTER COLUMN code DROP NOT NULL;
+  END IF;
+END $$;
+
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS failure_reason text;
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS finished_at timestamptz;
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS stop_requested_at timestamptz;
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS stop_confirmed_at timestamptz;
+ALTER TABLE patrol_tasks ADD COLUMN IF NOT EXISTS zero_velocity_confirmed_at timestamptz;
+`;
+
+// Web「2D Goal Pose」单点前往：对齐 Nav2 NavigateToPose，与多点巡航 patrol_tasks 分离。
+export const migration019 = `
+CREATE TABLE IF NOT EXISTS goto_goals (
+  id uuid PRIMARY KEY,
+  vehicle_id uuid NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+  x double precision NOT NULL,
+  y double precision NOT NULL,
+  yaw double precision NOT NULL DEFAULT 0,
+  status text NOT NULL CHECK (status IN ('queued','navigating','arrived','cancelled','failed','cancellation_requested')),
+  created_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  failure_reason text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  claimed_at timestamptz,
+  finished_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS goto_goals_vehicle_created_idx ON goto_goals(vehicle_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS goto_goals_vehicle_active_idx
+  ON goto_goals(vehicle_id) WHERE status IN ('queued','navigating','cancellation_requested');
+`;
+
+// Web 一键导航就绪 + 网页设初始位姿（对齐 RViz 2D Pose Estimate → /initialpose）。
+export const migration020 = `
+CREATE TABLE IF NOT EXISTS vehicle_nav_state (
+  vehicle_id uuid PRIMARY KEY REFERENCES vehicles(id) ON DELETE CASCADE,
+  prepare_requested boolean NOT NULL DEFAULT false,
+  prepare_requested_at timestamptz,
+  initial_pose_x double precision,
+  initial_pose_y double precision,
+  initial_pose_yaw double precision,
+  initial_pose_seq integer NOT NULL DEFAULT 0,
+  initial_pose_consumed_seq integer NOT NULL DEFAULT 0,
+  supervisor_seen_at timestamptz,
+  pose_ok boolean NOT NULL DEFAULT false,
+  goto_ok boolean NOT NULL DEFAULT false,
+  nav2_ok boolean NOT NULL DEFAULT false,
+  bringup_ok boolean NOT NULL DEFAULT false,
+  ready boolean NOT NULL DEFAULT false,
+  detail text NOT NULL DEFAULT '',
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
 `;

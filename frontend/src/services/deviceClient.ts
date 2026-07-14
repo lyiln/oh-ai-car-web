@@ -1,4 +1,4 @@
-import { apiRequest, type Device, type DevicePose, type DeviceStatus } from './api.js';
+import { apiRequest, type Device, type DevicePose, type DeviceStatus, type PosePoint } from './api.js';
 import type { TrackPoint, Vehicle } from './platformClient.js';
 
 function vehicleToDevice(vehicle: Vehicle): Device {
@@ -86,7 +86,6 @@ export async function deleteDevice(id: string): Promise<{ ok: true }> {
 
 export async function connectDevice(
   id: string,
-  override?: { host?: string; tcpPort?: number; videoPort?: number },
 ): Promise<{
   host: string;
   tcpPort: number;
@@ -123,12 +122,7 @@ export async function connectDevice(
     };
   }
 
-  return {
-    ...session,
-    host: override?.host?.trim() || session.host,
-    tcpPort: override?.tcpPort ?? session.tcpPort,
-    videoPort: override?.videoPort ?? session.videoPort,
-  };
+  return session;
 }
 
 export async function renewLease(leaseId: string): Promise<{ expiresAt: string; gatewayToken: string }> {
@@ -164,4 +158,24 @@ export async function track(id: string, from?: string, to?: string): Promise<Tra
     `/api/vehicles/${id}/track${qs ? `?${qs}` : ''}`,
   );
   return result.points ?? [];
+}
+
+// map 坐标系位姿轨迹（楼道 SLAM 地图）。
+export async function poseTrack(
+  id: string,
+  options?: { from?: string; to?: string; limit?: number },
+): Promise<PosePoint[]> {
+  const search = new URLSearchParams();
+  if (options?.from) search.set('from', options.from);
+  if (options?.to) search.set('to', options.to);
+  if (options?.limit) search.set('limit', String(options.limit));
+  const qs = search.toString();
+  try {
+    const result = await apiRequest<{ points: PosePoint[] }>(
+      `/api/vehicles/${id}/pose-track${qs ? `?${qs}` : ''}`,
+    );
+    return result.points ?? [];
+  } catch {
+    return [];
+  }
 }

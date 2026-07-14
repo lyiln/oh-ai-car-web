@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 
-BASE = "http://127.0.0.1:8788"
-ORIGIN = "http://127.0.0.1:5173"
-JETSON_HOST = "10.82.66.179"
+BASE = os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8788")
+ORIGIN = os.environ.get("PLATFORM_PUBLIC_ORIGIN", "http://127.0.0.1:5173")
+JETSON_HOST = os.environ.get("JETSON_HOST", "10.82.66.179")
 
 
 class Session:
@@ -40,7 +41,10 @@ class Session:
 
 def main() -> int:
     username = sys.argv[1] if len(sys.argv) > 1 else "admin"
-    password = sys.argv[2] if len(sys.argv) > 2 else "admin123"
+    password = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("JETSON_PLATFORM_ADMIN_PASSWORD", "")
+    if not password:
+        print("Pass the administrator password as argv[2] or set JETSON_PLATFORM_ADMIN_PASSWORD", file=sys.stderr)
+        return 2
     session = Session()
     status, payload = session.request("POST", "/api/auth/login", {"username": username, "password": password})
     print("login", status, payload)
@@ -92,15 +96,15 @@ def main() -> int:
     out = {
         "vehicleId": vehicle_id,
         "host": JETSON_HOST,
-        "platformApiUrl": "http://10.82.66.59:8788",
+        "platformApiUrl": os.environ.get("JETSON_PLATFORM_API_URL", BASE),
         "deviceCredential": token,
-        "devLanIp": "10.82.66.59",
+        "devLanIp": os.environ.get("JETSON_PLATFORM_LAN_HOST", ""),
     }
     path = "scripts/.local-jetson-gps.json"
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(out, fh, indent=2)
     print("wrote", path)
-    print("DEVICE_CREDENTIAL=", token)
+    print("Device credential written to the local ignored configuration file")
     return 0
 
 

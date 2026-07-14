@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { PoolClient } from 'pg';
 import type { Database } from '../db/index.js';
+import { saveEvidenceJpeg } from '../evidence-storage.js';
+import { matchWhitelistPlate, normalisePlate } from '../plate-match.js';
 
 type AuthUser = {
   id: string;
@@ -43,6 +45,8 @@ type PatrolTaskRow = {
   device_name?: string;
   route_name?: string;
   event_count?: number;
+  review_confidence_threshold?: number;
+  dedupe_window_sec?: number;
 };
 
 type RouteUser = {
@@ -62,6 +66,7 @@ export type PatrolRouteDeps = {
   acquireLease: (client: PoolClient, user: RouteUser, vehicleId: string) => Promise<{ id: string; expiresAt: Date }>;
   leaseToken: (leaseId: string, vehicleId: string, user: RouteUser, expiresAt: Date) => string;
   audit: (action: string, outcome: string, actorUserId?: string, vehicleId?: string, metadata?: Record<string, unknown>) => Promise<void>;
+  isTrustedOrigin: (origin: string | undefined) => boolean;
   hub: {
     publish: (vehicleId: string, payload: unknown) => void;
     publishPatrol?: (msg: { vehicleId: string; [key: string]: unknown }) => void;
@@ -94,7 +99,7 @@ function iso(value: Date | string | null | undefined): string | null {
   return value instanceof Date ? value.toISOString() : String(value);
 }
 
-function deviceDto(row: DeviceRow) {
+function deviceDto(row: DeviceRow, status?: 'online' | 'offline' | 'patrolling') {
   return {
     id: row.id,
     code: row.code,
@@ -107,6 +112,7 @@ function deviceDto(row: DeviceRow) {
     lastSeenAt: iso(row.last_seen_at),
     lastPatrolAt: iso(row.last_patrol_at),
     archived: row.archived,
+    status: status ?? (row.last_seen_at && Date.now() - new Date(row.last_seen_at).getTime() < 2 * 60_000 ? 'online' : 'offline'),
   };
 }
 
@@ -139,6 +145,19 @@ function optionalValidUntil(value: unknown): string | null {
   const date = new Date(trimmed);
   if (Number.isNaN(date.getTime())) throw httpError('validUntil is invalid', 400);
   return date.toISOString();
+}
+
+const DEFAULT_PATROL_RULES = { reviewConfidenceThreshold: 0.75, dedupeWindowSec: 1800 } as const;
+function patrolRules(rows: Array<{ key: string; value: unknown }>) {
+  const values = new Map(rows.map((row) => [row.key, row.value]));
+  const threshold = values.get('reviewConfidenceThreshold');
+  const window = values.get('dedupeWindowSec');
+  return {
+    reviewConfidenceThreshold: typeof threshold === 'number' && threshold >= 0 && threshold <= 1
+      ? threshold : DEFAULT_PATROL_RULES.reviewConfidenceThreshold,
+    dedupeWindowSec: typeof window === 'number' && Number.isInteger(window) && window >= 60 && window <= 86_400
+      ? window : DEFAULT_PATROL_RULES.dedupeWindowSec,
+  };
 }
 
 function optionalWxUid(value: unknown): string {
@@ -235,31 +254,64 @@ async function ensureDefaultRoute(db: Database, vehicleId: string, userId: strin
 }
 
 async function ensureMapMetadata(db: Database): Promise<{ name: string; basemap_url: string }> {
-  const existing = await db.query<{ name: string; basemap_url: string }>('SELECT name, basemap_url FROM map_metadata ORDER BY created_at LIMIT 1');
+  const existing = await db.query<{ name: string; basemap_url: string }>('SELECT name, basemap_url FROM map_metadata WHERE vehicle_id IS NULL ORDER BY created_at LIMIT 1');
   if (existing.rows[0]) return existing.rows[0];
   await db.query('INSERT INTO map_metadata (id, name, basemap_url) VALUES ($1, $2, $3)', [randomUUID(), 'default', '']);
   return { name: 'default', basemap_url: '' };
 }
 
+type MapMetaRow = {
+  id: string;
+  name: string;
+  basemap_url: string;
+  map_version: string;
+  resolution: number;
+  origin_x: number;
+  origin_y: number;
+  origin_yaw: number;
+  image_width: number;
+  image_height: number;
+};
+
+function mapMetaDto(row: MapMetaRow | undefined) {
+  if (!row) return null;
+  return {
+    name: row.name,
+    mapVersion: row.map_version,
+    resolution: Number(row.resolution),
+    originX: Number(row.origin_x),
+    originY: Number(row.origin_y),
+    originYaw: Number(row.origin_yaw),
+    imageWidth: row.image_width,
+    imageHeight: row.image_height,
+    imageUrl: row.basemap_url || null,
+  };
+}
+
+const MAP_META_SELECT = 'id, name, basemap_url, map_version, resolution, origin_x, origin_y, origin_yaw, image_width, image_height';
+
+// 优先返回该车辆专属地图；没有则回退到全局默认地图（vehicle_id 为空）。
+async function loadFloorMap(db: Database, vehicleId: string | null): Promise<MapMetaRow | undefined> {
+  if (vehicleId) {
+    const perVehicle = await db.query<MapMetaRow>(`SELECT ${MAP_META_SELECT} FROM map_metadata WHERE vehicle_id=$1 LIMIT 1`, [vehicleId]);
+    if (perVehicle.rows[0]) return perVehicle.rows[0];
+  }
+  const global = await db.query<MapMetaRow>(`SELECT ${MAP_META_SELECT} FROM map_metadata WHERE vehicle_id IS NULL AND image_width>0 ORDER BY updated_at DESC LIMIT 1`);
+  return global.rows[0];
+}
+
 async function ensureGlobalWhitelist(client: PoolClient, user: RouteUser): Promise<string> {
+  await client.query("SELECT pg_advisory_xact_lock(hashtext('oh-ai-car-web:global-whitelist'))");
   const existing = await client.query<{ id: string }>(
     'SELECT id FROM whitelist_imports WHERE vehicle_id IS NULL AND is_snapshot=false ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE',
   );
   if (existing.rows[0]) return existing.rows[0].id;
   const id = randomUUID();
-  try {
-    await client.query(
-      'INSERT INTO whitelist_imports (id,vehicle_id,name,created_by_user_id,is_snapshot) VALUES ($1,NULL,$2,$3,false)',
-      [id, '小区全局白名单', user.id],
-    );
-    return id;
-  } catch (error) {
-    const raced = await client.query<{ id: string }>(
-      'SELECT id FROM whitelist_imports WHERE vehicle_id IS NULL AND is_snapshot=false ORDER BY created_at DESC, id DESC LIMIT 1',
-    );
-    if (raced.rows[0]) return raced.rows[0].id;
-    throw error;
-  }
+  await client.query(
+    'INSERT INTO whitelist_imports (id,vehicle_id,name,created_by_user_id,is_snapshot) VALUES ($1,NULL,$2,$3,false)',
+    [id, '小区全局白名单', user.id],
+  );
+  return id;
 }
 
 const TASK_SELECT = `
@@ -273,7 +325,7 @@ const TASK_SELECT = `
 `;
 
 export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolRouteDeps): void {
-  const { db, requireUser, requireAdmin, canAccessVehicle, acquireLease, leaseToken, audit, hub } = deps;
+  const { db, requireUser, requireAdmin, canAccessVehicle, acquireLease, leaseToken, audit, hub, isTrustedOrigin } = deps;
 
   // --- Devices (vehicle aliases) ---
   app.get('/api/devices', async (request) => {
@@ -298,7 +350,11 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
          ORDER BY v.name`,
         [user.id, pattern],
       );
-    return { devices: result.rows.map(deviceDto) };
+    const active = await db.query<{ vehicle_id: string }>(
+      "SELECT vehicle_id FROM patrol_tasks WHERE status IN ('queued','running','cancellation_requested')",
+    );
+    const activeIds = new Set(active.rows.map((row) => row.vehicle_id));
+    return { devices: result.rows.map((row) => deviceDto(row, activeIds.has(row.id) ? 'patrolling' : undefined)) };
   });
 
   app.post('/api/devices', async (request) => {
@@ -469,7 +525,7 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
       pendingReviews: pendingReviews.rows[0]?.c ?? 0,
       violations: violations.rows[0]?.c ?? 0,
       recentTasks: recentTasks.rows.map(taskDto),
-      todayAlerts: todayAlerts.rows.map((row) => ({
+      alerts: todayAlerts.rows.map((row) => ({
         id: row.id,
         message: `${row.plate ?? '未知车牌'} · ${row.violation_type}`,
         priority: row.priority,
@@ -532,10 +588,14 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
          FROM whitelist_entries WHERE whitelist_id=$2`,
         [snapshotId, whitelist.rows[0].id],
       );
+      const ruleRows = await client.query<{ key: string; value: unknown }>(
+        "SELECT key,value FROM platform_settings WHERE key IN ('reviewConfidenceThreshold','dedupeWindowSec')",
+      );
+      const rules = patrolRules(ruleRows.rows);
       await client.query(
-        `INSERT INTO patrol_tasks (id, vehicle_id, route_id, whitelist_id, shift, status, created_by_user_id)
-         VALUES ($1,$2,$3,$4,$5,'queued',$6)`,
-        [id, deviceId, routeId, snapshotId, shift, user.id],
+        `INSERT INTO patrol_tasks (id, vehicle_id, route_id, whitelist_id, shift, status, created_by_user_id, review_confidence_threshold, dedupe_window_sec)
+         VALUES ($1,$2,$3,$4,$5,'queued',$6,$7,$8)`,
+        [id, deviceId, routeId, snapshotId, shift, user.id, rules.reviewConfidenceThreshold, rules.dedupeWindowSec],
       );
       await client.query("INSERT INTO patrol_events (id,task_id,event_type,details) VALUES ($1,$2,'status',$3)", [randomUUID(), id, JSON.stringify({ status: 'queued' })]);
     });
@@ -551,6 +611,7 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
     const body = object(request.body);
     const taskId = typeof body?.taskId === 'string' ? body.taskId.trim() : null;
     const deviceId = typeof body?.deviceId === 'string' ? body.deviceId.trim() : null;
+    const force = body?.force === true;
     if (!taskId && !deviceId) throw httpError('deviceId or taskId is required', 400);
 
     let task: PatrolTaskRow | undefined;
@@ -566,6 +627,23 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
     }
     if (!task) throw httpError('Active patrol task not found', 404);
     if (!await canAccessVehicle(user, task.vehicle_id)) throw httpError('Vehicle access denied', 403);
+
+    // 无调度器确认零速时，cancellation_requested 会一直卡住并挡住前往/控制台；允许强制结束。
+    if (task.status === 'cancellation_requested' || force) {
+      await db.query(
+        `UPDATE patrol_tasks
+         SET status='stopped', finished_at=COALESCE(finished_at, now()),
+             stop_confirmed_at=COALESCE(stop_confirmed_at, now()),
+             zero_velocity_confirmed_at=COALESCE(zero_velocity_confirmed_at, now()),
+             failure_reason=COALESCE(failure_reason, 'operator force stop')
+         WHERE id=$1 AND status IN ('queued','running','cancellation_requested')`,
+        [task.id],
+      );
+      await db.query("INSERT INTO patrol_events (id,task_id,event_type,details) VALUES ($1,$2,'status',$3)", [randomUUID(), task.id, JSON.stringify({ status: 'stopped', source: 'operator_force' })]);
+      await audit('patrol.force-stop', 'success', user.id, task.vehicle_id, { taskId: task.id });
+      hub.publishPatrol?.({ type: 'patrol_status', taskId: task.id, vehicleId: task.vehicle_id, deviceId: task.vehicle_id, status: 'stopped' });
+      return { ok: true as const, forced: true };
+    }
 
     const stopped = await db.query(
       `UPDATE patrol_tasks SET status='cancellation_requested', stop_requested_at=now()
@@ -631,7 +709,8 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
     const events = await db.query(
       `SELECT id, task_id AS "taskId", plate, event_type AS "eventType", waypoint,
               confidence, evidence_url AS "evidenceUrl", review_status AS "reviewStatus",
-              occurred_at AS "occurredAt"
+              occurred_at AS "occurredAt",
+              details->'plateMatch' AS "plateMatch"
        FROM patrol_events WHERE task_id=$1 ORDER BY occurred_at DESC`,
       [id],
     );
@@ -702,6 +781,8 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
         responseCompleted: responseStats.rows[0]?.completed ?? 0,
         responseAiAdviceCount: responseStats.rows[0]?.ai_used ?? 0,
         responseAverageSeconds: responseStats.rows[0]?.average_seconds ?? null,
+        reviewConfidenceThreshold: taskRow.review_confidence_threshold ?? DEFAULT_PATROL_RULES.reviewConfidenceThreshold,
+        dedupeWindowSec: taskRow.dedupe_window_sec ?? DEFAULT_PATROL_RULES.dedupeWindowSec,
         status: taskRow.status,
       };
 
@@ -867,19 +948,108 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     return { name: meta.name, basemapUrl: meta.basemap_url };
   });
 
+  // 楼道 SLAM 底图元数据（分辨率/原点/尺寸/图片）。图片以 data URL 存储于 basemap_url。
+  app.get('/api/map/basemap', async (request) => {
+    const user = await requireUser(request);
+    const vehicleId = optionalString((request.query as { vehicleId?: string }).vehicleId) || null;
+    if (vehicleId && !await canAccessVehicle(user, vehicleId)) throw httpError('Vehicle access denied', 403);
+    const row = await loadFloorMap(db, vehicleId);
+    return { basemap: mapMetaDto(row) };
+  });
+
+  app.post('/api/map/basemap', async (request) => {
+    const admin = await requireAdmin(request);
+    const body = object(request.body);
+    const vehicleId = optionalString(body?.vehicleId) || null;
+    if (vehicleId) {
+      const vehicle = await db.query('SELECT id FROM vehicles WHERE id=$1', [vehicleId]);
+      if (!vehicle.rows[0]) throw httpError('Vehicle not found', 404);
+    }
+    const mapVersion = string(body?.mapVersion, 'mapVersion');
+    const resolution = number(body?.resolution, 'resolution', 1e-6, 100);
+    const originX = number(body?.originX, 'originX', -1e6, 1e6);
+    const originY = number(body?.originY, 'originY', -1e6, 1e6);
+    const originYaw = body?.originYaw === undefined ? 0 : number(body?.originYaw, 'originYaw', -Math.PI * 2, Math.PI * 2);
+    const imageWidth = number(body?.imageWidth, 'imageWidth', 1, 100000);
+    const imageHeight = number(body?.imageHeight, 'imageHeight', 1, 100000);
+    const imageUrl = string(body?.imageDataUrl ?? body?.imageUrl, 'imageDataUrl');
+    if (!Number.isInteger(imageWidth) || !Number.isInteger(imageHeight)) throw httpError('imageWidth/imageHeight must be integers', 400);
+
+    const name = optionalString(body?.name, '楼道地图');
+    const rowId = randomUUID();
+    // 每车最多一张底图（map_metadata_vehicle_idx）；全局图 vehicle_id 为空可多条，上传时先清再插。
+    await db.transaction(async (client) => {
+      if (vehicleId) {
+        await client.query(
+          `INSERT INTO map_metadata (id, vehicle_id, name, basemap_url, map_version, resolution, origin_x, origin_y, origin_yaw, image_width, image_height, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now())
+           ON CONFLICT (vehicle_id) WHERE vehicle_id IS NOT NULL DO UPDATE SET
+             name = EXCLUDED.name,
+             basemap_url = EXCLUDED.basemap_url,
+             map_version = EXCLUDED.map_version,
+             resolution = EXCLUDED.resolution,
+             origin_x = EXCLUDED.origin_x,
+             origin_y = EXCLUDED.origin_y,
+             origin_yaw = EXCLUDED.origin_yaw,
+             image_width = EXCLUDED.image_width,
+             image_height = EXCLUDED.image_height,
+             updated_at = now()`,
+          [rowId, vehicleId, name, imageUrl, mapVersion, resolution, originX, originY, originYaw, imageWidth, imageHeight],
+        );
+      } else {
+        await client.query('DELETE FROM map_metadata WHERE vehicle_id IS NULL');
+        await client.query(
+          `INSERT INTO map_metadata (id, vehicle_id, name, basemap_url, map_version, resolution, origin_x, origin_y, origin_yaw, image_width, image_height, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now())`,
+          [rowId, null, name, imageUrl, mapVersion, resolution, originX, originY, originYaw, imageWidth, imageHeight],
+        );
+      }
+    });
+    await audit('map.basemap.upload', 'success', admin.id, vehicleId ?? undefined, { mapVersion, imageWidth, imageHeight, resolution });
+    const row = await loadFloorMap(db, vehicleId);
+    return { basemap: mapMetaDto(row) };
+  });
+
   app.get('/api/map/waypoints', async (request) => {
-    await requireUser(request);
-    const routeId = (request.query as { routeId?: string }).routeId;
+    const user = await requireUser(request);
+    const query = request.query as { routeId?: string; vehicleId?: string };
+    const routeId = query.routeId;
+    const vehicleId = typeof query.vehicleId === 'string' ? query.vehicleId.trim() : '';
+    if (routeId) {
+      const route = await db.query<{ vehicle_id: string }>('SELECT vehicle_id FROM patrol_routes WHERE id=$1', [routeId]);
+      if (!route.rows[0]) throw httpError('Route not found', 404);
+      if (!await canAccessVehicle(user, route.rows[0].vehicle_id)) throw httpError('Vehicle access denied', 403);
+    } else if (vehicleId) {
+      if (!await canAccessVehicle(user, vehicleId)) throw httpError('Vehicle access denied', 403);
+    }
     const result = routeId
       ? await db.query(
         `SELECT id, name, x AS longitude, y AS latitude, ordinal AS "order", route_id AS "routeId"
          FROM patrol_waypoints WHERE route_id=$1 ORDER BY ordinal`,
         [routeId],
       )
-      : await db.query(
-        `SELECT id, name, x AS longitude, y AS latitude, ordinal AS "order", route_id AS "routeId"
-         FROM patrol_waypoints ORDER BY route_id, ordinal`,
-      );
+      : vehicleId
+      ? await db.query(
+        `SELECT w.id, w.name, w.x AS longitude, w.y AS latitude, w.ordinal AS "order", w.route_id AS "routeId"
+         FROM patrol_waypoints w
+         JOIN patrol_routes r ON r.id = w.route_id
+         WHERE r.vehicle_id=$1
+         ORDER BY r.created_at, w.ordinal`,
+        [vehicleId],
+      )
+      : user.role === 'admin'
+        ? await db.query(
+          `SELECT id, name, x AS longitude, y AS latitude, ordinal AS "order", route_id AS "routeId"
+           FROM patrol_waypoints ORDER BY route_id, ordinal`,
+        )
+        : await db.query(
+          `SELECT w.id, w.name, w.x AS longitude, w.y AS latitude, w.ordinal AS "order", w.route_id AS "routeId"
+           FROM patrol_waypoints w
+           JOIN patrol_routes r ON r.id=w.route_id
+           JOIN vehicle_members vm ON vm.vehicle_id=r.vehicle_id AND vm.user_id=$1
+           ORDER BY w.route_id, w.ordinal`,
+          [user.id],
+        );
     return { waypoints: result.rows };
   });
 
@@ -950,6 +1120,150 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
   });
 
   // --- Violations ---
+  // Console plate-scan workbench: reject whitelist matches; otherwise create violation + review queue item.
+  app.post('/api/violations/from-console-scan', { bodyLimit: 6 * 1024 * 1024 }, async (request) => {
+    const user = await requireUser(request);
+    const body = (request.body && typeof request.body === 'object' && !Array.isArray(request.body))
+      ? request.body as Record<string, unknown>
+      : {};
+    const vehicleId = typeof body.vehicleId === 'string' ? body.vehicleId.trim() : '';
+    if (!vehicleId) throw httpError('vehicleId is required', 400);
+    if (!await canAccessVehicle(user, vehicleId)) throw httpError('Vehicle access denied', 403);
+
+    let plate: string;
+    try {
+      plate = normalisePlate(body.plate);
+    } catch {
+      throw httpError('plate is invalid', 400);
+    }
+
+    const liveWhitelist = await db.query<{ id: string }>(
+      `SELECT id FROM whitelist_imports
+       WHERE vehicle_id IS NULL AND is_snapshot=false
+       ORDER BY created_at DESC, id DESC LIMIT 1`,
+    );
+    if (liveWhitelist.rows[0]) {
+      const entries = await db.query<{ plate: string; category: 'private' | 'visitor' }>(
+        'SELECT plate, category FROM whitelist_entries WHERE whitelist_id=$1',
+        [liveWhitelist.rows[0].id],
+      );
+      const hit = matchWhitelistPlate(plate, entries.rows);
+      if (hit) {
+        const kind = hit.category === 'private' ? '登记私家车' : '登记访客';
+        throw httpError(
+          `白名单车辆：已匹配 ${hit.matchedPlate}（${kind}），不允许添加到违规车辆`,
+          409,
+        );
+      }
+    }
+
+    const jpegRaw = typeof body.jpegBase64 === 'string' ? body.jpegBase64.trim() : '';
+    if (!jpegRaw) throw httpError('jpegBase64 is required', 400);
+    let bytes: Buffer;
+    try {
+      bytes = Buffer.from(jpegRaw.replace(/^data:image\/jpeg;base64,/i, ''), 'base64');
+    } catch {
+      throw httpError('jpegBase64 is invalid', 400);
+    }
+
+    const confidence = typeof body.confidence === 'number' && Number.isFinite(body.confidence)
+      ? Math.min(1, Math.max(0, body.confidence))
+      : 0.5;
+    const waypoint = typeof body.waypoint === 'string' && body.waypoint.trim()
+      ? body.waypoint.trim().slice(0, 120)
+      : '控制台识别测试';
+
+    const route = await db.query<{ id: string }>(
+      'SELECT id FROM patrol_routes WHERE vehicle_id=$1 ORDER BY created_at DESC LIMIT 1',
+      [vehicleId],
+    );
+    if (!route.rows[0]) {
+      throw httpError('请先为该设备创建巡逻路线，测试审核需要挂接到任务事件', 409);
+    }
+    if (!liveWhitelist.rows[0]) {
+      throw httpError('全局白名单为空；请先维护白名单后再测试', 409);
+    }
+
+    const saved = saveEvidenceJpeg(bytes, 'console-scan');
+    const created = await db.transaction(async (client) => {
+      const taskId = randomUUID();
+      const eventId = randomUUID();
+      const reviewId = randomUUID();
+      const violationId = randomUUID();
+
+      await client.query(
+        `INSERT INTO patrol_tasks
+           (id, vehicle_id, route_id, whitelist_id, shift, status, created_by_user_id, started_at, finished_at)
+         VALUES ($1, $2, $3, $4, 'morning', 'completed', $5, now(), now())`,
+        [taskId, vehicleId, route.rows[0].id, liveWhitelist.rows[0].id, user.id],
+      );
+      await client.query(
+        `INSERT INTO patrol_events
+           (id, task_id, event_type, waypoint, plate, confidence, evidence_url, review_status, occurred_at, details)
+         VALUES ($1, $2, 'observation', $3, $4, $5, $6, 'pending', now(), $7)`,
+        [
+          eventId,
+          taskId,
+          waypoint,
+          plate,
+          confidence,
+          saved.publicPath,
+          JSON.stringify({
+            source: 'console_scan_test',
+            vehicleId,
+            plateMatch: null,
+          }),
+        ],
+      );
+      await client.query(
+        `INSERT INTO reviews (id, event_id, reason, status)
+         VALUES ($1, $2, 'console_scan_test', 'pending')`,
+        [reviewId, eventId],
+      );
+      await client.query(
+        `INSERT INTO violations
+           (id, event_id, plate, violation_type, task_id, vehicle_id, waypoint, priority, disposition, evidence_url, occurred_at)
+         VALUES ($1, $2, $3, 'suspected_external', $4, $5, $6, 'normal', 'pending', $7, now())`,
+        [violationId, eventId, plate, taskId, vehicleId, waypoint, saved.publicPath],
+      );
+      return { taskId, eventId, reviewId, violationId };
+    });
+
+    hub.publishPatrol?.({
+      type: 'violation_alert',
+      violationId: created.violationId,
+      vehicleId,
+      plate,
+      evidenceUrl: saved.publicPath,
+      source: 'console_scan_test',
+      confidence,
+      eventId: created.eventId,
+    });
+    await audit('violation.console_scan_test', 'success', user.id, vehicleId, {
+      violationId: created.violationId,
+      eventId: created.eventId,
+      reviewId: created.reviewId,
+      plate,
+      evidenceUrl: saved.publicPath,
+      confidence,
+    });
+    return {
+      violation: {
+        id: created.violationId,
+        plate,
+        evidenceUrl: saved.publicPath,
+        deviceId: vehicleId,
+        waypoint,
+        status: 'pending',
+        type: 'suspected_external',
+      },
+      review: {
+        id: created.reviewId,
+        eventId: created.eventId,
+      },
+    };
+  });
+
   // Observation coords preferred; else nearest telemetry within ±60s of violation time.
   const VIOLATION_FROM = `
        FROM violations v
@@ -1043,7 +1357,8 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     const user = await requireUser(request);
     const result = await db.query(
       `SELECT r.id, r.event_id AS "eventId", r.reason, r.created_at AS "occurredAt",
-              e.plate, e.waypoint, e.evidence_url AS "evidenceUrl",
+              e.plate, e.waypoint, e.evidence_url AS "evidenceUrl", e.confidence,
+              e.details->'plateMatch' AS "plateMatch",
               v.name AS "deviceName"
        FROM reviews r
        JOIN patrol_events e ON e.id = r.event_id
@@ -1065,6 +1380,7 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     const resolutionInput = typeof body?.resolution === 'string' ? body.resolution : body?.action;
     const resolution = string(resolutionInput, 'resolution');
     const plate = typeof body?.plate === 'string' ? body.plate.trim() : null;
+    if (resolution === 'whitelist' && user.role !== 'admin') throw httpError('Administrator role required to update whitelist', 403);
 
     const reviewStatus =
       resolution === 'confirmed' || resolution === 'confirm' || resolution === 'false_positive' || resolution === 'whitelist' || resolution === 'external' || resolution === 'visitor'
@@ -1074,6 +1390,12 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     const event = await db.query<{ vehicle_id: string }>('SELECT t.vehicle_id FROM patrol_events e JOIN patrol_tasks t ON t.id=e.task_id WHERE e.id=$1', [eventId]);
     if (!event.rows[0]) throw httpError('Event not found', 404);
     if (!await canAccessVehicle(user, event.rows[0].vehicle_id)) throw httpError('Vehicle access denied', 403);
+
+    const violationDisposition =
+      reviewStatus === 'confirmed' ? 'confirmed'
+        : reviewStatus === 'false_positive' ? 'false_positive'
+          : reviewStatus === 'whitelist' || reviewStatus === 'external' ? 'resolved'
+            : 'confirmed';
 
     await db.transaction(async (client) => {
       await client.query(
@@ -1085,6 +1407,11 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
         `UPDATE patrol_events SET review_status=$1, plate=COALESCE($2, plate) WHERE id=$3`,
         [reviewStatus, plate, eventId],
       );
+      // Keep violations list in sync with review outcomes (confirm / false_positive / whitelist / visitor).
+      await client.query(
+        `UPDATE violations SET disposition=$1 WHERE event_id=$2`,
+        [violationDisposition, eventId],
+      );
       if (resolution === 'whitelist' && plate) {
         const whitelistId = await ensureGlobalWhitelist(client, user);
         await client.query(
@@ -1095,13 +1422,13 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
         );
       }
     });
-    await audit('review.resolve', 'success', user.id, event.rows[0].vehicle_id, { eventId, resolution, plate });
+    await audit('review.resolve', 'success', user.id, event.rows[0].vehicle_id, { eventId, resolution, plate, violationDisposition });
     return { ok: true as const };
   });
 
   // --- Whitelist ---
   app.get('/api/whitelist', async (request) => {
-    await requireUser(request);
+    await requireAdmin(request);
     const q = typeof (request.query as { q?: string }).q === 'string'
       ? (request.query as { q: string }).q.trim()
       : '';
@@ -1122,7 +1449,7 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
   });
 
   app.get('/api/whitelist/:id', async (request) => {
-    await requireUser(request);
+    await requireAdmin(request);
     const id = (request.params as { id: string }).id;
     const result = await db.query<WhitelistEntryRow>(
       `${WHITELIST_ENTRY_SELECT} WHERE ${WHITELIST_LIVE_CLAUSE} AND e.id=$1 LIMIT 1`,
@@ -1144,21 +1471,23 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     if (vehicleTypeRaw !== 'private' && vehicleTypeRaw !== 'visitor') throw httpError('vehicleType is invalid', 400);
     const vehicleType = vehicleTypeRaw;
     const validUntil = optionalValidUntil(body?.validUntil ?? body?.expiresAt);
-    const id = randomUUID();
-    await db.transaction(async (client) => {
+    const entry = await db.transaction(async (client) => {
       const whitelistId = await ensureGlobalWhitelist(client, admin);
-      await client.query(
+      const result = await client.query<WhitelistEntryRow>(
         `INSERT INTO whitelist_entries (id, whitelist_id, plate, owner_name, building, category, parking_spot, valid_until, wx_uid)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
          ON CONFLICT (whitelist_id, plate) DO UPDATE SET
            owner_name=EXCLUDED.owner_name, building=EXCLUDED.building, category=EXCLUDED.category,
-           parking_spot=EXCLUDED.parking_spot, valid_until=EXCLUDED.valid_until, wx_uid=EXCLUDED.wx_uid`,
-        [id, whitelistId, plate, owner, building, vehicleType, parkingSpot, validUntil, wxUid],
+           parking_spot=EXCLUDED.parking_spot, valid_until=EXCLUDED.valid_until, wx_uid=EXCLUDED.wx_uid
+         RETURNING id, plate, owner_name AS owner, building, parking_spot AS "parkingSpot",
+                   wx_uid AS "wxUid", category AS "vehicleType", valid_until AS "validUntil"`,
+        [randomUUID(), whitelistId, plate, owner, building, vehicleType, parkingSpot, validUntil, wxUid],
       );
+      return result.rows[0];
     });
     await audit('whitelist.create', 'success', admin.id, undefined, { plate });
     return {
-      entry: whitelistEntryDto({ id, plate, owner, building, parkingSpot, wxUid, vehicleType, validUntil }),
+      entry: whitelistEntryDto(entry),
     };
   });
 
@@ -1393,8 +1722,7 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     const result = await db.query<{ key: string; value: unknown; updated_at: Date }>(
       'SELECT key, value, updated_at FROM platform_settings ORDER BY key',
     );
-    const settings: Record<string, unknown> = {};
-    for (const row of result.rows) settings[row.key] = row.value;
+    const settings = patrolRules(result.rows);
     return { settings, entries: result.rows.map((row) => ({ key: row.key, value: row.value, updatedAt: iso(row.updated_at) })) };
   });
 
@@ -1402,16 +1730,17 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     const admin = await requireAdmin(request);
     const body = object(request.body);
     if (!body) throw httpError('body is required', 400);
-
+    const settings = object(body.settings) ?? body;
+    const allowed = new Set(['reviewConfidenceThreshold', 'dedupeWindowSec']);
+    if (!Object.keys(settings).length || Object.keys(settings).some((key) => !allowed.has(key))) {
+      throw httpError('Only reviewConfidenceThreshold and dedupeWindowSec can be updated', 400);
+    }
     const upserts: Array<{ key: string; value: unknown }> = [];
-    if (typeof body.key === 'string' && body.key.trim()) {
-      upserts.push({ key: body.key.trim(), value: body.value ?? {} });
-    } else if (body.settings && typeof body.settings === 'object' && !Array.isArray(body.settings)) {
-      for (const [key, value] of Object.entries(body.settings as Record<string, unknown>)) {
-        upserts.push({ key, value });
-      }
-    } else {
-      throw httpError('Provide { key, value } or { settings: { ... } }', 400);
+    if (settings.reviewConfidenceThreshold !== undefined) {
+      upserts.push({ key: 'reviewConfidenceThreshold', value: number(settings.reviewConfidenceThreshold, 'reviewConfidenceThreshold', 0, 1) });
+    }
+    if (settings.dedupeWindowSec !== undefined) {
+      upserts.push({ key: 'dedupeWindowSec', value: number(settings.dedupeWindowSec, 'dedupeWindowSec', 60, 86_400) });
     }
 
     for (const entry of upserts) {
@@ -1427,6 +1756,10 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
 
   // --- WebSocket /patrol/live ---
   app.get('/patrol/live', { websocket: true }, async (socket, request) => {
+    if (!isTrustedOrigin(request.headers.origin)) {
+      socket.close(1008, 'Untrusted WebSocket origin');
+      return;
+    }
     let user: RouteUser & AuthUser;
     try {
       user = await requireUser(request);

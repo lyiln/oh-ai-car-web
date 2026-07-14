@@ -1,10 +1,12 @@
 # 巡牌通 · PatrolPlate 平台 API 契约
 
-品牌：**巡牌通 · PatrolPlate**。登录页见现有 `/api/auth/*`。本文描述管理端业务 API（migration 003–007）。
+品牌：**巡牌通 · PatrolPlate**。登录页见现有 `/api/auth/*`。本文描述管理端业务 API（migration 003–010）。
 
 ## 认证
 
-所有 `/api/*`（除 `/device/v1/*`、`/internal/*`）需已登录会话 Cookie `oh_ai_session`，且请求 Origin 受信任。
+所有 `/api/*`（除 `/device/v1/*`、`/internal/*`）需已登录会话 Cookie `oh_ai_session`，且请求 Origin 受信任。密码登录适用于活跃账号；邮箱 OTP 仅对已绑定邮箱的管理员可用。验证码只在后端生成、哈希存储并经 SMTP 投递，API 不返回验证码或收件地址。密码登录按规范化用户名限制为 10 次/15 分钟，OTP 申请为 5 次/15 分钟，OTP 验证为 5 次/5 分钟；超限返回 429，并在响应前等待写入 `throttled` 审计。单个 OTP 连续失败 5 次后立即失效。
+
+`PLATFORM_TRUST_PROXY` 默认关闭。只有 backend 位于覆盖 `X-Forwarded-For` 的受控单跳代理后方时才可启用；仓库 Compose 符合该拓扑并显式启用，以便非法或缺失用户名按真实客户端 IP 限流。直接暴露的 backend 必须保持关闭。
 
 ## 设备 `/api/devices`
 
@@ -51,12 +53,29 @@
 | PUT/DELETE | `/api/map/zones/:id` |
 
 禁停区使用 PostGIS `geometry(Polygon,4326)`，API 返回坐标环。
+管理员可读取全部航点；操作员只可读取 `vehicle_members` 授权车辆的航点，指定无权路线时返回 403。
 
 设备侧使用 `/device/v1/patrol/tasks/:id/events` 发送 `observation`。观测必须属于
-任务快照路线中的航点；低于 0.75 的置信度进入待复核，其余车牌使用任务快照的白名单分类；
+任务快照路线中的航点；低于任务置信度阈值（默认 0.75）的观测进入待复核；达到阈值后：
+
+1. **完整匹配**：OCR 车牌与白名单条目完全一致 → 按该条目分类（私家车 / 访客）
+2. **部分匹配**：满足任一方向即判非外来（`registered_private` / `visitor`），响应带
+   `plateMatch.mode=partial`：
+   - `scan_in_whitelist`：OCR 连续 ≥3 位 `A-Z0-9` 落在白名单车牌内（如 `A123`→`京A12345`）
+   - `whitelist_in_scan`：白名单字母数字体是 OCR 的子串（如 `京A12345X`→`京A12345`）
+3. 否则 → `suspected_external`
+
+上门候选与分类共用同一套 `matchWhitelistPlate` / `matchedPlate` 查目的地，不再要求 OCR
+与白名单整牌精确相等。`GET /api/reviews/pending` 与任务事件详情会返回 `plateMatch` 供人工对照。
+
 同一任务、航点、车牌和 30 分钟窗口会合并计数，禁停 ROI 相交独立记录。
 
-**白名单快照隔离（FR-002）**：单条新增、批量导入和任务启动以同一车辆行锁串行执行。批量导入的有效行在一个事务中提交；任务启动在持锁事务内将当前活跃白名单复制为不可变快照（`whitelist_imports.is_snapshot=true`）。因此任务只会看到完整的导入前或导入后版本，后续导入只影响下一次巡检，不影响正在运行任务的分类。
+调度器另可：`GET /device/v1/patrol/tasks/next` 领取 queued 任务；
+`GET /device/v1/patrol/tasks/:id` 查询本车任务 `status`（检测 `cancellation_requested`）；
+并上报 `waypoint` / `status` / `stop_confirmed`（取消时须 `zeroVelocity: true`）。
+本机仿真调度见 `docs/flows/patrol-stage-c-sim.md`。
+
+**白名单快照隔离（FR-002）**：白名单是小区全局数据，只有管理员可读取、导入或修改。首次创建与写入在事务级 advisory lock 下串行；批量导入的有效行在一个事务中提交。任务启动在持锁事务内将当前全局 live 白名单复制为不可变快照（`whitelist_imports.is_snapshot=true`）。因此任务只会看到完整的导入前或导入后版本，后续导入只影响下一次巡检，不影响正在运行任务的分类。
 
 **待复核流程（FR-005）**：置信度 < 0.75 的首次观测（去重后计数为 1）除写入 `plate_observations` 外，还以事务方式同步写入 `patrol_events`（event_type='observation'）和 `reviews`（reason='low_confidence'，status='pending'），确保 `GET /api/reviews/pending` 立即可见。
 
@@ -69,7 +88,15 @@
 | GET | `/api/reviews/pending` |
 | POST | `/api/reviews/:event_id/resolve` |
 
-管理员可访问所有车辆；操作员只能读取或处理 `vehicle_members` 授权车辆的违规、审核、报告和工作台统计。无权的单条违规或报告返回 404。
+管理员可访问所有车辆；操作员只能读取或处理 `vehicle_members` 授权车辆的违规、审核、报告和工作台统计。无权的单条违规或报告返回 404。审核中只有管理员可选择 `whitelist`，该操作才会写入全局白名单；操作员仍可处理其授权车辆的其他审核结果。
+
+违规列表与详情额外返回：
+
+- `longitude` / `latitude`：优先观测直传，否则用巡检车在 `occurred_at` ±60s 内最近遥测点回填
+- `coordinateSource`：`observation` | `telemetry` | `none`
+- `ownerName` / `building` / `parkingSpot` / `confidence`：来自任务白名单快照与观测
+
+详见 [乱停车违停定位说明](../flows/illegal-parking-localization.md)。
 
 违规列表与详情额外返回：
 
@@ -83,9 +110,10 @@
 
 | 方法 | 路径 |
 |------|------|
-| GET | `/api/whitelist?deviceId=:id` |
-| POST | `/api/whitelist`（请求体必须含 `deviceId`） |
-| POST | `/api/whitelist/import`（请求体必须含 `deviceId`） |
+| GET | `/api/whitelist?q=:query`（管理员） |
+| GET/PUT/DELETE | `/api/whitelist/:id`（管理员） |
+| POST | `/api/whitelist`（管理员） |
+| POST | `/api/whitelist/import`（管理员） |
 | GET | `/api/reports` · `/api/reports/:id` |
 | GET/PUT | `/api/settings` |
 
@@ -103,9 +131,11 @@
 | 路径 | 事件 |
 |------|------|
 | `/ws` | 兼容：`vehicle.position` |
-| `/patrol/live` | `pose_update`、`device_status`、`patrol_status`、`patrol_event`、`violation_alert` |
+| `/patrol/live` | `pose_update`、`device_status`、`patrol_status`、`patrol_event`、`violation_alert`、`response_status`、`assignment_changed`、`response_event` |
 
-客户端发送 `{ "type": "subscribe", "vehicleId": "<uuid>" }`。
+客户端发送 `{ "type": "subscribe", "vehicleId": "<uuid>" }`。两个 WebSocket
+入口均要求已认证 Cookie 和配置在 `PLATFORM_PUBLIC_ORIGIN` 或
+`PLATFORM_ALLOWED_ORIGINS` 中的 Origin；不受信或缺失 Origin 会以 1008 关闭。
 
 ## 前端路由
 
@@ -128,11 +158,13 @@
 
 当前设备 ID 存于 `localStorage` 键 `patrol:selectedDeviceId`。
 
-白名单类型仅支持 `private` 和 `visitor`。创建、导入和查询均显式绑定当前设备（`deviceId`）且过滤快照行；巡检启动会验证目标车辆活跃白名单（非快照）至少包含一条记录，并原子性创建不可变快照供任务引用。
+白名单类型仅支持 `private` 和 `visitor`。创建、导入和查询均针对小区全局 live 白名单并过滤快照行；支持 `parkingSpot` 和可选 `validUntil`。巡检启动会验证全局 live 白名单至少包含一条记录，并原子性创建不可变快照供任务引用。
 
 ## 授权说明
 
 `reviews`、`violations`、`reports`、`dashboard` 等端点使用 `$N::uuid IS NULL OR EXISTS (... AND vm.user_id=$N)` 模式：管理员传 `NULL`（全量访问），操作员传自身 user_id（仅限授权车辆）。
+
+`GET /api/evidence/:fileName` 还会反查巡检事件、观测、违规或上门任务的车辆关联。历史违规缺少 `vehicle_id` 时依次从 `task_id`、`event_id` 所属任务回退解析车辆；直接车辆字段存在时优先使用，避免异常关联扩大权限。未关联文件和无权证据统一返回 404。AI 顾问只为管理员注册全局白名单查询工具，底层工具仍独立校验管理员角色。
 
 ## 数据库迁移
 
@@ -146,6 +178,9 @@
 | 006-whitelist-live-version-locking | 历史重复活跃白名单转为快照；每车唯一活跃白名单索引；导入与快照的车辆锁语义 |
 | 007-doorstep-response | 住户目的地、上门处置任务与设备幂等事件 |
 | 008-doorstep-response-safety | 可恢复分配、安全取消状态、零速度停止确认与活动车辆互斥 |
+| 009-global-whitelist | 兼容旧版扁平白名单，将 live 数据迁移为全局版本并保留任务快照 |
+| 010-whitelist-entry-fields | 白名单车位和有效期字段 |
+| 016-auth-otp-attempt-limit | auth_otps.failed_attempts 与单验证码五次失败失效约束 |
 
 ## 演示注意
 

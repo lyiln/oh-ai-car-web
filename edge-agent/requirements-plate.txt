@@ -10,4 +10,4 @@ paddlepaddle>=2.5; platform_machine == "x86_64" or platform_machine == "AMD64"
 # torchvision>=0.14
 #
 # Jetson Ubuntu runtime (reference):
-#   bash yolo-v5/oh-ai-car-YOLOv5/scripts/ubuntu/setup_plate_runtime.sh
+#   bash YOLOv5/oh-ai-car-YOLOv5/scripts/ubuntu/setup_plate_runtime.sh

@@ -56,7 +56,11 @@ export function SelectedDeviceProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  useEffect(() => { void refreshDevices(); }, [refreshDevices]);
+  useEffect(() => {
+    void refreshDevices();
+    const timer = window.setInterval(() => { void refreshDevices(); }, 15_000);
+    return () => window.clearInterval(timer);
+  }, [refreshDevices]);
 
   const selectedDevice = useMemo(
     () => devices.find((device) => device.id === selectedId) ?? null,

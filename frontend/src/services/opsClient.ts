@@ -8,18 +8,7 @@ import {
 } from './api.js';
 
 export async function dashboardSummary(): Promise<DashboardSummary> {
-  try {
-    return await apiRequest<DashboardSummary>('/api/dashboard/summary');
-  } catch {
-    return {
-      onlineDevices: 0,
-      todayPatrols: 0,
-      pendingReviews: 0,
-      violations: 0,
-      recentTasks: [],
-      alerts: [],
-    };
-  }
+  return apiRequest<DashboardSummary>('/api/dashboard/summary');
 }
 
 export async function violations(): Promise<Violation[]> {
@@ -34,6 +23,23 @@ export async function violation(id: string): Promise<Violation | null> {
   } catch {
     return null;
   }
+}
+
+/** Console plate-scan workbench: upload JPEG evidence and create a pending violation + review for UI tests. */
+export async function createViolationFromConsoleScan(input: {
+  vehicleId: string;
+  plate: string;
+  jpegBase64: string;
+  confidence?: number | null;
+  waypoint?: string;
+}): Promise<{
+  violation: Pick<Violation, 'id' | 'plate' | 'evidenceUrl' | 'deviceId' | 'waypoint' | 'status' | 'type'>;
+  review: { id: string; eventId: string };
+}> {
+  return apiRequest('/api/violations/from-console-scan', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
 }
 
 export async function pendingReviews(): Promise<Review[]> {
@@ -89,36 +95,18 @@ export async function importWhitelist(csv: string): Promise<{ imported: number; 
 }
 
 export async function reports(): Promise<PatrolReport[]> {
-  try {
-    const result = await apiRequest<{ reports: PatrolReport[] }>('/api/reports');
-    return result.reports ?? [];
-  } catch {
-    return [];
-  }
+  const result = await apiRequest<{ reports: PatrolReport[] }>('/api/reports');
+  return result.reports ?? [];
 }
 
 export async function report(id: string): Promise<PatrolReport | null> {
-  try {
-    const result = await apiRequest<{ report: PatrolReport }>(`/api/reports/${id}`);
-    return result.report;
-  } catch {
-    return null;
-  }
+  const result = await apiRequest<{ report: PatrolReport }>(`/api/reports/${id}`);
+  return result.report;
 }
 
 export async function getSettings(): Promise<Record<string, unknown>> {
-  try {
-    const result = await apiRequest<{ settings: Record<string, unknown> }>('/api/settings');
-    return result.settings ?? {};
-  } catch {
-    return {
-      waypointsYaml: '',
-      alertConfidence: 0.7,
-      dedupeWindowSec: 120,
-      bridgeDefault: '',
-      connectTimeoutMs: 5000,
-    };
-  }
+  const result = await apiRequest<{ settings: Record<string, unknown> }>('/api/settings');
+  return result.settings ?? {};
 }
 
 export async function putSettings(settings: Record<string, unknown>): Promise<{ ok: true }> {

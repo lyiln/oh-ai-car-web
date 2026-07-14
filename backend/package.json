@@ -16,6 +16,7 @@
   "dependencies": {
     "@fastify/cookie": "^11.0.2",
     "@fastify/cors": "^10.0.2",
+    "@fastify/rate-limit": "^11.1.0",
     "@fastify/websocket": "^11.0.0",
     "@langchain/core": "^1.2.2",
     "@langchain/openai": "^1.5.5",
@@ -23,15 +24,20 @@
     "dotenv": "^16.4.7",
     "fastify": "^5.2.1",
     "langchain": "^1.5.3",
+    "nodemailer": "^9.0.3",
     "pg": "^8.13.1",
+    "yaml": "^2.8.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.15.21",
+    "@types/nodemailer": "^6.4.17",
     "@types/pg": "^8.11.10",
+    "@types/ws": "^8.5.14",
     "testcontainers": "^12.0.4",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "ws": "^8.18.2"
   }
 }

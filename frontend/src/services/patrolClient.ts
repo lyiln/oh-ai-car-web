@@ -18,10 +18,10 @@ export async function start(input: {
   return result.task;
 }
 
-export async function stop(deviceId?: string): Promise<{ ok: true }> {
-  return apiRequest<{ ok: true }>('/api/patrol/stop', {
+export async function stop(deviceId?: string, options?: { force?: boolean }): Promise<{ ok: true; forced?: boolean }> {
+  return apiRequest<{ ok: true; forced?: boolean }>('/api/patrol/stop', {
     method: 'POST',
-    body: JSON.stringify({ deviceId }),
+    body: JSON.stringify({ deviceId, force: options?.force === true }),
   });
 }
 
@@ -55,4 +55,17 @@ export async function routes(deviceId?: string | null): Promise<PatrolRoute[]> {
   const qs = deviceId ? `?deviceId=${encodeURIComponent(deviceId)}` : '';
   const result = await apiRequest<{ routes: PatrolRoute[] }>(`/api/patrol/routes${qs}`);
   return result.routes ?? [];
+}
+
+export async function importRoute(vehicleId: string, input: { name: string; mapVersion: string; yaml: string }): Promise<PatrolRoute> {
+  const result = await apiRequest<{ route: PatrolRoute }>(`/api/vehicles/${vehicleId}/patrol-routes`, {
+    method: 'POST', body: JSON.stringify(input),
+  });
+  return result.route;
+}
+
+export async function clearRoutes(vehicleId: string): Promise<{ deleted: number }> {
+  return apiRequest<{ ok: true; deleted: number }>(`/api/vehicles/${vehicleId}/patrol-routes`, {
+    method: 'DELETE',
+  });
 }

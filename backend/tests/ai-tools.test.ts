@@ -4,6 +4,7 @@ import {
   buildDailyReportStats,
   classifyObservationHighlight,
 } from '../src/ai/tools/observations.js';
+import { createAdvisorTools } from '../src/ai/tools/index.js';
 import { queryWhitelist } from '../src/ai/tools/whitelist.js';
 import type { Database } from '../src/db/index.js';
 import type { DailyObservationRow } from '../src/ai/types.js';
@@ -29,11 +30,23 @@ describe('ai tools', () => {
       }],
     }));
     const db = { query } as unknown as Database;
-    const result = await queryWhitelist(db, '京A');
+    const ctx = { user: { id: 'admin-1', role: 'admin' as const }, memberId: null };
+    const result = await queryWhitelist(db, ctx, '京A');
     expect(result.count).toBe(1);
     expect(result.entries[0]?.plate).toBe('京A12345');
     expect(String(query.mock.calls[0]?.[0])).toContain('is_snapshot = false');
     expect(query.mock.calls[0]?.[1]).toEqual(['%京A%']);
+  });
+
+  it('exposes the global whitelist tool only to administrators', async () => {
+    const db = { query: vi.fn() } as unknown as Database;
+    const adminTools = createAdvisorTools(db, { user: { id: 'admin-1', role: 'admin' }, memberId: null });
+    const operatorTools = createAdvisorTools(db, { user: { id: 'operator-1', role: 'operator' }, memberId: 'operator-1' });
+    expect(adminTools.map((entry) => entry.name)).toContain('list_whitelist');
+    expect(operatorTools.map((entry) => entry.name)).not.toContain('list_whitelist');
+    await expect(queryWhitelist(db, { user: { id: 'operator-1', role: 'operator' }, memberId: 'operator-1' }))
+      .rejects.toMatchObject({ statusCode: 403 });
+    expect(db.query).not.toHaveBeenCalled();
   });
 
   it('builds daily stats and highlights for intrusion and illegal parking', () => {

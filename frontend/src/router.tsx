@@ -4,7 +4,6 @@ import { AppShell } from './components/layout/AppShell.js';
 import { useAuth } from './contexts/AuthContext.js';
 import { SelectedDeviceProvider } from './contexts/SelectedDeviceContext.js';
 import { LoginPage } from './app/LoginPage.js';
-import { ClassicConsole } from './app/ClassicConsole.js';
 import { DashboardPage } from './pages/dashboard/DashboardPage.js';
 import { DeviceListPage } from './pages/fleet/DeviceListPage.js';
 import { ConsolePage } from './pages/console/ConsolePage.js';
@@ -18,11 +17,19 @@ import { WhitelistPage } from './pages/whitelist/WhitelistPage.js';
 import { ReportsPage } from './pages/reports/ReportsPage.js';
 import { SettingsPage } from './pages/settings/SettingsPage.js';
 import { ResponseTasksPage } from './pages/responses/ResponseTasksPage.js';
+import { AdminUsersPage } from './pages/admin/AdminUsersPage.js';
+import { AdminAuditPage } from './pages/admin/AdminAuditPage.js';
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
   if (loading) return <div className="empty-state">正在验证登录…</div>;
   if (!user) return <Navigate to="/login" replace />;
+  return children;
+}
+
+function RequireAdmin({ children }: { children: React.ReactNode }) {
+  const { user } = useAuth();
+  if (user?.role !== 'admin') return <Navigate to="/dashboard" replace />;
   return children;
 }
 
@@ -67,10 +74,10 @@ export const router = createBrowserRouter([
       { path: 'whitelist', element: <WhitelistPage /> },
       { path: 'reports', element: <ReportsPage /> },
       { path: 'settings', element: <SettingsPage /> },
+      { path: 'admin/users', element: <RequireAdmin><AdminUsersPage /></RequireAdmin> },
+      { path: 'admin/audit', element: <RequireAdmin><AdminAuditPage /></RequireAdmin> },
     ],
   },
-  { path: '/connect', element: <ClassicConsole /> },
-  { path: '/remote', element: <ClassicConsole /> },
   { path: '*', element: <Navigate to="/dashboard" replace /> },
 ]);
 

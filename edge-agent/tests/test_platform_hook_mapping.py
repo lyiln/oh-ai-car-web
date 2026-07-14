@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 YOLO_REPO = Path(
     os.environ.get(
         "YOLO_REPO_PATH",
-        REPO_ROOT / "yolo-v5" / "oh-ai-car-YOLOv5",
+        REPO_ROOT / "YOLOv5" / "oh-ai-car-YOLOv5",
     )
 )
 HOOK_PATH = YOLO_REPO / "platform_hook.py"
@@ -114,13 +114,14 @@ class PlatformHookInferenceTests(unittest.TestCase):
 
 
 class AdapterPathTests(unittest.TestCase):
-    def test_repo_path_prefers_yolo_v5(self) -> None:
+    def test_repo_path_prefers_bundled_yolov5(self) -> None:
         os.environ.pop("YOLO_REPO_PATH", None)
         os.environ["PLATE_DETECTOR_MODE"] = "mock"
         from yolo_plate_adapter import _repo_candidates
 
         candidates = _repo_candidates()
-        self.assertTrue(any("yolo-v5" in str(path).replace("\\", "/") for path in candidates))
+        normalized = [str(path).replace("\\", "/") for path in candidates]
+        self.assertTrue(any("/YOLOv5/oh-ai-car-YOLOv5" in path for path in normalized))
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import type { GatewayEnvelope } from '@oh-ai-car-web/shared';
 import { fetchCarVideoSnapshot, SnapshotError } from '../http/video-snapshot.js';
 import { CarTcpClient } from '../tcp/car-tcp-client.js';
-import { CommandError, dispatch, parseCommand, parseConnectionConfig, probeTarget, stopCommand, type ParsedCommand } from './command-dispatcher.js';
+import { CommandError, dispatch, parseCommand, parseConnectionConfig, parseProbeConfig, stopCommand, type ParsedCommand } from './command-dispatcher.js';
 import type { ProbeResult } from '@oh-ai-car-web/shared';
 
 const DEFAULT_ALLOWED_ORIGINS = [
@@ -208,7 +208,10 @@ export class ControlServer {
 
   private async handleCommand(ws: WebSocket, command: ParsedCommand): Promise<{ requestId: string; encoded?: string; probe?: ProbeResult }> {
     if (command.command === 'probe') {
-      const probe = await probeTarget(command.payload);
+      if (!this.leaseVerifier) throw new CommandError('PLATFORM_AUTH_REQUIRED', 'TCP probe requires a platform control lease');
+      const { timeoutMs } = parseProbeConfig(command.payload);
+      const target = await this.authorizeConnection(command.payload, false, false);
+      const probe = await CarTcpClient.probe(target.host, target.tcpPort, timeoutMs);
       return { requestId: command.requestId, probe };
     }
 
@@ -259,31 +262,29 @@ export class ControlServer {
       this.clearLeaseTimer();
       this.controller = null;
       this.client.disconnect();
-      this.client.clearLastTarget();
     }
     if (failure) throw new CommandError('STOP_FAILED', failure instanceof Error ? `Stop write failed: ${failure.message}` : 'Stop write failed');
     return encoded;
   }
 
-  /**
-   * Verify platform lease for vehicleId when required, then connect to the
-   * operator-supplied host/ports (APP NetworkSettings-style override).
-   */
-  private async authorizeConnection(payload: unknown, refresh = false) {
+  private async authorizeConnection(payload: unknown, refresh = false, scheduleLease = true) {
     const target = parseConnectionConfig(payload);
     if (!this.leaseVerifier) return target;
     const value = payload as { vehicleId?: unknown; leaseToken?: unknown };
     if (typeof value.vehicleId !== 'string' || typeof value.leaseToken !== 'string') throw new CommandError('PLATFORM_AUTH_REQUIRED', 'A valid platform control lease is required');
     const lease = await this.leaseVerifier.verify(value.leaseToken, value.vehicleId);
     if (!lease) throw new CommandError('PLATFORM_AUTH_REQUIRED', 'Platform control lease is invalid or expired');
+    if (lease.vehicle.host !== target.host || lease.vehicle.tcpPort !== target.tcpPort || lease.vehicle.videoPort !== target.videoPort) {
+      throw new CommandError('PLATFORM_AUTH_REQUIRED', 'Connection target does not match the approved vehicle');
+    }
     if (refresh) {
       const current = this.client.currentTarget;
-      if (!current || current.host !== target.host || current.tcpPort !== target.tcpPort || current.videoPort !== target.videoPort) {
+      if (!current || current.host !== lease.vehicle.host || current.tcpPort !== lease.vehicle.tcpPort || current.videoPort !== lease.vehicle.videoPort) {
         throw new CommandError('PLATFORM_AUTH_REQUIRED', 'Lease refresh does not match the connected vehicle');
       }
     }
-    this.scheduleLeaseExpiry(lease.expiresAt);
-    return target;
+    if (scheduleLease) this.scheduleLeaseExpiry(lease.expiresAt);
+    return lease.vehicle;
   }
 
   private scheduleLeaseExpiry(expiresAt: string): void {

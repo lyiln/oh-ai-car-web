@@ -8,58 +8,61 @@
    `https://cars.example.edu`). It is required in production and is used to
    restrict CORS and Cookie-authenticated write requests. Use
    `PLATFORM_ALLOWED_ORIGINS` only for additional trusted development origins.
-2. Start the platform with `docker compose up --build`. The first start runs the
+   Compose sets `PLATFORM_TRUST_PROXY=true` because its backend is reachable only
+   through the bundled single-hop Nginx proxy. Nginx overwrites the forwarded IP
+   headers. Keep this setting false for a directly reachable backend, and never
+   enable it behind a proxy that passes through client-supplied forwarding headers.
+   Set `BOOTSTRAP_ADMIN_EMAIL` to a mailbox that can receive administrator
+   login codes, and configure all `SMTP_*` values for a controlled SMTP
+   account. SMTP credentials and codes stay in the backend runtime; neither
+   is exposed to the browser.
+2. Start the local smoke-test platform with `docker compose up --build`. The first start runs the
    SQL migration and creates the configured bootstrap administrator exactly once.
+   Compose requires the bootstrap email and SMTP variables so a newly created
+   administrator can use email OTP login.
 3. Open `http://<server>:8080` and sign in. Create vehicle records, assign
    operators, and rotate device credentials through the administrator API
    described in [the project guide](../architecture/vehicle-platform-overview.md#后端-api-索引).
    Store each returned one-time credential on the ROS2 companion computer as
    `DEVICE_CREDENTIAL`.
 4. Run `PLATFORM_API_URL=http://<server>:8080 DEVICE_CREDENTIAL=<credential>
-   python3 telemetry_agent.py` in a ROS2 environment with `/gps/fix` available.
-   For Yahboom Jetson Orin Nano (ROS2 Foxy in Docker, optional mock GPS), see
-   [jetson-gps-setup.md](./jetson-gps-setup.md).
+   python3 telemetry_agent.py` in an approved ROS2 environment with `/gps/fix`
+   available. Hardware-specific deployment and ROS runtime recovery require a
+   separate stage 1.5 approval. For the approved Jetson GPS setup procedure,
+   see [jetson-gps-setup.md](./jetson-gps-setup.md).
 5. On each operator machine, run the local gateway with
    `PLATFORM_API_URL=http://<server>:8080 npm run dev:gateway`. The gateway then
    rejects control connections without a live platform lease.
 
-## Local three-process stack (HarmonyOS APP parity)
+The supplied Compose file explicitly runs the backend in development mode so
+browser-based local HTTP smoke tests can use a non-secure Cookie. It is not a
+production deployment definition. Production must terminate HTTPS and run with
+`NODE_ENV=production`, a non-default `SESSION_SECRET` of at least 32 characters,
+`COOKIE_SECURE=true`, and `PLATFORM_PUBLIC_ORIGIN` set; the backend refuses to
+start if any of these gates is absent. Production also requires
+`SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`, and `SMTP_FROM`; verify delivery to
+the bootstrap administrator before enabling email-login-only operations. Do not
+expose the local gateway beyond the operator machine.
 
-The HarmonyOS APP connects **directly** from the phone to car TCP `:6000` and
-loads video at `http://{IP}:6500/index2`. The Web stack keeps the same car
-protocol (`$01…#` packets, same ports) but inserts a **localhost gateway** for
-browser safety:
+## Local three-process stack
 
-| APP (`NetworkSettings` / remote) | Web (`/console`) |
-|---|---|
-| Enter car IP / TCP 6000 / video 6500 | Editable network panel on `/console` |
-| Phone opens TCP to car | Operator PC gateway opens TCP to car |
-| No auth | Platform lease + `PLATFORM_API_URL` on gateway |
-| Video Web component → `:6500/index2` | Browser iframe → same URL |
+The browser uses a localhost gateway for TCP safety. An operator computer must
+be on the same LAN as the registered vehicle; the browser never sends raw TCP.
+Run the backend, frontend, and a gateway configured with `PLATFORM_API_URL`.
+The console requests a vehicle-bound control lease, probes that approved target,
+then connects. Device IP and ports are managed by administrators and are not
+overridable from the control session.
 
-**Requirement:** the operator PC must be on the **same LAN** as the car (same
-condition as the phone when using the APP). The gateway initiates TCP from that
-PC; the browser never speaks raw TCP.
+Protocol encoding remains an unconfirmed source-compatibility assumption; see
+`PROTOCOL_STATUS.md` and the real-car validation flow before vehicle operation.
 
-For local development, run all three (see `npm run dev:stack`):
-
-```bash
-npm run dev:backend
-npm run dev:frontend
-# PowerShell:
-$env:PLATFORM_API_URL="http://127.0.0.1:8788"; npm run dev:gateway
-```
-
-Then open `http://127.0.0.1:5173`, sign in, select a device, open **控制台**,
-confirm or override IP/ports, and connect. The UI probes TCP before claiming
-control and shows separate status for gateway / lease / car TCP.
-
-Protocol encoding matches the retained ArkTS `CarEncode` evidence (Front =
-`$011504011B#`). Real-car confirmation remains gated by
-`PROTOCOL_STATUS.md` and `docs/flows/web-control-real-car-validation.md`.
-
-Do not expose the local gateway beyond the operator machine. Use HTTPS and set
-`COOKIE_SECURE=true` before any non-local deployment. Run
+Run
 `npm run test:integration --workspace=@oh-ai-car-web/backend` in a Docker-ready
 environment before deployment; it starts a temporary PostGIS database and does
 not use the deployment data volume.
+
+Use `npm run test:deploy-live` to build the Compose stack, verify the frontend
+HTML entry, authenticate, verify an authorised `/patrol/live` subscription
+through Nginx, and verify that an unauthenticated connection closes with policy
+code 1008. It creates an isolated Compose project and removes its containers and
+volumes when finished.

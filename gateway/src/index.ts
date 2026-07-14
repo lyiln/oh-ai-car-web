@@ -2,7 +2,8 @@ import { ControlServer } from './websocket/control-server.js';
 import { HttpLeaseVerifier } from './platform-lease-verifier.js';
 
 const platformApiUrl = process.env.PLATFORM_API_URL;
-const server = new ControlServer({ port: 8787, ...(platformApiUrl ? { leaseVerifier: new HttpLeaseVerifier(platformApiUrl) } : {}) });
+if (!platformApiUrl) throw new Error('PLATFORM_API_URL is required; unleased local control is disabled');
+const server = new ControlServer({ port: 8787, leaseVerifier: new HttpLeaseVerifier(platformApiUrl) });
 server.listen()
   .then((port) => console.log(`OH AI car gateway listening on http://127.0.0.1:${port}`))
   .catch((error) => { console.error('Gateway failed to start', error); process.exitCode = 1; });

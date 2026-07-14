@@ -1,0 +1,142 @@
+[
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\00951867816092-90_91-456&519_624&577-620&575_462&573_464&525_621&527-0_0_15_30_29_29_0-108-50.jpg",
+    "area_ratio": 0.011667,
+    "tilt_x": 90,
+    "tilt_y": 91,
+    "difficulty_score": 100.194286
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\0077658045977-90_87-236&410_394&472-384&467_248&468_246&421_382&421-0_0_8_18_33_26_26-133-16.jpg",
+    "area_ratio": 0.011729,
+    "tilt_x": 90,
+    "tilt_y": 87,
+    "difficulty_score": 99.41929
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\00777418582376-90_90-429&337_594&397-587&386_437&387_437&346_588&344-0_0_4_33_24_30_1-136-18.jpg",
+    "area_ratio": 0.011853,
+    "tilt_x": 90,
+    "tilt_y": 90,
+    "difficulty_score": 98.763636
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\0104418103448-91_85-255&469_425&528-420&525_269&521_267&468_418&473-0_0_7_27_10_28_33-106-33.jpg",
+    "area_ratio": 0.012009,
+    "tilt_x": 91,
+    "tilt_y": 85,
+    "difficulty_score": 97.350189
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\0108620689655-89_90-303&541_456&609-450&604_307&608_306&549_448&545-0_0_7_33_16_32_24-111-49.jpg",
+    "area_ratio": 0.012457,
+    "tilt_x": 89,
+    "tilt_y": 90,
+    "difficulty_score": 94.596817
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\00970905172414-90_88-337&515_508&576-497&566_339&564_338&515_497&517-0_0_12_5_33_31_32-114-25.jpg",
+    "area_ratio": 0.012489,
+    "tilt_x": 90,
+    "tilt_y": 88,
+    "difficulty_score": 94.309025
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\0092816091954-89_91-254&452_421&515-412&504_260&508_260&460_412&457-16_6_2_30_3_27_27-126-12.jpg",
+    "area_ratio": 0.012597,
+    "tilt_x": 89,
+    "tilt_y": 91,
+    "difficulty_score": 93.784089
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\00933908045977-90_87-302&523_475&584-460&578_313&580_310&530_458&528-0_0_25_32_32_26_33-113-15.jpg",
+    "area_ratio": 0.012635,
+    "tilt_x": 90,
+    "tilt_y": 87,
+    "difficulty_score": 93.303372
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\010150862069-88_88-385&591_561&651-545&640_391&647_388&600_541&593-0_0_31_25_29_5_33-106-18.jpg",
+    "area_ratio": 0.012644,
+    "tilt_x": 88,
+    "tilt_y": 88,
+    "difficulty_score": 93.170909
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\0102777777778-90_90-329&442_501&505-480&499_334&497_335&441_482&443-0_0_21_4_24_24_27-131-23.jpg",
+    "area_ratio": 0.012974,
+    "tilt_x": 90,
+    "tilt_y": 90,
+    "difficulty_score": 91.476412
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\0109051724138-90_88-290&437_501&490-493&481_297&484_295&441_490&438-0_0_24_29_25_16_32-119-16.jpg",
+    "area_ratio": 0.01339,
+    "tilt_x": 90,
+    "tilt_y": 88,
+    "difficulty_score": 88.924789
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\0100095785441-92_88-329&491_494&559-483&552_332&546_333&497_484&503-0_0_33_15_32_30_31-149-25.jpg",
+    "area_ratio": 0.013434,
+    "tilt_x": 92,
+    "tilt_y": 88,
+    "difficulty_score": 88.838503
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\01061901341-90_85-264&505_471&560-459&554_282&555_278&507_455&506-0_0_27_25_25_32_25-103-53.jpg",
+    "area_ratio": 0.013631,
+    "tilt_x": 90,
+    "tilt_y": 85,
+    "difficulty_score": 87.359684
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\00838960727969-90_90-329&408_491&479-479&466_336&467_336&419_479&418-0_0_30_30_4_26_29-172-13.jpg",
+    "area_ratio": 0.013772,
+    "tilt_x": 90,
+    "tilt_y": 90,
+    "difficulty_score": 87.013459
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\0121827107279-91_87-306&526_503&585-499&579_315&574_314&524_498&529-0_0_3_31_10_33_32-109-48.jpg",
+    "area_ratio": 0.013916,
+    "tilt_x": 91,
+    "tilt_y": 87,
+    "difficulty_score": 86.097524
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\00952107279693-79_99-191&504_320&599-309&563_199&585_197&536_306&514-0_0_13_11_32_25_27-124-19.jpg",
+    "area_ratio": 0.014673,
+    "tilt_x": 79,
+    "tilt_y": 99,
+    "difficulty_score": 82.391775
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\0101484674329-90_93-357&509_541&576-531&568_370&570_372&520_533&518-0_0_7_5_31_33_30-115-17.jpg",
+    "area_ratio": 0.014761,
+    "tilt_x": 90,
+    "tilt_y": 93,
+    "difficulty_score": 82.388215
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\0118426724138-89_90-450&509_626&579-614&570_458&573_457&513_613&510-0_0_14_32_25_24_27-86-22.jpg",
+    "area_ratio": 0.014751,
+    "tilt_x": 89,
+    "tilt_y": 90,
+    "difficulty_score": 82.112208
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\0106465517241-90_85-236&441_409&512-400&508_249&510_244&455_395&453-0_0_18_30_29_32_1-151-23.jpg",
+    "area_ratio": 0.014707,
+    "tilt_x": 90,
+    "tilt_y": 85,
+    "difficulty_score": 81.996418
+  },
+  {
+    "image_path": "C:\\Users\\jfkyx\\Desktop\\YOLOv5\\member_d_plate_detection\\datasets\\ccpd_plate_base1000\\images\\val\\00968031609195-90_85-243&501_428&569-421&561_260&562_256&515_417&513-0_0_22_32_15_26_30-203-8.jpg",
+    "area_ratio": 0.015062,
+    "tilt_x": 90,
+    "tilt_y": 85,
+    "difficulty_score": 80.391097
+  }
+]

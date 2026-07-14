@@ -9,6 +9,14 @@ function pathToCoordinates(path: Array<{ lng: number; lat: number } | number[]>)
   });
 }
 
+export function createMapMarkerContent(className: string, text = '', title = ''): HTMLDivElement {
+  const node = document.createElement('div');
+  node.className = className;
+  node.textContent = text;
+  node.title = title;
+  return node;
+}
+
 export type MapLayers = {
   waypoints: boolean;
   zones: boolean;
@@ -196,7 +204,7 @@ export const GlobalMap = forwardRef<GlobalMapHandle, Props>(function GlobalMap({
         const marker = new AMap.Marker({
           position: [point.longitude, point.latitude],
           title: point.name,
-          content: `<div class="amap-waypoint-dot" title="${point.name}"></div>`,
+          content: createMapMarkerContent('amap-waypoint-dot', '', point.name),
           offset: [-6, -6],
         });
         map.add(marker);
@@ -216,7 +224,7 @@ export const GlobalMap = forwardRef<GlobalMapHandle, Props>(function GlobalMap({
         const marker = new AMap.Marker({
           position: [violation.longitude, violation.latitude],
           title: tipParts.join(' · '),
-          content: `<div class="amap-violation-dot">${violation.plate || '违'}</div>`,
+          content: createMapMarkerContent('amap-violation-dot', violation.plate || '违', tipParts.join(' · ')),
           offset: [-18, -12],
         });
         marker.on?.('click', () => callbacksRef.current.onViolationClick?.(violation));

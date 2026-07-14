@@ -33,12 +33,12 @@ Fastify 应用入口是 `backend/src/app.ts`；启动时 `backend/src/index.ts` 
 
 | 能力 | 后端行为 | 主要数据 |
 | --- | --- | --- |
-| 登录与角色 | 管理员创建账号；使用 Argon2 校验密码，签名 Cookie 保存 8 小时会话 | `users` |
+| 登录与角色 | 管理员创建账号；所有活跃账号可使用 Argon2 密码登录，已绑定邮箱的管理员还可通过后端 SMTP 接收一次性验证码；签名 Cookie 保存 8 小时会话 | `users`、`auth_otps` |
 | 车辆档案 | 保存车辆名称、编号、TCP 主机/端口、视频端口及成员授权 | `vehicles`、`vehicle_members` |
 | 控制权 | 每辆车同一时刻只允许一个有效租约；租约有效期 60 秒，页面每 20 秒续期 | `control_leases` |
 | GPS | 设备令牌验证后批量写入 WGS-84 轨迹点；同车同采集时间重复上报会忽略 | `device_credentials`、`telemetry_points` |
 | 实时更新 | GPS 成功写入后向已授权的 `/ws` 订阅者推送 `vehicle.position` | 内存订阅表 |
-| 巡检任务 | 路线 YAML、白名单 CSV、单车单活动任务、调度事件、车牌证据与 HTML 报告 | `patrol_*`、`whitelist_*`、`plate_observations` |
+| 巡检任务 | 路线 YAML、全局白名单 CSV、单车单活动任务、调度事件、车牌证据与 HTML 报告 | `patrol_*`、`whitelist_*`、`plate_observations` |
 | 审计与保留 | 记录登录、车辆、设备令牌、租约操作；每 6 小时清理 90 天前轨迹和 1 年前审计 | `audit_logs` |
 
 数据库 DDL 位于 `backend/src/db/schema.ts`。虽然数据库启用了 PostGIS 扩展，MVP 当前按经纬度字段和时间索引查询轨迹，尚未使用空间几何列。
@@ -60,9 +60,9 @@ Fastify 应用入口是 `backend/src/app.ts`；启动时 `backend/src/index.ts` 
 | `POST/DELETE /api/control-leases/:id...` | 操作员 | 续约或主动释放控制权 |
 | `GET /api/vehicles/:id/track` | 已授权用户 | 按 `from`/`to` 时间范围查询轨迹；省略时为最近 24 小时 |
 | `GET /api/audit-logs` | 管理员 | 读取最近 200 条审计记录 |
+| `GET/POST/PUT/DELETE /api/whitelist...`、`POST /api/whitelist/import` | 管理员 | 维护所有巡检车共享的全局白名单；任务启动时复制为不可变快照 |
 | `POST /device/v1/telemetry` | 边缘代理 | 使用 `Authorization: Bearer <credential>` 批量上报点位 |
 | `/api/vehicles/:id/patrol-routes` | 管理员/已授权用户 | 管理员导入路线 YAML；已授权用户读取路线与航点 |
-| `/api/vehicles/:id/whitelists` | 管理员/已授权用户 | 管理员导入业主/访客 CSV；已授权用户读取版本列表 |
 | `/api/vehicles/:id/patrol-tasks...` | 已授权用户 | 创建、启动、停止、查看任务与下载 HTML 报告；启动前须安全断开本机网关并释放有效人工控制租约 |
 | `/device/v1/patrol/tasks/next`、`.../events` | 巡检调度器 | 凭车辆设备令据领取任务，上报航点、状态与识别记录 |
 | `POST /internal/control-lease/verify` | 本机网关 | 验证租约令牌、车辆和当前连接目标 |
@@ -73,7 +73,7 @@ Fastify 应用入口是 `backend/src/app.ts`；启动时 `backend/src/index.ts` 
 ## 巡检任务与识别链路
 
 1. 管理员导入导航组维护的 YAML 路线。每条路线有 3-8 个固定航点、8-10 秒停留时间和可选的相机画面禁停 ROI；历史路线不被改写。
-2. 管理员导入 `plate,ownerName,building,category` CSV，`category` 为 `private` 或 `visitor`。创建任务时固定引用路线和白名单版本。
+2. 管理员导入小区全局白名单（车牌、车主、楼栋、车位、类型和可选有效期）。所有巡检车使用同一份 live 白名单；创建任务时固定复制为不可变快照。
 3. 操作员启动草稿任务前，后端在同一车辆锁定事务中检查有效人工控制租约；如存在则返回 409，任务保持 `draft`，操作员必须安全断开本机网关并释放租约。检查通过后任务才进入 `queued`；小车端 `patrol_scheduler` 使用已有设备凭据领取任务后进入 `running`，并按 Nav2 航点顺序导航。
 4. 调度器上报航点到达和识别事件。置信度低于 0.75 或无有效车牌为待复核；其余记录按白名单判为登记私家车、访客或疑似外来。相同任务、车牌、航点和 30 分钟窗口内的记录会合并。
 5. 禁停只按固定航点的相机 ROI 与车辆检测框相交判定，不把未标定的 GPS 当作禁停围栏。任务详情与 HTML 报告保留识别证据和处置统计。
@@ -85,9 +85,9 @@ Fastify 应用入口是 `backend/src/app.ts`；启动时 `backend/src/index.ts` 
 1. 操作员登录平台，后端在 HttpOnly Cookie 中保存签名会话。
 2. 前端只读取该操作员被授权的车辆档案，得到已保存的 TCP 和视频配置。
 3. 操作员点击连接。前端请求 `POST /api/vehicles/:id/control-lease`，后端在事务中拒绝其他用户的有效租约，或签发/延长自己的 60 秒租约。
-4. 前端把车辆 ID、租约令牌与保存的连接配置提交给本机 `ws://127.0.0.1:8787/control` 网关。
-5. 当网关设置了 `PLATFORM_API_URL` 时，会调用后端 `/internal/control-lease/verify`。只有令牌、用户、车辆、未过期租约及连接配置完全一致，且该车没有活动或待确认停止的巡检任务时，网关才允许 TCP 连接。
-6. 前端每 20 秒续约，并把新令牌以 `leaseRefresh` 更新给网关。更新失败或租约到期时，网关沿用既有安全路径：先尝试发送 Stop，再关闭 TCP。
+4. 前端先以车辆 ID、租约令牌与保存的连接配置请求 probe；网关只探测与租约完全一致的目标，且 probe 不占用控制会话。
+5. 前端仅在 probe 可达后把相同配置提交给本机 `ws://127.0.0.1:8787/control` 网关。网关必须设置 `PLATFORM_API_URL` 并调用后端 `/internal/control-lease/verify`；只有令牌、用户、车辆、未过期租约及连接配置完全一致，且该车没有活动或待确认停止的巡检任务时，网关才允许 TCP 连接。
+6. 前端每 20 秒续约，并把新令牌以 `leaseRefresh` 更新给网关。更新失败或租约到期时，网关沿用既有安全路径：先尝试发送 Stop，再关闭 TCP。TCP 意外断开时，网关不会自动重连或重发运动命令，操作员必须重新连接。
 
 这套机制不会改变当前已知但尚未真车确认的小车 TCP 编码。有关协议风险请始终查看 [PROTOCOL_STATUS.md](../../PROTOCOL_STATUS.md)。
 
@@ -98,6 +98,8 @@ Fastify 应用入口是 `backend/src/app.ts`；启动时 `backend/src/index.ts` 
 3. 后端写入轨迹并推送最新点。前端进入车辆地图时先查询最近 24 小时历史数据，再订阅实时位置事件。
 4. GPS 原始数据以 WGS-84 保存；前端在显示前调用高德 `AMap.convertFrom(..., 'gps')` 转为 GCJ-02。转换失败时不绘制可能错位的轨迹。
 5. 高德的 `securityJsCode` 不进入前端包，由 Nginx `/_AMapService` 代理附加；Web Key 作为受域名限制的前端构建参数提供。
+
+全局运营地图还会绘制禁停区、航点、违规点及选中车辆轨迹。浏览器定位不可用时回退到配置的默认中心；动态车牌和航点标签通过 DOM `textContent` 创建，不插入动态 HTML。
 
 速度、航向、电量和工作模式在 API 中是可选字段。当前 ROS2 `NavSatFix` 代理实际提供坐标、高度和由协方差计算的精度；其他字段需要未来接入相应 ROS2 话题后才会有值。
 
@@ -119,14 +121,15 @@ npm run dev:frontend
 2. 在一个终端运行 `npm run dev:backend`；首次启动会迁移数据库。
 3. 以 `VITE_PLATFORM_ENABLED=true npm run dev:frontend` 启动前端。Vite 已将 `/api` 和 `/ws` 代理到 `127.0.0.1:8788`。
 4. 在操作员机器上，以 `PLATFORM_API_URL=http://127.0.0.1:8788 npm run dev:gateway` 启动本机网关。
-5. 配置高德 Key 和 ROS2 边缘代理后，才可以看到真实底图与实时轨迹。
+5. 若要使用控制台的「车牌识别工作台」，另开终端运行 `npm run dev:plate-api`。这是第四个本机进程，监听 `127.0.0.1:8010`；它需要 YOLO/PaddleOCR Python 依赖、模型权重和可发现的 YOLO 仓库。基础遥控不依赖它，详见[YOLO 集成说明](../integration/yolo-plate-recognition.md)。
+6. 配置高德 Key 和 ROS2 边缘代理后，才可以看到真实底图与实时轨迹。
 
 面向统一服务器的 Docker 配置、环境变量与 ROS2 命令见[部署说明](../deployment/vehicle-platform.md)。生产环境必须使用 HTTPS、强随机密钥、`COOKIE_SECURE=true` 和外部备份策略。
 
 ## 当前边界与尚未验证项
 
-- 已通过 TypeScript 构建和自动化测试的是代码逻辑；尚未启动 Docker Compose、验证真实 PostgreSQL/AMap/ROS2 或连接真实小车。
-- 后端包含 `npm run test:integration --workspace=@oh-ai-car-web/backend` 的 PostGIS 集成测试。PostgreSQL 镜像初始化会短暂启动一次再退出；测试等待第二次就绪日志后执行，已验证路线、任务领取、ROI、白名单分类、30 分钟去重、停止确认、双向租约互锁和并发启动。
+- TypeScript 构建、workspace 自动化测试、临时 PostGIS 集成测试和 Docker Compose 完整栈冒烟验证已经通过；Compose 证据覆盖前端入口、登录、车辆创建和认证/未认证 WebSocket，但不代表真实 AMap、SMTP、AI、ROS2 或小车已验证。
+- 后端 `npm run test:integration --workspace=@oh-ai-car-web/backend` 的 20 项 PostGIS 集成测试已通过，覆盖迁移、路线、任务领取、ROI、白名单分类与快照、30 分钟去重、停止确认、车辆级授权、OTP 并发/限流、上门处置和并发写入。
 - 巡检车的 Nav2、OCR、停止确认和真车安全接管仍需独立实测并记录。
 - 巡检看板目前通过刷新读取任务事件和识别记录，尚未把这些事件推送到浏览器 WebSocket；它不能作为实时进度已验证的证据。
 - 浏览器加载视频页面不代表小车视频流健康；TCP 写成功也不代表小车已执行指令。
