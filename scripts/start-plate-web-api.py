@@ -16,6 +16,7 @@ def _repo_candidates() -> list[Path]:
     env_path = os.environ.get("YOLO_REPO_PATH", "").strip()
     candidates = [
         Path(env_path) if env_path else None,
+        ROOT / "YOLOv5" / "oh-ai-car-YOLOv5",
         ROOT / "yolo-v5" / "oh-ai-car-YOLOv5",
         ROOT / "vendor" / "oh-ai-car-YOLOv5",
         ROOT.parents[1] / "YOLOv5" / "oh-ai-car-YOLOv5",

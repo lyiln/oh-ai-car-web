@@ -6,8 +6,11 @@ cd "$SCRIPT_DIR"
 : "${PLATFORM_API_URL:?}"
 : "${DEVICE_CREDENTIAL:?}"
 
-# Prefer local yolo-v5 checkout, then vendor clone
-DEFAULT_YOLO_REPO="$SCRIPT_DIR/../yolo-v5/oh-ai-car-YOLOv5"
+# Prefer bundled YOLO checkout, then legacy local paths
+DEFAULT_YOLO_REPO="$SCRIPT_DIR/../YOLOv5/oh-ai-car-YOLOv5"
+if [ ! -d "$DEFAULT_YOLO_REPO" ]; then
+  DEFAULT_YOLO_REPO="$SCRIPT_DIR/../yolo-v5/oh-ai-car-YOLOv5"
+fi
 if [ ! -d "$DEFAULT_YOLO_REPO" ]; then
   DEFAULT_YOLO_REPO="$SCRIPT_DIR/../vendor/oh-ai-car-YOLOv5"
 fi
