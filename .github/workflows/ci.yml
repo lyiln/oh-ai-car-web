@@ -133,6 +133,19 @@ jobs:
 
       - name: Collect Docker diagnostics when a container check fails
         if: failure()
+        env:
+          POSTGRES_PASSWORD: ci-postgres-password
+          SESSION_SECRET: ci-session-secret-at-least-32-characters-long
+          BOOTSTRAP_ADMIN_USERNAME: ci-admin
+          BOOTSTRAP_ADMIN_PASSWORD: ci-admin-password
+          BOOTSTRAP_ADMIN_EMAIL: ci-admin@example.test
+          SMTP_HOST: smtp.example.test
+          SMTP_USER: ci-mailer
+          SMTP_PASSWORD: ci-mailer-password
+          SMTP_FROM: CI <ci@example.test>
+          PLATFORM_PUBLIC_ORIGIN: http://127.0.0.1:8080
+          VITE_AMAP_KEY: ci-amap-key
+          AMAP_SECURITY_JS_CODE: ci-amap-security-code
         run: |
           docker ps -a
           docker images

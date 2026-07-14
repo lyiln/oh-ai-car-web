@@ -65,14 +65,34 @@ beforeAll(async () => {
     .withWaitStrategy(Wait.forLogMessage(/PostgreSQL init process complete; ready for start up/))
     .start();
   const databaseUrl = `postgres://platform:platform@${container.getHost()}:${container.getMappedPort(5432)}/platform`;
-  const firstMigrator = new Database(databaseUrl);
+  db = new Database(databaseUrl);
   const secondMigrator = new Database(databaseUrl);
-  await waitForDatabase(firstMigrator);
-  await Promise.all([firstMigrator.migrate(), secondMigrator.migrate()]);
-  const migrations = await firstMigrator.query<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version');
-  expect(migrations.rows).toHaveLength(12);
-  await secondMigrator.close();
-  db = firstMigrator;
+  try {
+    await waitForDatabase(db);
+    await Promise.all([db.migrate(), secondMigrator.migrate()]);
+    const migrations = await db.query<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version');
+    expect(migrations.rows).toHaveLength(16);
+    expect(new Set(migrations.rows.map((row) => row.version))).toEqual(new Set([
+      '001',
+      '002-patrol-inspection',
+      '003-patrol-stop-confirmation',
+      '004-platform-operations',
+      '005-patrol-snapshot-reviews',
+      '006-whitelist-live-version-locking',
+      '007-doorstep-response',
+      '008-doorstep-response-safety',
+      '009-global-whitelist',
+      '010-whitelist-entry-fields',
+      '011-patrol-event-details',
+      '012-patrol-rule-snapshots',
+      '012-ai-agents',
+      '013-whitelist-phone-sms',
+      '014-wxpusher-uid',
+      '015-drop-phone-aliyun',
+    ]));
+  } finally {
+    await secondMigrator.close();
+  }
   for (const [name, id, role, email] of [
     ['admin', ids.admin, 'admin', 'admin@example.test'],
     ['operator-a', ids.operatorA, 'operator', 'operator-a@example.test'],
