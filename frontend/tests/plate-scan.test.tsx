@@ -1,4 +1,5 @@
 import { render, screen } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { PlateScanPanel } from '../src/components/plate/PlateScanPanel.js';
 import { normalizePlateText, rewriteInferImageUrls, rewriteVideoInferResult } from '../src/services/plateClient.js';
@@ -25,6 +26,10 @@ vi.mock('../src/services/plateClient.js', async (importOriginal) => {
     inferPlateImage: vi.fn(),
   };
 });
+
+vi.mock('../src/services/opsClient.js', () => ({
+  createViolationFromConsoleScan: vi.fn(),
+}));
 
 describe('plateClient helpers', () => {
   it('normalizes Chinese plate text', () => {
@@ -108,9 +113,14 @@ describe('PlateScanPanel', () => {
   });
 
   it('disables scan actions when control is disabled', async () => {
-    render(<PlateScanPanel host="10.82.66.179" videoPort={6500} disabled />);
+    render(
+      <MemoryRouter>
+        <PlateScanPanel host="10.82.66.179" videoPort={6500} vehicleId="veh-1" disabled />
+      </MemoryRouter>,
+    );
     expect(await screen.findByText(/YOLO 就绪/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '识别当前帧' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '开始定时扫描' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '添加到违规车辆（测试）' })).toBeDisabled();
   });
 });

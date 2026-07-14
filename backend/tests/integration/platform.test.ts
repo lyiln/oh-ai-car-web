@@ -65,14 +65,35 @@ beforeAll(async () => {
     .withWaitStrategy(Wait.forLogMessage(/PostgreSQL init process complete; ready for start up/))
     .start();
   const databaseUrl = `postgres://platform:platform@${container.getHost()}:${container.getMappedPort(5432)}/platform`;
-  const firstMigrator = new Database(databaseUrl);
+  db = new Database(databaseUrl);
   const secondMigrator = new Database(databaseUrl);
-  await waitForDatabase(firstMigrator);
-  await Promise.all([firstMigrator.migrate(), secondMigrator.migrate()]);
-  const migrations = await firstMigrator.query<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version');
-  expect(migrations.rows).toHaveLength(12);
-  await secondMigrator.close();
-  db = firstMigrator;
+  try {
+    await waitForDatabase(db);
+    await Promise.all([db.migrate(), secondMigrator.migrate()]);
+    const migrations = await db.query<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version');
+    expect(migrations.rows).toHaveLength(17);
+    expect(new Set(migrations.rows.map((row) => row.version))).toEqual(new Set([
+      '001',
+      '002-patrol-inspection',
+      '003-patrol-stop-confirmation',
+      '004-platform-operations',
+      '005-patrol-snapshot-reviews',
+      '006-whitelist-live-version-locking',
+      '007-doorstep-response',
+      '008-doorstep-response-safety',
+      '009-global-whitelist',
+      '010-whitelist-entry-fields',
+      '011-patrol-event-details',
+      '012-patrol-rule-snapshots',
+      '012-ai-agents',
+      '013-violation-review-disposition',
+      '013-whitelist-phone-sms',
+      '014-wxpusher-uid',
+      '015-drop-phone-aliyun',
+    ]));
+  } finally {
+    await secondMigrator.close();
+  }
   for (const [name, id, role, email] of [
     ['admin', ids.admin, 'admin', 'admin@example.test'],
     ['operator-a', ids.operatorA, 'operator', 'operator-a@example.test'],
@@ -287,6 +308,114 @@ describe('platform API against PostGIS', () => {
     ]);
   });
 
+  it('classifies incomplete OCR plates via ≥3 contiguous alphanumeric whitelist overlap', async () => {
+    const adminCookie = await login('admin', defaultPassword);
+    const operatorCookie = await login('operator-a', 'password');
+    const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-PARTIAL-PLATE', name: '部分车牌车', host: '192.168.1.27', tcpPort: 6000, videoPort: 6500 } });
+    const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
+    await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA] } });
+    const routeId = randomUUID(); const waypointId = randomUUID();
+    await db.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [routeId, vehicleId, '部分车牌路线', 'v1', 'generated', ids.admin]);
+    await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds,no_parking_roi) VALUES ($1,$2,0,$3,0,0,0,8,$4)', [waypointId, routeId, '识别点', JSON.stringify([0.1, 0.1, 0.5, 0.5])]);
+    for (const ordinal of [1, 2]) await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,$3,$4,0,0,0,8)', [randomUUID(), routeId, ordinal, `点${ordinal}`]);
+    await resetGlobalWhitelist([{ plate: '京A12345', owner: '部分匹配住户', building: '3号楼' }]);
+    const started = await app.inject({ method: 'POST', url: '/api/patrol/start', headers: { origin, cookie: operatorCookie }, payload: { deviceId: vehicleId, routeId, shift: 'morning' } });
+    expect(started.statusCode).toBe(200);
+    const taskId = started.json<{ task: { id: string } }>().task.id;
+    const credential = await app.inject({ method: 'POST', url: `/api/vehicles/${vehicleId}/device-credentials`, headers: { origin, cookie: adminCookie } });
+    const token = credential.json<{ credential: { token: string } }>().credential.token;
+    await app.inject({ method: 'GET', url: '/device/v1/patrol/tasks/next', headers: { authorization: `Bearer ${token}` } });
+    const posted = await app.inject({
+      method: 'POST',
+      url: `/device/v1/patrol/tasks/${taskId}/events`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        type: 'observation',
+        waypointId,
+        occurredAt: '2026-07-11T02:15:00.000Z',
+        plate: 'A123',
+        confidence: 0.9,
+        vehicleBox: [0.2, 0.2, 0.2, 0.2],
+      },
+    });
+    expect(posted.statusCode).toBe(200);
+    expect(posted.json()).toMatchObject({
+      classification: 'registered_private',
+      plateMatch: {
+        mode: 'partial',
+        matchedPlate: '京A12345',
+        fragment: 'A123',
+        direction: 'scan_in_whitelist',
+      },
+    });
+  });
+
+  it('matches OCR with extra characters via whitelist⊆scan and enables doorstep on matched plate', async () => {
+    const adminCookie = await login('admin', defaultPassword);
+    const operatorCookie = await login('operator-a', 'password');
+    const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-DOOR-PARTIAL', name: '模糊上门车', host: '192.168.1.28', tcpPort: 6000, videoPort: 6500 } });
+    const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
+    await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA] } });
+    await db.query('UPDATE vehicles SET last_seen_at=now() WHERE id=$1', [vehicleId]);
+    await db.query('INSERT INTO telemetry_points (id,vehicle_id,occurred_at,longitude,latitude,battery_pct) VALUES ($1,$2,now(),0,0,80)', [randomUUID(), vehicleId]);
+    const destination = await app.inject({ method: 'POST', url: '/api/resident-destinations', headers: { origin, cookie: adminCookie }, payload: { vehicleId, building: '3号楼', displayName: '3号楼门口', mapVersion: 'v-partial-door', x: 4, y: 5, yaw: 0 } });
+    expect(destination.statusCode).toBe(200);
+    const routeId = randomUUID(); const waypointId = randomUUID();
+    await db.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [routeId, vehicleId, '模糊上门路线', 'v-partial-door', 'generated', ids.admin]);
+    await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds,no_parking_roi) VALUES ($1,$2,0,$3,0,0,0,8,$4)', [waypointId, routeId, '禁停点', JSON.stringify([0.1, 0.1, 0.5, 0.5])]);
+    for (const ordinal of [1, 2]) await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,$3,$4,0,0,0,8)', [randomUUID(), routeId, ordinal, `点${ordinal}`]);
+    await resetGlobalWhitelist([{ plate: '京A12345', owner: '模糊上门住户', building: '3号楼' }]);
+    const started = await app.inject({ method: 'POST', url: '/api/patrol/start', headers: { origin, cookie: operatorCookie }, payload: { deviceId: vehicleId, routeId, shift: 'morning' } });
+    const taskId = started.json<{ task: { id: string } }>().task.id;
+    const credential = await app.inject({ method: 'POST', url: `/api/vehicles/${vehicleId}/device-credentials`, headers: { origin, cookie: adminCookie } });
+    const token = credential.json<{ credential: { token: string } }>().credential.token;
+    await app.inject({ method: 'GET', url: '/device/v1/patrol/tasks/next', headers: { authorization: `Bearer ${token}` } });
+    // Incomplete OCR fragment — same match path as classification
+    const fragmentObs = await app.inject({
+      method: 'POST',
+      url: `/device/v1/patrol/tasks/${taskId}/events`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        type: 'observation',
+        waypointId,
+        occurredAt: '2026-07-11T02:20:00.000Z',
+        plate: 'A123',
+        confidence: 0.91,
+        vehicleBox: [0.2, 0.2, 0.2, 0.2],
+        evidenceImageUrl: 'https://evidence.invalid/partial-door.jpg',
+      },
+    });
+    expect(fragmentObs.statusCode).toBe(200);
+    expect(fragmentObs.json()).toMatchObject({
+      classification: 'registered_private',
+      responseEligible: true,
+      ownerName: '模糊上门住户',
+      building: '3号楼',
+      plateMatch: { mode: 'partial', matchedPlate: '京A12345', direction: 'scan_in_whitelist' },
+    });
+    // OCR with trailing noise — whitelist body ⊆ scan
+    const noisyObs = await app.inject({
+      method: 'POST',
+      url: `/device/v1/patrol/tasks/${taskId}/events`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        type: 'observation',
+        waypointId,
+        occurredAt: '2026-07-11T02:25:00.000Z',
+        plate: '京A12345X',
+        confidence: 0.93,
+        vehicleBox: [0.2, 0.2, 0.2, 0.2],
+        evidenceImageUrl: 'https://evidence.invalid/noisy-door.jpg',
+      },
+    });
+    expect(noisyObs.statusCode).toBe(200);
+    expect(noisyObs.json()).toMatchObject({
+      classification: 'registered_private',
+      responseEligible: true,
+      plateMatch: { mode: 'partial', matchedPlate: '京A12345', direction: 'whitelist_in_scan' },
+    });
+  });
+
   it('creates patrol_events and reviews for pending-review observations, and whitelist snapshot is immutable', async () => {
     const adminCookie = await login('admin', defaultPassword);
     const operatorCookie = await login('operator-a', 'password');
@@ -308,31 +437,48 @@ describe('platform API against PostGIS', () => {
     // Mutate live whitelist after task start — snapshot must stay isolated
     await app.inject({ method: 'POST', url: '/api/whitelist/import', headers: { origin, cookie: adminCookie }, payload: { rows: [{ plate: 'X99999', owner: '篡改', building: '99号楼', vehicleType: 'visitor' }] } });
     // Low-confidence observation → pending_review → must create patrol_event + review
-    const lowConf = await app.inject({ method: 'POST', url: `/device/v1/patrol/tasks/${taskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { type: 'observation', waypointId, occurredAt: '2026-07-11T03:00:00.000Z', plate: 'B99998', confidence: 0.5 } });
+    // OCR fragment still carries plateMatch hint for operators even when below threshold.
+    const lowConf = await app.inject({
+      method: 'POST',
+      url: `/device/v1/patrol/tasks/${taskId}/events`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { type: 'observation', waypointId, occurredAt: '2026-07-11T03:00:00.000Z', plate: 'X999', confidence: 0.5 },
+    });
     expect(lowConf.statusCode).toBe(200);
-    expect(lowConf.json()).toMatchObject({ classification: 'pending_review', deduplicated: false });
+    expect(lowConf.json()).toMatchObject({
+      classification: 'pending_review',
+      deduplicated: false,
+      plateMatch: { mode: 'partial', matchedPlate: 'X99999', fragment: 'X999', direction: 'scan_in_whitelist' },
+    });
     // High-confidence observation for X99999 — snapshot still classifies it as private, not visitor
     const highConf = await app.inject({ method: 'POST', url: `/device/v1/patrol/tasks/${taskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { type: 'observation', waypointId, occurredAt: '2026-07-11T03:01:00.000Z', plate: 'X99999', confidence: 0.92 } });
     expect(highConf.json()).toMatchObject({ classification: 'registered_private' });
-    // Review queue must contain the low-confidence observation
+    // Review queue must contain the low-confidence observation with match rationale
     const reviews = await app.inject({ method: 'GET', url: '/api/reviews/pending', headers: { origin, cookie: operatorCookie } });
     expect(reviews.statusCode).toBe(200);
-    const pending = reviews.json<{ reviews: Array<{ eventId: string; reason: string; deviceName: string }> }>().reviews;
+    const pending = reviews.json<{ reviews: Array<{ eventId: string; reason: string; deviceName: string; plate?: string; plateMatch?: { matchedPlate: string; mode: string } }> }>().reviews;
     expect(pending).toEqual(
-      expect.arrayContaining([expect.objectContaining({ reason: 'low_confidence', deviceName: '审核测试车' })]),
+      expect.arrayContaining([
+        expect.objectContaining({
+          reason: 'low_confidence',
+          deviceName: '审核测试车',
+          plate: 'X999',
+          plateMatch: expect.objectContaining({ mode: 'partial', matchedPlate: 'X99999' }),
+        }),
+      ]),
     );
     const review = pending.find((item) => item.reason === 'low_confidence')!;
     expect((await app.inject({
       method: 'POST',
       url: `/api/reviews/${review.eventId}/resolve`,
       headers: { origin, cookie: operatorCookie },
-      payload: { action: 'whitelist', plate: 'B99998' },
+      payload: { action: 'whitelist', plate: 'X999' },
     })).statusCode).toBe(403);
     expect((await app.inject({
       method: 'POST',
       url: `/api/reviews/${review.eventId}/resolve`,
       headers: { origin, cookie: adminCookie },
-      payload: { action: 'whitelist', plate: 'B99998' },
+      payload: { action: 'whitelist', plate: 'X999' },
     })).statusCode).toBe(200);
     // Task events must include the 'observation' type event
     const events = await app.inject({ method: 'GET', url: `/api/patrol/tasks/${taskId}/events`, headers: { origin, cookie: operatorCookie } });

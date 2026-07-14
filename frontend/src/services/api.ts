@@ -42,6 +42,7 @@ export interface PatrolEvent {
   confidence?: number | null;
   thumbnailUrl?: string | null;
   message?: string;
+  plateMatch?: PlateMatchInfo | null;
 }
 
 export interface MapZone {
@@ -75,6 +76,13 @@ export interface Violation {
   confidence?: number | null;
 }
 
+export interface PlateMatchInfo {
+  mode: 'exact' | 'partial';
+  matchedPlate: string;
+  fragment?: string | null;
+  direction?: 'scan_in_whitelist' | 'whitelist_in_scan';
+}
+
 export interface Review {
   id: string;
   eventId: string;
@@ -84,6 +92,8 @@ export interface Review {
   waypoint?: string | null;
   deviceName?: string | null;
   evidenceUrl?: string | null;
+  confidence?: number | null;
+  plateMatch?: PlateMatchInfo | null;
   suggestion?: string | null;
 }
 
@@ -93,6 +103,7 @@ export interface WhitelistEntry {
   owner?: string | null;
   building?: string | null;
   parkingSpot?: string | null;
+  wxUid?: string | null;
   vehicleType?: 'private' | 'visitor';
   validUntil?: string | null;
 }
@@ -182,6 +193,10 @@ export interface ResponseTask {
   plate: string;
   ownerName: string;
   building: string;
+  ownerWxUid?: string;
+  smsStatus?: string;
+  smsError?: string;
+  smsSentAt?: string | null;
   status: 'pending_review' | 'confirmed' | 'assigned' | 'navigating' | 'arrived' | 'cancellation_requested' | 'completed' | 'cancelled' | 'failed';
   eligibilityReason: string;
   aiSuggestion?: string;

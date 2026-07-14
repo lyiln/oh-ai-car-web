@@ -8,8 +8,10 @@
 相机 / 视频源
     → YOLOv5/oh-ai-car-YOLOv5 (YOLOv5 车辆门控 + 车牌检测 + PaddleOCR)
     → edge-agent/plate_vision_agent.py
-    → POST /device/v1/patrol/tasks/:id/events  { type: "observation", plate, confidence, vehicleBox, ... }
+    → POST /device/v1/evidence  (JPEG → 主机 data/evidence/)
+    → POST /device/v1/patrol/tasks/:id/events  { type: "observation", evidenceImageUrl: "/api/evidence/..." }
     → plate_observations → violations / reviews / 地图
+    → 管理员在「待审核」「违规车辆」页查看截图并人工判断
 ```
 
 平台后端**不包含**推理代码；与 GPS 遥测一样，推理在 Jetson 边缘侧完成。
@@ -44,7 +46,7 @@ c:\Users\jfkyx\Desktop\小车web\YOLOv5\oh-ai-car-YOLOv5
 
 仓库为私有时，需先接受 GitHub 邀请：
 
-<https://github.com/JMshepherd227/oh-ai-car-YOLOv5/invitations>
+[https://github.com/JMshepherd227/oh-ai-car-YOLOv5/invitations](https://github.com/JMshepherd227/oh-ai-car-YOLOv5/invitations)
 
 如需重新克隆或修复目录，也可以在本仓库根目录执行：
 
@@ -60,7 +62,7 @@ python scripts/setup-yolo-plate.py
 
 仓库根目录的 `platform_hook.py` 导出 `create_detector()`，内部复用 `scripts/web_runtime_inference.py` 的 **WebInferenceRuntime**（进程内两阶段推理，避免每帧 subprocess）。
 
-参考本仓库 [`edge-agent/platform_hook.example.py`](../../edge-agent/platform_hook.example.py)；`setup-yolo-plate.py` 会在缺失时自动复制。
+参考本仓库 `[edge-agent/platform_hook.example.py](../../edge-agent/platform_hook.example.py)`；`setup-yolo-plate.py` 会在缺失时自动复制。
 
 ### 方式 B：仅权重回退
 
@@ -76,23 +78,34 @@ pip install -r edge-agent/requirements-plate.txt
 
 ## 4. 环境变量（Jetson / 开发机）
 
-| 变量 | 说明 |
-|------|------|
-| `PLATFORM_API_URL` | 平台 API，如 `http://10.82.66.59:8788` |
-| `DEVICE_CREDENTIAL` | 设备凭据 `uuid.secret` |
-| `YOLO_REPO_PATH` | 默认 `YOLOv5/oh-ai-car-YOLOv5`（其次 `yolo-v5/...`、`vendor/...`） |
-| `YOLO_DEVICE` | `0` / `cpu`，空为自动 |
-| `YOLO_CAR_WEIGHTS` | 默认 `weights/car_bdd100k_mini_v1_best.pt` |
-| `YOLO_PLATE_WEIGHTS` | 默认 `weights/best_plate_detector_v2.pt` |
-| `YOLO_OCR_MIN_SCORE` | OCR 通过阈值，默认 `0.75` |
-| `YOLO_PIPELINE_MODE` | `two_stage`（默认） |
-| `PLATE_VIDEO_SOURCE` | `0` 摄像头，或 RTSP/文件路径 |
-| `PLATE_DETECTOR_MODE` | `auto` / `mock` / `subprocess` |
-| `PLATE_MIN_CONFIDENCE` | 上报阈值，默认 `0.45`（平台分类阈值 0.75） |
-| `EVIDENCE_PUBLIC_BASE_URL` | 证据图 URL 前缀，如 `http://10.82.66.179:8089/evidence` |
-| `EVIDENCE_HOST` | 证据服务监听地址；默认 `127.0.0.1`，仅在经批准的受防火墙保护 LAN 部署中显式设为 `0.0.0.0` |
-| `PLATE_VISION_TASK_ID` | 可选，固定任务 ID（调试） |
-| `PLATE_VISION_WAYPOINT_ID` | 可选，固定航点 ID（调试） |
+
+| 变量                            | 说明                                                                          |
+| ----------------------------- | --------------------------------------------------------------------------- |
+| `PLATFORM_API_URL`            | 平台 API，如 `http://10.82.66.59:8788`                                          |
+| `DEVICE_CREDENTIAL`           | 设备凭据 `uuid.secret`                                                          |
+| `YOLO_REPO_PATH`              | 默认 `YOLOv5/oh-ai-car-YOLOv5`（其次 `yolo-v5/...`、`vendor/...`）                 |
+| `YOLO_DEVICE`                 | `0` / `cpu`，空为自动                                                            |
+| `YOLO_CAR_WEIGHTS`            | 默认 `weights/car_bdd100k_mini_v1_best.pt`                                    |
+| `YOLO_PLATE_WEIGHTS`          | 默认 `weights/best_plate_detector_v2.pt`                                      |
+| `YOLO_OCR_MIN_SCORE`          | OCR 通过阈值，默认 `0.75`                                                          |
+| `YOLO_PIPELINE_MODE`          | `two_stage`（默认）                                                             |
+| `PLATE_VIDEO_SOURCE`          | `0` 摄像头，或 RTSP/文件路径                                                         |
+| `PLATE_DETECTOR_MODE`         | `auto` / `mock` / `subprocess`                                              |
+| `PLATE_MIN_CONFIDENCE`        | 上报阈值，默认 `0.45`（平台分类阈值 0.75）                                                 |
+| `EVIDENCE_UPLOAD_TO_PLATFORM` | 默认 `1`：把 JPEG 上传到主机 `POST /device/v1/evidence`，Web 用 `/api/evidence/...` 展示 |
+| `EVIDENCE_STORAGE_DIR`        | 主机侧存储目录，默认 `backend/data/evidence`（相对后端 cwd）                                |
+| `EVIDENCE_KEEP_LOCAL`         | 默认 `1`：上传后仍在边缘保留本地副本（调试）                                                    |
+| `EVIDENCE_PUBLIC_BASE_URL`    | 仅当 `EVIDENCE_UPLOAD_TO_PLATFORM=0` 时使用；Jetson 本机证据 HTTP 前缀                  |
+| `EVIDENCE_HOST`               | 本地证据服务监听；上传到主机时可不开启 `EVIDENCE_SERVE`                                        |
+| `PLATE_VISION_TASK_ID`        | 可选，固定任务 ID（调试）                                                              |
+| `PLATE_VISION_WAYPOINT_ID`    | 可选，固定航点 ID（调试）                                                              |
+
+
+### 主机 Web 可视化（管理员）
+
+1. 后端对外监听（Jetson 可访问）：`.env` 中 `HOST=0.0.0.0`，`PLATFORM_API_URL=http://<PC-IP>:8788`
+2. 边缘 `plate_vision_agent` 识别后上传原图/标注图到主机
+3. 登录 Web → **待人工审核** / **违规车辆**：看截图，点图可放大，再确认/误报
 
 ## 5. 启动
 
@@ -158,21 +171,23 @@ npm run dev:plate-api
 1. 连接小车并确认视频 iframe 正常
 2. 进入控制台下方的「车牌识别工作台」
 3. 可选模式：
-   - `实时快照`：对当前小车视频帧执行识别
-   - `本地图片`：上传单张图片测试两阶段流程
-   - `本地视频`：上传视频并查看抽帧统计、命中帧列表、详情复核、主体车 ROI 与车牌裁剪图
-   - `浏览器摄像头`：直接用浏览器摄像头做连续抓帧识别
+  - `实时快照`：对当前小车视频帧执行识别
+  - `本地图片`：上传单张图片测试两阶段流程
+  - `本地视频`：上传视频并查看抽帧统计、命中帧列表、详情复核、主体车 ROI 与车牌裁剪图
+  - `浏览器摄像头`：直接用浏览器摄像头做连续抓帧识别
 
 这些本地/Fake TCP 验证不构成真实车辆或模型精度验证；真实车辆操作仍须遵循 `PROTOCOL_STATUS.md`。
 
 相关文件：
 
-| 文件 | 作用 |
-|------|------|
-| [`frontend/src/components/plate/PlateScanPanel.tsx`](../../frontend/src/components/plate/PlateScanPanel.tsx) | 控制台识别 UI |
-| [`frontend/src/services/plateClient.ts`](../../frontend/src/services/plateClient.ts) | snapshot + infer 客户端 |
-| [`gateway/src/http/video-snapshot.ts`](../../gateway/src/http/video-snapshot.ts) | 视频帧代理 |
-| [`scripts/start-plate-web-api.py`](../../scripts/start-plate-web-api.py) | 启动 :8010 |
+
+| 文件                                                                                                           | 作用                   |
+| ------------------------------------------------------------------------------------------------------------ | -------------------- |
+| `[frontend/src/components/plate/PlateScanPanel.tsx](../../frontend/src/components/plate/PlateScanPanel.tsx)` | 控制台识别 UI             |
+| `[frontend/src/services/plateClient.ts](../../frontend/src/services/plateClient.ts)`                         | snapshot + infer 客户端 |
+| `[gateway/src/http/video-snapshot.ts](../../gateway/src/http/video-snapshot.ts)`                             | 视频帧代理                |
+| `[scripts/start-plate-web-api.py](../../scripts/start-plate-web-api.py)`                                     | 启动 :8010             |
+
 
 ## 8. 与 TCP 遥控的关系
 
@@ -182,11 +197,14 @@ npm run dev:plate-api
 
 ## 相关文件
 
-| 文件 | 作用 |
-|------|------|
-| [`edge-agent/plate_vision_agent.py`](../../edge-agent/plate_vision_agent.py) | 主循环：采帧 → 推理 → 上报 |
-| [`edge-agent/yolo_plate_adapter.py`](../../edge-agent/yolo_plate_adapter.py) | 加载 YOLO 仓库 / hook |
-| [`edge-agent/platform_hook.example.py`](../../edge-agent/platform_hook.example.py) | hook 模板（复制到 YOLO 仓库根） |
-| [`edge-agent/platform_client.py`](../../edge-agent/platform_client.py) | Device API 客户端 |
-| [`backend/src/app.ts`](../../backend/src/app.ts) | observation 入库与分类（支持中文车牌） |
-| [`docs/flows/illegal-parking-localization.md`](../flows/illegal-parking-localization.md) | 坐标与车主信息 |
+
+| 文件                                                                                       | 作用                        |
+| ---------------------------------------------------------------------------------------- | ------------------------- |
+| `[edge-agent/plate_vision_agent.py](../../edge-agent/plate_vision_agent.py)`             | 主循环：采帧 → 推理 → 上报          |
+| `[edge-agent/yolo_plate_adapter.py](../../edge-agent/yolo_plate_adapter.py)`             | 加载 YOLO 仓库 / hook         |
+| `[edge-agent/platform_hook.example.py](../../edge-agent/platform_hook.example.py)`       | hook 模板（复制到 YOLO 仓库根）     |
+| `[edge-agent/platform_client.py](../../edge-agent/platform_client.py)`                   | Device API 客户端            |
+| `[backend/src/app.ts](../../backend/src/app.ts)`                                         | observation 入库与分类（支持中文车牌） |
+| `[docs/flows/illegal-parking-localization.md](../flows/illegal-parking-localization.md)` | 坐标与车主信息                   |
+
+

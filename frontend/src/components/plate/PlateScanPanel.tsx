@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import {
   fetchPlateHealth,
   fetchVideoSnapshot,
@@ -6,6 +7,7 @@ import {
   inferPlateVideo,
   normalizePlateText,
 } from '../../services/plateClient.js';
+import * as opsClient from '../../services/opsClient.js';
 import type {
   HealthResponse,
   InferResponse,
@@ -23,6 +25,7 @@ const CAMERA_JPEG_QUALITY = 0.88;
 type PlateScanPanelProps = {
   host: string;
   videoPort: number;
+  vehicleId?: string | null;
   disabled: boolean;
 };
 
@@ -39,7 +42,7 @@ const TAB_LABELS: Record<PlatePanelTab, string> = {
   camera: '浏览器摄像头',
 };
 
-export function PlateScanPanel({ host, videoPort, disabled }: PlateScanPanelProps) {
+export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: PlateScanPanelProps) {
   const processingRef = useRef(false);
   const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
   const cameraCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -88,6 +91,15 @@ export function PlateScanPanel({ host, videoPort, disabled }: PlateScanPanelProp
   const [cameraHits, setCameraHits] = useState<CameraHit[]>([]);
   const [activeCameraHitId, setActiveCameraHitId] = useState<string | null>(null);
 
+  const [submitBusy, setSubmitBusy] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [submitOk, setSubmitOk] = useState<{
+    id: string;
+    plate: string;
+    evidenceUrl?: string | null;
+    eventId?: string;
+  } | null>(null);
+
   const refreshHealth = useCallback(async () => {
     try {
       const payload = await fetchPlateHealth();
@@ -135,6 +147,90 @@ export function PlateScanPanel({ host, videoPort, disabled }: PlateScanPanelProp
       ) ?? videoResult.matchedFrames[0]
     );
   }, [activeVideoFrameKey, videoResult]);
+
+  const violationCandidate = useMemo(() => {
+    if (tab === 'live') {
+      const result = activeLiveHit ?? latest;
+      const plate = normalizePlateText(result?.bestPlateResult?.plate_text);
+      if (!result || !plate) return null;
+      return {
+        plate,
+        confidence: result.bestPlateResult?.ocr_confidence ?? null,
+        imageUrl: pickEvidenceImageUrl(result, previewUrl),
+      };
+    }
+    if (tab === 'image') {
+      const plate = normalizePlateText(imageResult?.bestPlateResult?.plate_text);
+      if (!imageResult || !plate) return null;
+      return {
+        plate,
+        confidence: imageResult.bestPlateResult?.ocr_confidence ?? null,
+        imageUrl: pickEvidenceImageUrl(imageResult, imagePreviewUrl),
+      };
+    }
+    if (tab === 'video') {
+      const plate = normalizePlateText(activeVideoFrame?.bestPlateResult?.plate_text);
+      if (!activeVideoFrame || !plate) return null;
+      return {
+        plate,
+        confidence: activeVideoFrame.bestPlateResult?.ocr_confidence ?? null,
+        imageUrl: pickEvidenceImageUrl(activeVideoFrame, null),
+      };
+    }
+    const result = activeCameraHit ?? cameraLatest;
+    const plate = normalizePlateText(result?.bestPlateResult?.plate_text);
+    if (!result || !plate) return null;
+    return {
+      plate,
+      confidence: result.bestPlateResult?.ocr_confidence ?? null,
+      imageUrl: pickEvidenceImageUrl(result, cameraFrameUrl),
+    };
+  }, [
+    tab,
+    activeLiveHit,
+    latest,
+    previewUrl,
+    imageResult,
+    imagePreviewUrl,
+    activeVideoFrame,
+    activeCameraHit,
+    cameraLatest,
+    cameraFrameUrl,
+  ]);
+
+  const submitToViolations = useCallback(async () => {
+    if (!vehicleId) {
+      setSubmitError('请先在设备列表选择车辆。');
+      return;
+    }
+    if (!violationCandidate?.imageUrl) {
+      setSubmitError('当前没有可上传的识别结果图，请先完成识别。');
+      return;
+    }
+    setSubmitBusy(true);
+    setSubmitError(null);
+    setSubmitOk(null);
+    try {
+      const jpegBase64 = await imageUrlToJpegBase64(violationCandidate.imageUrl);
+      const created = await opsClient.createViolationFromConsoleScan({
+        vehicleId,
+        plate: violationCandidate.plate,
+        confidence: violationCandidate.confidence,
+        jpegBase64,
+        waypoint: '控制台识别测试',
+      });
+      setSubmitOk({
+        id: created.violation.id,
+        plate: created.violation.plate,
+        evidenceUrl: created.violation.evidenceUrl,
+        eventId: created.review.eventId,
+      });
+    } catch (reason) {
+      setSubmitError(reason instanceof Error ? reason.message : '添加到违规车辆失败');
+    } finally {
+      setSubmitBusy(false);
+    }
+  }, [vehicleId, violationCandidate]);
 
   useEffect(() => {
     if (!hits.length) {
@@ -421,6 +517,33 @@ export function PlateScanPanel({ host, videoPort, disabled }: PlateScanPanelProp
         <p className="notice">
           请先在本机启动 YOLO 推理服务（:8010）：
           <code>python scripts/start-plate-web-api.py</code>
+        </p>
+      )}
+
+      <div className="plate-scan-actions plate-violation-test-bar">
+        <button
+          type="button"
+          className="secondary"
+          disabled={submitBusy || !violationCandidate || !vehicleId}
+          onClick={() => void submitToViolations()}
+        >
+          {submitBusy ? '上传中…' : '添加到违规车辆（测试）'}
+        </button>
+        <p className="muted">
+          {violationCandidate
+            ? `将把 ${violationCandidate.plate} 与截图写入「违规车辆」并进入「待人工审核」；若命中白名单会被拒绝`
+            : '识别出有效车牌后可一键写入违规并进入审核队列（测试用；白名单车牌会被拦截）'}
+        </p>
+      </div>
+      {submitError && <p className="error-text">{submitError}</p>}
+      {submitOk && (
+        <p className="notice">
+          已写入：{submitOk.plate}
+          {' · '}
+          <Link to="/reviews">去审核队列</Link>
+          {' · '}
+          <Link to="/violations">违规列表</Link>
+          {submitOk.evidenceUrl ? ` · 证据 ${submitOk.evidenceUrl}` : ''}
         </p>
       )}
 
@@ -776,6 +899,57 @@ function EmptyBlock({ text }: { text: string }) {
 function formatRatio(value: number | null | undefined): string {
   if (value == null || Number.isNaN(value)) return '—';
   return `${(value * 100).toFixed(1)}%`;
+}
+
+function pickEvidenceImageUrl(
+  result: InferResponse | VideoMatchedFrame | PlateHit | CameraHit,
+  fallback: string | null,
+): string | null {
+  return (
+    result.imageUrls.plateVisualUrl
+    || result.imageUrls.primaryCarVisualUrl
+    || result.imageUrls.uploadedImageUrl
+    || result.imageUrls.plateCropUrl
+    || result.imageUrls.primaryCarCropUrl
+    || fallback
+  );
+}
+
+async function imageUrlToJpegBase64(url: string): Promise<string> {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`读取识别结果图失败（HTTP ${response.status}）`);
+  const blob = await response.blob();
+  if (blob.type === 'image/jpeg' || /\.jpe?g($|\?)/i.test(url)) {
+    return blobToBase64(blob);
+  }
+  const bitmap = await createImageBitmap(blob);
+  const canvas = document.createElement('canvas');
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('无法转换识别结果图为 JPEG');
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+  const jpegBlob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((value) => {
+      if (value) resolve(value);
+      else reject(new Error('JPEG 编码失败'));
+    }, 'image/jpeg', 0.92);
+  });
+  return blobToBase64(jpegBlob);
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const value = typeof reader.result === 'string' ? reader.result : '';
+      const comma = value.indexOf(',');
+      resolve(comma >= 0 ? value.slice(comma + 1) : value);
+    };
+    reader.onerror = () => reject(new Error('读取图片失败'));
+    reader.readAsDataURL(blob);
+  });
 }
 
 function FrameReviewDetail({

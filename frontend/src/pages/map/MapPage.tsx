@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
+import { EvidenceImage } from '../../components/EvidenceImage.js';
 import { FormModal } from '../../components/layout/FormModal.js';
 import { GlobalMap, type GlobalMapHandle, type GlobalMapMode, type MapLayers } from '../../components/map/GlobalMap.js';
 import type { MapZone, ResidentDestination, TrackPoint, Violation, Waypoint } from '../../services/api.js';
@@ -336,9 +337,7 @@ export function MapPage() {
           {selectedViolation.longitude == null || selectedViolation.latitude == null ? (
             <p className="muted">暂无 GPS，仅显示航点/禁停区名称。</p>
           ) : null}
-          {selectedViolation.evidenceUrl && (
-            <img className="review-thumb" src={selectedViolation.evidenceUrl} alt="证据截图" />
-          )}
+          <EvidenceImage url={selectedViolation.evidenceUrl} alt={`证据 ${selectedViolation.plate || '违规'}`} />
           <div className="button-row">
             <button
               type="button"
