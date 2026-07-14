@@ -25,6 +25,10 @@ platform MVP. Start with the Chinese [project and backend guide](docs/architectu
 change record remain in [tasks/vehicle-fleet-platform-mvp-plan.md](tasks/vehicle-fleet-platform-mvp-plan.md)
 and [tasks/change-report-vehicle-fleet-platform-mvp.md](tasks/change-report-vehicle-fleet-platform-mvp.md).
 
+The repository now also vendors the key YOLO plate-recognition code under
+`YOLOv5/oh-ai-car-YOLOv5`, so the local plate API and edge-agent can run
+without requiring a separate sibling checkout by default.
+
 ## Development
 
 ```sh

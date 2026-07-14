@@ -5,6 +5,8 @@ coverage/
 *.log
 .env*
 !.env.example
+.dbg/
+debug-paddle-pir-ocr.md
 scripts/.local-jetson-gps.json
 scripts/.local/
 vendor/oh-ai-car-YOLOv5/
@@ -13,3 +15,4 @@ edge-agent/evidence-cache/
 edge-agent/__pycache__/
 scripts/.local-plate-task.json
 *.pt
+!YOLOv5/oh-ai-car-YOLOv5/**/*.pt

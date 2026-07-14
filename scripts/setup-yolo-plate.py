@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Clone oh-ai-car-YOLOv5 and install platform_hook.py for edge-agent."""
+"""Clone oh-ai-car-YOLOv5 into the repository and install platform_hook.py for edge-agent."""
 from __future__ import annotations
 
 import shutil
@@ -8,7 +8,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGET = ROOT / "yolo-v5" / "oh-ai-car-YOLOv5"
+TARGET = ROOT / "YOLOv5" / "oh-ai-car-YOLOv5"
+LEGACY_BUNDLED_TARGET = ROOT / "yolo-v5" / "oh-ai-car-YOLOv5"
 LEGACY_TARGET = ROOT / "vendor" / "oh-ai-car-YOLOv5"
 REPO = "https://github.com/JMshepherd227/oh-ai-car-YOLOv5.git"
 HOOK_EXAMPLE = ROOT / "edge-agent" / "platform_hook.example.py"
@@ -30,6 +31,10 @@ def main() -> int:
     if TARGET.exists() and any(TARGET.iterdir()):
         print(f"Already present: {TARGET}")
         _ensure_hook(TARGET)
+        return 0
+    if LEGACY_BUNDLED_TARGET.exists() and any(LEGACY_BUNDLED_TARGET.iterdir()):
+        print(f"Using legacy path: {LEGACY_BUNDLED_TARGET}")
+        _ensure_hook(LEGACY_BUNDLED_TARGET)
         return 0
     if LEGACY_TARGET.exists() and any(LEGACY_TARGET.iterdir()):
         print(f"Using legacy path: {LEGACY_TARGET}")

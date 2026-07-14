@@ -1,0 +1,9 @@
+path: c:/Users/jfkyx/Desktop/YOLOv5 plate/member_d_plate_detection/datasets/bdd100k
+train: images/100k/train
+val: images/100k/val
+
+nc: 3
+names:
+  - car
+  - bus
+  - truck

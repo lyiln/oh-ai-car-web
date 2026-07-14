@@ -3,7 +3,7 @@
 Run YOLO plate detection on a camera stream and post patrol observations.
 
 Requires:
-  - yolo-v5/oh-ai-car-YOLOv5 (or vendor/oh-ai-car-YOLOv5) with platform_hook.py
+  - YOLOv5/oh-ai-car-YOLOv5 (or legacy yolo-v5/vendor path) with platform_hook.py
   - PLATFORM_API_URL + DEVICE_CREDENTIAL
   - Active patrol task (queued on platform) or PLATE_VISION_TASK_ID + PLATE_VISION_WAYPOINT_ID
 """

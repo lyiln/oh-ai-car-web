@@ -6,7 +6,7 @@
 
 ```text
 相机 / 视频源
-    → yolo-v5/oh-ai-car-YOLOv5 (YOLOv5 车辆门控 + 车牌检测 + PaddleOCR)
+    → YOLOv5/oh-ai-car-YOLOv5 (YOLOv5 车辆门控 + 车牌检测 + PaddleOCR)
     → edge-agent/plate_vision_agent.py
     → POST /device/v1/patrol/tasks/:id/events  { type: "observation", plate, confidence, vehicleBox, ... }
     → plate_observations → violations / reviews / 地图
@@ -16,10 +16,10 @@
 
 ## 1. 放置 YOLO 模型仓库
 
-推荐路径（本机已有则直接使用）：
+当前仓库已内置主用路径：
 
 ```text
-yolo-v5/oh-ai-car-YOLOv5/
+YOLOv5/oh-ai-car-YOLOv5/
 ├─ yolov5/                 # Ultralytics YOLOv5
 ├─ weights/
 │  ├─ car_bdd100k_mini_v1_best.pt
@@ -28,7 +28,7 @@ yolo-v5/oh-ai-car-YOLOv5/
 └─ platform_hook.py        # 由 setup 脚本或示例文件生成
 ```
 
-当前 `WEB` 仓库也会自动尝试发现你本机现有的外部仓库路径：
+同时仍兼容自动发现你本机现有的外部仓库路径：
 
 ```text
 ../YOLOv5/oh-ai-car-YOLOv5/
@@ -46,13 +46,13 @@ c:\Users\jfkyx\Desktop\小车web\YOLOv5\oh-ai-car-YOLOv5
 
 <https://github.com/JMshepherd227/oh-ai-car-YOLOv5/invitations>
 
-然后在本仓库根目录：
+如需重新克隆或修复目录，也可以在本仓库根目录执行：
 
 ```bash
 python scripts/setup-yolo-plate.py
 ```
 
-克隆目标：`yolo-v5/oh-ai-car-YOLOv5/`（已 gitignore，不提交权重）。兼容旧路径 `vendor/oh-ai-car-YOLOv5/`。
+克隆目标：`YOLOv5/oh-ai-car-YOLOv5/`。兼容旧路径 `yolo-v5/oh-ai-car-YOLOv5/` 与 `vendor/oh-ai-car-YOLOv5/`。
 
 ## 2. 对接方式
 
@@ -71,7 +71,7 @@ python scripts/setup-yolo-plate.py
 ```bash
 pip install -r edge-agent/requirements-plate.txt
 # Jetson 上按官方说明单独安装 CUDA 版 PyTorch / PaddlePaddle
-# 参考：yolo-v5/oh-ai-car-YOLOv5/scripts/ubuntu/setup_plate_runtime.sh
+# 参考：YOLOv5/oh-ai-car-YOLOv5/scripts/ubuntu/setup_plate_runtime.sh
 ```
 
 ## 4. 环境变量（Jetson / 开发机）
@@ -80,7 +80,7 @@ pip install -r edge-agent/requirements-plate.txt
 |------|------|
 | `PLATFORM_API_URL` | 平台 API，如 `http://10.82.66.59:8788` |
 | `DEVICE_CREDENTIAL` | 设备凭据 `uuid.secret` |
-| `YOLO_REPO_PATH` | 默认 `yolo-v5/oh-ai-car-YOLOv5`（其次 `vendor/...`） |
+| `YOLO_REPO_PATH` | 默认 `YOLOv5/oh-ai-car-YOLOv5`（其次 `yolo-v5/...`、`vendor/...`） |
 | `YOLO_DEVICE` | `0` / `cpu`，空为自动 |
 | `YOLO_CAR_WEIGHTS` | 默认 `weights/car_bdd100k_mini_v1_best.pt` |
 | `YOLO_PLATE_WEIGHTS` | 默认 `weights/best_plate_detector_v2.pt` |

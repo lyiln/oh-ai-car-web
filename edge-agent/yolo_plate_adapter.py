@@ -48,6 +48,7 @@ def _repo_candidates() -> list[Path]:
         candidates.append(Path(env_path))
     candidates.extend(
         [
+            root / "YOLOv5" / "oh-ai-car-YOLOv5",
             root / "yolo-v5" / "oh-ai-car-YOLOv5",
             root / "vendor" / "oh-ai-car-YOLOv5",
             root.parents[1] / "YOLOv5" / "oh-ai-car-YOLOv5",
@@ -70,7 +71,7 @@ def _repo_path() -> Path:
         if (candidate / "scripts").is_dir():
             return candidate
     # Fall back to preferred default for error messages
-    return Path(__file__).resolve().parents[1] / "yolo-v5" / "oh-ai-car-YOLOv5"
+    return Path(__file__).resolve().parents[1] / "YOLOv5" / "oh-ai-car-YOLOv5"
 
 
 def _resolve_car_weights(repo: Path) -> Path:
@@ -404,7 +405,7 @@ def load_plate_detector() -> PlateDetector:
     repo = _repo_path()
     if not repo.is_dir():
         raise FileNotFoundError(
-            f"YOLO repo not found at {repo}. Place the repo at yolo-v5/oh-ai-car-YOLOv5 "
+            f"YOLO repo not found at {repo}. Place the repo at YOLOv5/oh-ai-car-YOLOv5 "
             "or set YOLO_REPO_PATH (see docs/integration/yolo-plate-recognition.md)."
         )
 
