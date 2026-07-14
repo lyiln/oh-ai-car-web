@@ -78,7 +78,7 @@ beforeAll(async () => {
     await waitForDatabase(db);
     await Promise.all([db.migrate(), secondMigrator.migrate()]);
     const migrations = await db.query<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version');
-    expect(migrations.rows).toHaveLength(18);
+    expect(migrations.rows).toHaveLength(22);
     expect(new Set(migrations.rows.map((row) => row.version))).toEqual(new Set([
       '001',
       '002-patrol-inspection',
@@ -98,6 +98,10 @@ beforeAll(async () => {
       '014-wxpusher-uid',
       '015-drop-phone-aliyun',
       '016-auth-otp-attempt-limit',
+      '017-floor-map-pose',
+      '018-patrol-routes-code',
+      '019-goto-goals',
+      '020-vehicle-nav-state',
     ]));
   } finally {
     await secondMigrator.close();
