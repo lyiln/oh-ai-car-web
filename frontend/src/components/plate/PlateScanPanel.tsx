@@ -19,6 +19,8 @@ import type {
 const DEFAULT_INTERVAL_SEC = 2;
 const DEFAULT_VIDEO_SAMPLE_FPS = 1;
 const DEFAULT_VIDEO_MAX_FRAMES = 20;
+const CAMERA_MAX_EDGE_PX = 1280;
+const CAMERA_JPEG_QUALITY = 0.88;
 
 type PlateScanPanelProps = {
   host: string;
@@ -428,8 +430,10 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
       const video = cameraVideoRef.current;
       const canvas = cameraCanvasRef.current;
       const nextFrameNumber = cameraFramesScanned + 1;
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
+      const maxEdge = Math.max(video.videoWidth, video.videoHeight);
+      const scale = maxEdge > CAMERA_MAX_EDGE_PX ? CAMERA_MAX_EDGE_PX / maxEdge : 1;
+      canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+      canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
       const context = canvas.getContext('2d');
       if (!context) {
         throw new Error('无法创建摄像头画布上下文。');
@@ -442,7 +446,7 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
             return;
           }
           reject(new Error('摄像头帧导出失败。'));
-        }, 'image/jpeg', 0.92);
+        }, 'image/jpeg', CAMERA_JPEG_QUALITY);
       });
       setCameraFrameUrl((previous) => {
         if (previous) URL.revokeObjectURL(previous);
@@ -620,6 +624,11 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
                   </div>
                   <FrameReviewDetail result={activeLiveHit} />
                 </div>
+              ) : latest ? (
+                <>
+                  <p className="muted">当前帧还没有进入命中列表，下面展示最近一次识别详情，方便判断卡在哪一步。</p>
+                  <FrameReviewDetail result={latest} />
+                </>
               ) : (
                 <EmptyBlock text="只有“检测到车辆且识别出有效车牌文本”的结果会进入命中列表。" />
               )}
@@ -845,6 +854,11 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
                   </div>
                   <FrameReviewDetail result={activeCameraHit ?? cameraLatest} />
                 </div>
+              ) : cameraLatest ? (
+                <>
+                  <p className="muted">当前抓帧没有进入命中列表，下面展示最近一次识别详情，方便判断是车辆门控、车牌候选还是 OCR 没通过。</p>
+                  <FrameReviewDetail result={cameraLatest} />
+                </>
               ) : (
                 <EmptyBlock text="只有通过车辆门控且输出有效大陆车牌文本的抓帧才会留在这里。" />
               )}
