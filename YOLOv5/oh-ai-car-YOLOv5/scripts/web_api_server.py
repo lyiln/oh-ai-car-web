@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from web_api_service import (
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
+    build_gate_response,
     build_health_payload,
     build_infer_response,
     build_runtime_paths,
@@ -144,6 +145,78 @@ async def infer(image: UploadFile = File(...)) -> dict:
 
     try:
         payload = INFERENCE_RUNTIME.run(saved_image, run_root)
+        copy_uploaded_input_to_run(saved_image, request_dirs["display_input_dir"])
+        response = build_infer_response(RUNTIME_PATHS.runtime_root, run_root, payload)
+        cleanup_old_runs(RUNTIME_PATHS.runtime_root)
+        return response
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/gate")
+async def gate(image: UploadFile = File(...)) -> dict:
+    health_payload = build_health_payload(RUNTIME_PATHS)
+    if not health_payload["ok"]:
+        raise HTTPException(status_code=500, detail=health_payload["message"])
+
+    if not image.filename:
+        raise HTTPException(status_code=400, detail="未收到图片文件名。")
+
+    try:
+        filename = validate_upload_filename(
+            image.filename,
+            allowed_extensions=IMAGE_EXTENSIONS,
+            error_message="仅支持 jpg、jpeg、png、bmp、webp 格式图片。",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    request_dirs = create_request_dirs(RUNTIME_PATHS.runtime_root)
+    run_root = request_dirs["run_root"]
+    content = await image.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="上传图片为空。")
+
+    saved_image = save_upload_bytes(request_dirs["upload_dir"], filename, content)
+
+    try:
+        payload = INFERENCE_RUNTIME.run_car_gate(saved_image, run_root)
+        copy_uploaded_input_to_run(saved_image, request_dirs["display_input_dir"])
+        response = build_gate_response(RUNTIME_PATHS.runtime_root, run_root, payload)
+        cleanup_old_runs(RUNTIME_PATHS.runtime_root)
+        return response
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/infer-plate-only")
+async def infer_plate_only(image: UploadFile = File(...)) -> dict:
+    health_payload = build_health_payload(RUNTIME_PATHS)
+    if not health_payload["ok"]:
+        raise HTTPException(status_code=500, detail=health_payload["message"])
+
+    if not image.filename:
+        raise HTTPException(status_code=400, detail="未收到图片文件名。")
+
+    try:
+        filename = validate_upload_filename(
+            image.filename,
+            allowed_extensions=IMAGE_EXTENSIONS,
+            error_message="仅支持 jpg、jpeg、png、bmp、webp 格式图片。",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    request_dirs = create_request_dirs(RUNTIME_PATHS.runtime_root)
+    run_root = request_dirs["run_root"]
+    content = await image.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="上传图片为空。")
+
+    saved_image = save_upload_bytes(request_dirs["upload_dir"], filename, content)
+
+    try:
+        payload = INFERENCE_RUNTIME.run_plate_only(saved_image, run_root, profile="video")
         copy_uploaded_input_to_run(saved_image, request_dirs["display_input_dir"])
         response = build_infer_response(RUNTIME_PATHS.runtime_root, run_root, payload)
         cleanup_old_runs(RUNTIME_PATHS.runtime_root)

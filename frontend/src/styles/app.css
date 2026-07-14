@@ -818,6 +818,13 @@ h1, h2, p { margin: 0; } h1 { font-size: 28px; font-weight: 700; } h2 { font-siz
 }
 .console-map-panel { min-height: 560px; display: grid; }
 .console-side { display: grid; gap: 14px; align-content: start; }
+.console-media-layout {
+  display: grid;
+  grid-template-columns: minmax(320px, 0.78fr) minmax(0, 1.22fr);
+  gap: 16px;
+  align-items: start;
+  margin-top: 16px;
+}
 .live-map {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
@@ -1074,6 +1081,7 @@ h1, h2, p { margin: 0; } h1 { font-size: 28px; font-weight: 700; } h2 { font-siz
   .kpi-grid { grid-template-columns: 1fr 1fr; }
   .split-grid,
   .console-layout { grid-template-columns: 1fr; }
+  .console-media-layout { grid-template-columns: 1fr; }
   .console-network-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 720px) {
@@ -1082,7 +1090,6 @@ h1, h2, p { margin: 0; } h1 { font-size: 28px; font-weight: 700; } h2 { font-siz
   .shell-content { padding: 16px; }
 }
 
-.console-plate-section { margin-top: 16px; }
 .plate-scan-panel { display: grid; gap: 14px; }
 .plate-scan-panel .panel-heading {
   display: flex;

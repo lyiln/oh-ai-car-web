@@ -3,7 +3,9 @@ import { Link } from 'react-router-dom';
 import {
   fetchPlateHealth,
   fetchVideoSnapshot,
+  inferCarGate,
   inferPlateImage,
+  inferPlateOnlyImage,
   inferPlateVideo,
   normalizePlateText,
 } from '../../services/plateClient.js';
@@ -27,7 +29,7 @@ type PlateScanPanelProps = {
   disabled: boolean;
 };
 
-type PlatePanelTab = 'live' | 'image' | 'video' | 'camera';
+type PlatePanelTab = 'live' | 'carVideo' | 'image' | 'video' | 'camera';
 
 type CameraHit = PlateHit & {
   frameNumber: number;
@@ -35,6 +37,7 @@ type CameraHit = PlateHit & {
 
 const TAB_LABELS: Record<PlatePanelTab, string> = {
   live: '实时快照',
+  carVideo: '小车视频',
   image: '本地图片',
   video: '本地视频',
   camera: '浏览器摄像头',
@@ -46,6 +49,9 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
   const cameraCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
   const cameraProcessingRef = useRef(false);
+  const displayVideoRef = useRef<HTMLVideoElement | null>(null);
+  const displayCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const displayStreamRef = useRef<MediaStream | null>(null);
 
   const [tab, setTab] = useState<PlatePanelTab>('live');
   const [health, setHealth] = useState<HealthResponse | null>(null);
@@ -60,6 +66,18 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
   const [hits, setHits] = useState<PlateHit[]>([]);
   const [framesScanned, setFramesScanned] = useState(0);
   const [activeLiveHitId, setActiveLiveHitId] = useState<string | null>(null);
+  const [displayReady, setDisplayReady] = useState(false);
+  const [displayStarting, setDisplayStarting] = useState(false);
+  const [displayStatus, setDisplayStatus] = useState('未启用屏幕捕获回退');
+  const [displayScanning, setDisplayScanning] = useState(false);
+  const [displayBusy, setDisplayBusy] = useState(false);
+  const [displayError, setDisplayError] = useState<string | null>(null);
+  const [displayLatest, setDisplayLatest] = useState<InferResponse | null>(null);
+  const [displayFrameUrl, setDisplayFrameUrl] = useState<string | null>(null);
+  const [displayFramesScanned, setDisplayFramesScanned] = useState(0);
+  const [displayLastLatencySec, setDisplayLastLatencySec] = useState<number | null>(null);
+  const [displayHits, setDisplayHits] = useState<CameraHit[]>([]);
+  const [activeDisplayHitId, setActiveDisplayHitId] = useState<string | null>(null);
 
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
@@ -85,6 +103,7 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
   const [cameraLatest, setCameraLatest] = useState<InferResponse | null>(null);
   const [cameraFrameUrl, setCameraFrameUrl] = useState<string | null>(null);
   const [cameraFramesScanned, setCameraFramesScanned] = useState(0);
+  const [cameraVehicleFrames, setCameraVehicleFrames] = useState(0);
   const [cameraLastLatencySec, setCameraLastLatencySec] = useState<number | null>(null);
   const [cameraHits, setCameraHits] = useState<CameraHit[]>([]);
   const [activeCameraHitId, setActiveCameraHitId] = useState<string | null>(null);
@@ -125,9 +144,11 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
       if (imagePreviewUrl) URL.revokeObjectURL(imagePreviewUrl);
       if (videoLocalUrl) URL.revokeObjectURL(videoLocalUrl);
       if (cameraFrameUrl) URL.revokeObjectURL(cameraFrameUrl);
+      if (displayFrameUrl) URL.revokeObjectURL(displayFrameUrl);
       cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
+      displayStreamRef.current?.getTracks().forEach((track) => track.stop());
     };
-  }, [previewUrl, imagePreviewUrl, videoLocalUrl, cameraFrameUrl]);
+  }, [previewUrl, imagePreviewUrl, videoLocalUrl, cameraFrameUrl, displayFrameUrl]);
 
   const activeLiveHit = useMemo(
     () => hits.find((item) => item.id === activeLiveHitId) ?? hits[0] ?? null,
@@ -136,6 +157,10 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
   const activeCameraHit = useMemo(
     () => cameraHits.find((item) => item.id === activeCameraHitId) ?? cameraHits[0] ?? null,
     [activeCameraHitId, cameraHits],
+  );
+  const activeDisplayHit = useMemo(
+    () => displayHits.find((item) => item.id === activeDisplayHitId) ?? displayHits[0] ?? null,
+    [activeDisplayHitId, displayHits],
   );
   const activeVideoFrame = useMemo<VideoMatchedFrame | null>(() => {
     if (!videoResult?.matchedFrames.length) return null;
@@ -175,6 +200,16 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
         imageUrl: pickEvidenceImageUrl(activeVideoFrame, null),
       };
     }
+    if (tab === 'carVideo') {
+      const result = activeDisplayHit ?? displayLatest;
+      const plate = normalizePlateText(result?.bestPlateResult?.plate_text);
+      if (!result || !plate) return null;
+      return {
+        plate,
+        confidence: result.bestPlateResult?.ocr_confidence ?? null,
+        imageUrl: pickEvidenceImageUrl(result, displayFrameUrl),
+      };
+    }
     const result = activeCameraHit ?? cameraLatest;
     const plate = normalizePlateText(result?.bestPlateResult?.plate_text);
     if (!result || !plate) return null;
@@ -191,6 +226,9 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
     imageResult,
     imagePreviewUrl,
     activeVideoFrame,
+    activeDisplayHit,
+    displayLatest,
+    displayFrameUrl,
     activeCameraHit,
     cameraLatest,
     cameraFrameUrl,
@@ -247,6 +285,14 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
   }, [cameraHits]);
 
   useEffect(() => {
+    if (!displayHits.length) {
+      setActiveDisplayHitId(null);
+      return;
+    }
+    setActiveDisplayHitId((current) => current ?? displayHits[0].id);
+  }, [displayHits]);
+
+  useEffect(() => {
     if (!videoResult?.matchedFrames.length) {
       setActiveVideoFrameKey(null);
       return;
@@ -285,56 +331,6 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
     });
   }, [videoFile]);
 
-  const runOnce = useCallback(async () => {
-    if (disabled || processingRef.current) return;
-    processingRef.current = true;
-    setBusy(true);
-    setError(null);
-    const startedAt = performance.now();
-    try {
-      const blob = await fetchVideoSnapshot(host, videoPort);
-      setPreviewUrl((previous) => {
-        if (previous) URL.revokeObjectURL(previous);
-        return URL.createObjectURL(blob);
-      });
-      const result = await inferPlateImage(blob, `snapshot_${Date.now()}.jpg`);
-      setLatest(result);
-      setFramesScanned((count) => count + 1);
-      setLastLatencySec((performance.now() - startedAt) / 1000);
-      if (result.carDetected && result.plateDetected) {
-        const hit: PlateHit = {
-          ...result,
-          id: crypto.randomUUID(),
-          capturedAt: new Date().toISOString(),
-        };
-        setHits((prev) => [hit, ...prev].slice(0, 10));
-      }
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '识别失败');
-      setScanning(false);
-    } finally {
-      processingRef.current = false;
-      setBusy(false);
-    }
-  }, [disabled, host, videoPort]);
-
-  useEffect(() => {
-    if (!scanning || disabled) return;
-    let cancelled = false;
-    let timerId: number | null = null;
-    const loop = async () => {
-      if (cancelled) return;
-      await runOnce();
-      if (cancelled) return;
-      timerId = window.setTimeout(loop, DEFAULT_INTERVAL_SEC * 1000);
-    };
-    void loop();
-    return () => {
-      cancelled = true;
-      if (timerId != null) window.clearTimeout(timerId);
-    };
-  }, [scanning, disabled, runOnce]);
-
   const handleImageInfer = useCallback(async () => {
     if (!imageFile) {
       setImageError('请先选择一张图片。');
@@ -371,6 +367,237 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
       setVideoBusy(false);
     }
   }, [videoFile, videoMaxFrames, videoSampleFps]);
+
+  const stopDisplayCapture = useCallback(() => {
+    setDisplayScanning(false);
+    displayStreamRef.current?.getTracks().forEach((track) => track.stop());
+    displayStreamRef.current = null;
+    if (displayVideoRef.current) {
+      displayVideoRef.current.srcObject = null;
+    }
+    setDisplayReady(false);
+    setDisplayStatus('未启用屏幕捕获回退');
+  }, []);
+
+  const startDisplayCapture = useCallback(async () => {
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      setError('当前浏览器不支持屏幕捕获回退。');
+      setDisplayError('当前浏览器不支持小车视频捕获。');
+      return;
+    }
+    setDisplayStarting(true);
+    setError(null);
+    setDisplayError(null);
+    setDisplayStatus('正在请求屏幕/标签页捕获权限...');
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: false,
+      });
+      displayStreamRef.current = stream;
+      stream.getVideoTracks()[0]?.addEventListener('ended', () => {
+        stopDisplayCapture();
+      });
+      if (displayVideoRef.current) {
+        displayVideoRef.current.srcObject = stream;
+        await displayVideoRef.current.play();
+      }
+      setDisplayReady(true);
+      setDisplayStatus('小车视频捕获已启用');
+    } catch (reason) {
+      stopDisplayCapture();
+      const message = reason instanceof Error ? reason.message : '无法打开屏幕捕获';
+      setError(message);
+      setDisplayError(message);
+    } finally {
+      setDisplayStarting(false);
+    }
+  }, [stopDisplayCapture]);
+
+  const captureDisplayFrame = useCallback(async (): Promise<Blob> => {
+    const video = displayVideoRef.current;
+    const canvas = displayCanvasRef.current;
+    if (!video || !canvas || video.videoWidth <= 0 || video.videoHeight <= 0) {
+      throw new Error('屏幕捕获尚未准备好，请先打开屏幕捕获并让视频区域可见。');
+    }
+    const context = canvas.getContext('2d');
+    if (!context) {
+      throw new Error('无法创建屏幕捕获画布上下文。');
+    }
+
+    const previewFrame = document.querySelector<HTMLIFrameElement>('.video-panel iframe[title="小车视频预览"]');
+    const rect = previewFrame?.getBoundingClientRect();
+    const canCropToPreview = Boolean(
+      rect
+      && rect.width >= 32
+      && rect.height >= 32
+      && rect.bottom > 0
+      && rect.right > 0
+      && rect.top < window.innerHeight
+      && rect.left < window.innerWidth,
+    );
+
+    if (canCropToPreview && rect) {
+      const clippedLeft = Math.max(0, Math.min(rect.left, window.innerWidth));
+      const clippedTop = Math.max(0, Math.min(rect.top, window.innerHeight));
+      const clippedRight = Math.max(clippedLeft + 1, Math.min(rect.right, window.innerWidth));
+      const clippedBottom = Math.max(clippedTop + 1, Math.min(rect.bottom, window.innerHeight));
+      const cssWidth = clippedRight - clippedLeft;
+      const cssHeight = clippedBottom - clippedTop;
+      const scaleX = video.videoWidth / Math.max(window.innerWidth, 1);
+      const scaleY = video.videoHeight / Math.max(window.innerHeight, 1);
+      const sourceX = Math.max(0, Math.floor(clippedLeft * scaleX));
+      const sourceY = Math.max(0, Math.floor(clippedTop * scaleY));
+      const sourceWidth = Math.max(1, Math.min(video.videoWidth - sourceX, Math.floor(cssWidth * scaleX)));
+      const sourceHeight = Math.max(1, Math.min(video.videoHeight - sourceY, Math.floor(cssHeight * scaleY)));
+      canvas.width = sourceWidth;
+      canvas.height = sourceHeight;
+      context.drawImage(
+        video,
+        sourceX,
+        sourceY,
+        sourceWidth,
+        sourceHeight,
+        0,
+        0,
+        canvas.width,
+        canvas.height,
+      );
+    } else {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    }
+
+    return await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob((value) => {
+        if (value) resolve(value);
+        else reject(new Error('屏幕捕获帧导出失败。'));
+      }, 'image/jpeg', 0.92);
+    });
+  }, []);
+
+  const runGateThenInfer = useCallback(async (
+    blob: Blob,
+    filename: string,
+  ): Promise<{ result: InferResponse | null }> => {
+    const gate = await inferCarGate(blob, filename);
+    if (!gate.carDetected) {
+      return { result: null };
+    }
+    const result = await inferPlateImage(blob, filename);
+    return { result };
+  }, []);
+
+  const scanDisplayFrame = useCallback(async () => {
+    if (!displayReady || displayBusy) return;
+    setDisplayBusy(true);
+    setDisplayError(null);
+    const startedAt = performance.now();
+    try {
+      const blob = await captureDisplayFrame();
+      const nextFrameNumber = displayFramesScanned + 1;
+      const result = await inferPlateOnlyImage(blob, `car_video_${Date.now()}.jpg`);
+      setDisplayStatus(result.plateDetected ? '已检测到车牌并输出结果' : '当前帧未识别到有效车牌');
+      setDisplayFrameUrl((previous) => {
+        if (previous) URL.revokeObjectURL(previous);
+        return URL.createObjectURL(blob);
+      });
+      setDisplayLatest(result);
+      setDisplayFramesScanned(nextFrameNumber);
+      setDisplayLastLatencySec((performance.now() - startedAt) / 1000);
+      if (result.plateDetected) {
+        setDisplayHits((previous) => [
+          {
+            ...result,
+            id: crypto.randomUUID(),
+            capturedAt: new Date().toISOString(),
+            frameNumber: nextFrameNumber,
+          },
+          ...previous,
+        ].slice(0, 10));
+      }
+    } catch (reason) {
+      setDisplayError(reason instanceof Error ? reason.message : '小车视频扫描失败');
+      setDisplayScanning(false);
+    } finally {
+      setDisplayBusy(false);
+    }
+  }, [captureDisplayFrame, displayBusy, displayFramesScanned, displayReady]);
+
+  const runOnce = useCallback(async () => {
+    if (disabled || processingRef.current) return;
+    processingRef.current = true;
+    setBusy(true);
+    setError(null);
+    const startedAt = performance.now();
+    try {
+      let blob: Blob;
+      try {
+        blob = await fetchVideoSnapshot(host, videoPort);
+      } catch (reason) {
+        if (!displayReady) throw reason;
+        blob = await captureDisplayFrame();
+        setDisplayStatus('已使用屏幕捕获回退完成本次抓帧');
+      }
+      setPreviewUrl((previous) => {
+        if (previous) URL.revokeObjectURL(previous);
+        return URL.createObjectURL(blob);
+      });
+      const result = await inferPlateImage(blob, `snapshot_${Date.now()}.jpg`);
+      setLatest(result);
+      setFramesScanned((count) => count + 1);
+      setLastLatencySec((performance.now() - startedAt) / 1000);
+      if (result.carDetected && result.plateDetected) {
+        const hit: PlateHit = {
+          ...result,
+          id: crypto.randomUUID(),
+          capturedAt: new Date().toISOString(),
+        };
+        setHits((prev) => [hit, ...prev].slice(0, 10));
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '识别失败');
+      setScanning(false);
+    } finally {
+      processingRef.current = false;
+      setBusy(false);
+    }
+  }, [captureDisplayFrame, disabled, displayReady, host, videoPort]);
+
+  useEffect(() => {
+    if (!scanning || disabled) return;
+    let cancelled = false;
+    let timerId: number | null = null;
+    const loop = async () => {
+      if (cancelled) return;
+      await runOnce();
+      if (cancelled) return;
+      timerId = window.setTimeout(loop, DEFAULT_INTERVAL_SEC * 1000);
+    };
+    void loop();
+    return () => {
+      cancelled = true;
+      if (timerId != null) window.clearTimeout(timerId);
+    };
+  }, [scanning, disabled, runOnce]);
+
+  useEffect(() => {
+    if (!displayReady || !displayScanning) return;
+    let cancelled = false;
+    let timerId: number | null = null;
+    const loop = async () => {
+      if (cancelled) return;
+      await scanDisplayFrame();
+      if (cancelled) return;
+      timerId = window.setTimeout(loop, DEFAULT_INTERVAL_SEC * 1000);
+    };
+    void loop();
+    return () => {
+      cancelled = true;
+      if (timerId != null) window.clearTimeout(timerId);
+    };
+  }, [displayReady, displayScanning, scanDisplayFrame]);
 
   const stopBrowserCamera = useCallback(() => {
     setCameraScanning(false);
@@ -444,15 +671,24 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
           reject(new Error('摄像头帧导出失败。'));
         }, 'image/jpeg', 0.92);
       });
+      const { result } = await runGateThenInfer(blob, `camera_${Date.now()}.jpg`);
+      if (!result) {
+        setCameraLatest(null);
+        setCameraStatus('最近一帧未检测到车辆，已跳过完整识别');
+        setCameraFramesScanned(nextFrameNumber);
+        setCameraLastLatencySec((performance.now() - startedAt) / 1000);
+        return;
+      }
+      setCameraVehicleFrames((count) => count + 1);
+      setCameraStatus('已检测到车辆，正在按完整车牌流程识别');
       setCameraFrameUrl((previous) => {
         if (previous) URL.revokeObjectURL(previous);
         return URL.createObjectURL(blob);
       });
-      const result = await inferPlateImage(blob, `camera_${Date.now()}.jpg`);
       setCameraLatest(result);
       setCameraFramesScanned(nextFrameNumber);
       setCameraLastLatencySec((performance.now() - startedAt) / 1000);
-      if (result.carDetected && result.plateDetected) {
+      if (result?.carDetected && result.plateDetected) {
         setCameraHits((previous) => [
           {
             ...result,
@@ -470,7 +706,7 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
       cameraProcessingRef.current = false;
       setCameraBusy(false);
     }
-  }, [cameraFramesScanned]);
+  }, [cameraFramesScanned, runGateThenInfer]);
 
   useEffect(() => {
     if (!cameraReady || !cameraScanning) return;
@@ -570,7 +806,19 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
             >
               {scanning ? '停止扫描' : '开始定时扫描'}
             </button>
+            <button type="button" className="secondary" disabled={displayReady || displayStarting} onClick={() => void startDisplayCapture()}>
+              {displayStarting ? '授权中…' : '打开屏幕捕获回退'}
+            </button>
+            <button type="button" className="secondary" disabled={!displayReady} onClick={stopDisplayCapture}>
+              关闭屏幕捕获
+            </button>
           </div>
+
+          <p className="muted">
+            {displayStatus}
+            {' · '}
+            当 `:6500` 不支持程序化抓帧时，可开启屏幕捕获，选择当前浏览器标签页或包含视频的窗口，再点击“识别当前帧”。
+          </p>
 
           <StatGrid
             items={[
@@ -582,6 +830,8 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
           />
 
           {error && <p className="error-text">{error}</p>}
+          <video ref={displayVideoRef} className="plate-video-hidden" muted playsInline />
+          <canvas ref={displayCanvasRef} className="plate-hidden-canvas" />
 
           <div className="plate-summary-grid">
             <article className="plate-visual-card">
@@ -622,6 +872,89 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
                 </div>
               ) : (
                 <EmptyBlock text="只有“检测到车辆且识别出有效车牌文本”的结果会进入命中列表。" />
+              )}
+            </article>
+          </div>
+        </div>
+      )}
+
+      {tab === 'carVideo' && (
+        <div className="plate-tab-section">
+          <div className="plate-scan-actions">
+            <button type="button" disabled={displayReady || displayStarting} onClick={() => void startDisplayCapture()}>
+              {displayStarting ? '授权中…' : '打开小车视频捕获'}
+            </button>
+            <button
+              type="button"
+              className={displayScanning ? 'danger' : 'secondary'}
+              disabled={!displayReady || !health?.ok}
+              onClick={() => setDisplayScanning((value) => !value)}
+            >
+              {displayScanning ? '停止扫描' : '开始实时扫描'}
+            </button>
+            <button type="button" className="secondary" disabled={!displayReady || displayBusy} onClick={() => void scanDisplayFrame()}>
+              {displayBusy ? '识别中…' : '识别当前视频帧'}
+            </button>
+            <button type="button" className="secondary" disabled={!displayReady} onClick={stopDisplayCapture}>
+              关闭视频捕获
+            </button>
+          </div>
+
+          <p className="muted">
+            {displayStatus}
+            {' · '}
+            请选择当前浏览器标签页或包含“视频预览”的窗口。授权一次后，系统会对抓到的帧直接做车牌检测与 OCR，不再执行车辆预检。
+          </p>
+
+          <StatGrid
+            items={[
+              ['状态', displayReady ? '已连接视频捕获' : '未连接'],
+              ['已扫描', String(displayFramesScanned)],
+              ['命中', String(displayHits.length)],
+              ['耗时', displayLastLatencySec != null ? `${displayLastLatencySec.toFixed(2)}s` : '—'],
+            ]}
+          />
+
+          {displayError && <p className="error-text">{displayError}</p>}
+
+          <div className="plate-summary-grid">
+            <article className="plate-visual-card">
+              <h3>小车视频抓帧</h3>
+              <video ref={displayVideoRef} className="plate-video-hidden" muted playsInline />
+              {!displayFrameUrl && (
+                <EmptyBlock text="打开小车视频捕获后，保持控制台里的“视频预览”区域可见，系统会从你选中的标签页/窗口持续抓帧并送入 YOLO 流程。" />
+              )}
+              <canvas ref={displayCanvasRef} className="plate-hidden-canvas" />
+              {displayFrameUrl && (
+                <>
+                  <h4>最近抓帧</h4>
+                  <img className="plate-scan-preview" src={displayFrameUrl} alt="car-video-frame" />
+                </>
+              )}
+            </article>
+
+            <article className="plate-hit-card">
+              <h3>视频命中结果</h3>
+              {displayBusy && <p className="muted">正在处理当前抓帧…</p>}
+              {displayHits.length ? (
+                <div className="plate-hit-layout">
+                  <div className="plate-hit-list">
+                    {displayHits.map((hit) => (
+                      <button
+                        key={hit.id}
+                        type="button"
+                        className={activeDisplayHit?.id === hit.id ? 'plate-hit-item-active' : 'plate-hit-item'}
+                        onClick={() => setActiveDisplayHitId(hit.id)}
+                      >
+                        <strong>{normalizePlateText(hit.bestPlateResult?.plate_text) || '未识别'}</strong>
+                        <small>第 {hit.frameNumber} 帧</small>
+                      </button>
+                    ))}
+                  </div>
+                  <FrameReviewDetail result={activeDisplayHit ?? displayLatest} hideVehicleGate />
+                </div>
+              ) : (
+                <EmptyBlock text="只有识别出有效车牌文本的视频帧才会留在这里。" />
               )}
             </article>
           </div>
@@ -799,6 +1132,7 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
             items={[
               ['状态', cameraStatus],
               ['已扫描', String(cameraFramesScanned)],
+              ['见车', String(cameraVehicleFrames)],
               ['命中', String(cameraHits.length)],
               ['耗时', cameraLastLatencySec != null ? `${cameraLastLatencySec.toFixed(2)}s` : '—'],
             ]}
@@ -941,9 +1275,11 @@ function blobToBase64(blob: Blob): Promise<string> {
 function FrameReviewDetail({
   result,
   meta,
+  hideVehicleGate = false,
 }: {
   result: InferResponse | VideoMatchedFrame | PlateHit | CameraHit | null;
   meta?: Array<[string, string]>;
+  hideVehicleGate?: boolean;
 }) {
   if (!result) {
     return <EmptyBlock text="选择左侧命中项后，这里会展示详情、主体车 ROI 和车牌裁剪图。" />;
@@ -965,7 +1301,7 @@ function FrameReviewDetail({
         <DetailRow label="OCR 置信度" value={formatRatio(result.bestPlateResult?.ocr_confidence)} />
         <DetailRow label="主体车置信度" value={formatRatio(result.primaryCar?.confidence)} />
         <DetailRow label="流程状态" value={result.status} />
-        <DetailRow label="车辆门控" value={result.carDetected ? '已通过' : '未通过'} />
+        {!hideVehicleGate && <DetailRow label="车辆门控" value={result.carDetected ? '已通过' : '未通过'} />}
         <DetailRow
           label="门控后车牌候选数"
           value={String(result.stageTimings?.gated_plate_candidate_count ?? 0)}

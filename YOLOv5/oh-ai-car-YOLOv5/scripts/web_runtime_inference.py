@@ -197,6 +197,276 @@ class WebInferenceRuntime:
         with self.lock:
             return self._run_locked(source_image, run_root, profile=profile)
 
+    def run_car_gate(self, source_image: Path, run_root: Path) -> dict[str, Any]:
+        with self.lock:
+            return self._run_car_gate_locked(source_image, run_root)
+
+    def run_plate_only(self, source_image: Path, run_root: Path, profile: str = "video") -> dict[str, Any]:
+        with self.lock:
+            return self._run_plate_only_locked(source_image, run_root, profile=profile)
+
+    def _prepare_primary_car_assets(
+        self,
+        source_image: Path,
+        primary_detection: dict[str, Any] | None,
+        primary_visual_path: Path,
+        primary_input_dir: Path,
+    ) -> dict[str, Any] | None:
+        if primary_detection is None:
+            return None
+
+        image = cv2.imread(str(source_image))
+        if image is None:
+            raise ValueError(f"Image is unreadable: {source_image}")
+
+        img_h, img_w = image.shape[:2]
+        crop_bbox = expand_primary_bbox(primary_detection["bbox"], img_w, img_h)
+        x1, y1, x2, y2 = crop_bbox
+        roi_image = image[y1:y2, x1:x2]
+        primary_input_dir.mkdir(parents=True, exist_ok=True)
+        primary_crop_path = primary_input_dir / f"{source_image.stem}_primary{source_image.suffix}"
+        cv2.imwrite(str(primary_crop_path), roi_image)
+        save_primary_vehicle_visual(source_image, primary_visual_path, primary_detection)
+
+        primary_payload = dict(primary_detection)
+        primary_payload["crop_bbox"] = crop_bbox
+        primary_payload["crop_path"] = str(primary_crop_path)
+        primary_payload["visual_path"] = str(primary_visual_path)
+        return primary_payload
+
+    def _run_car_gate_locked(self, source_image: Path, run_root: Path) -> dict[str, Any]:
+        pipeline_start = time.perf_counter()
+        car_visual_path = run_root / "car_detector" / source_image.name
+        car_detections, car_detection_elapsed_sec = self.car_detector.infer(source_image, car_visual_path)
+
+        primary_visual_path = run_root / "primary_vehicle" / "visuals" / source_image.name
+        primary_input_dir = run_root / "primary_vehicle" / "input"
+        primary_prepare_start = time.perf_counter()
+        primary_detection, _ = choose_primary_car_detection(source_image, car_detections)
+        primary_payload = self._prepare_primary_car_assets(
+            source_image,
+            primary_detection,
+            primary_visual_path,
+            primary_input_dir,
+        )
+        primary_prepare_elapsed_sec = time.perf_counter() - primary_prepare_start
+
+        image_result = {
+            "image_path": str(source_image),
+            "car_detected": bool(car_detections),
+            "car_detection_count": len(car_detections),
+            "car_detections": car_detections,
+            "primary_car": primary_payload,
+            "plate_detected": False,
+            "plate_detection_count": 0,
+            "plate_results": [],
+            "best_plate_result": None,
+            "status": "car_found" if car_detections else "no_car_detected",
+        }
+
+        total_elapsed_sec = time.perf_counter() - pipeline_start
+        payload = {
+            "source": str(source_image),
+            "car_detection_json": str(run_root / "car_detector" / "detections.json"),
+            "plate_result_json": str(run_root / "plate_pipeline" / "pipeline_results.json"),
+            "image_count": 1,
+            "vehicle_positive_count": int(bool(car_detections)),
+            "plate_positive_count": 0,
+            "stage_timings": {
+                "car_detection_sec": round(car_detection_elapsed_sec, 6),
+                "gated_source_prepare_sec": round(primary_prepare_elapsed_sec, 6),
+                "plate_pipeline_sec": 0.0,
+                "plate_detection_sec": 0.0,
+                "plate_gate_sec": 0.0,
+                "ocr_model_init_sec": 0.0,
+                "crop_save_total_sec": 0.0,
+                "ocr_sec": 0.0,
+                "ocr_stage_total_sec": 0.0,
+                "total_pipeline_sec": round(total_elapsed_sec, 6),
+                "runtime_warm_start": True,
+                "raw_plate_detection_count": 0,
+                "gated_plate_candidate_count": 0,
+                "ocr_attempt_count": 0,
+            },
+            "summary": build_summary_text([image_result]),
+            "results": [image_result],
+        }
+
+        (run_root / "car_detector").mkdir(parents=True, exist_ok=True)
+        (run_root / "plate_pipeline").mkdir(parents=True, exist_ok=True)
+        (run_root / "car_detector" / "detections.json").write_text(
+            json.dumps(car_detections, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (run_root / "plate_pipeline" / "pipeline_results.json").write_text(
+            json.dumps([], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (run_root / "plate_pipeline" / "timings.json").write_text(
+            json.dumps(payload["stage_timings"], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (run_root / "car_gate_results.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return payload
+
+    def _run_plate_only_locked(self, source_image: Path, run_root: Path, profile: str = "video") -> dict[str, Any]:
+        pipeline_start = time.perf_counter()
+        image = cv2.imread(str(source_image))
+        if image is None:
+            raise ValueError(f"Image is unreadable: {source_image}")
+
+        plate_visual_dir = run_root / "plate_pipeline" / "detector"
+        crop_dir = run_root / "plate_pipeline" / "plate_crops"
+        crop_dir.mkdir(parents=True, exist_ok=True)
+
+        plate_detection_elapsed_sec = 0.0
+        plate_gate_elapsed_sec = 0.0
+        crop_save_elapsed_total = 0.0
+        ocr_elapsed_total = 0.0
+        raw_plate_detection_count = 0
+        gated_plate_candidate_count = 0
+        ocr_attempt_count = 0
+        plate_results: list[dict[str, Any]] = []
+
+        plate_detections, plate_detection_elapsed_sec = self.plate_detector.infer(
+            source_image,
+            plate_visual_dir / source_image.name,
+        )
+        raw_plate_detection_count = len(plate_detections)
+
+        gate_start = time.perf_counter()
+        candidate_detections = self._filter_plate_candidates(
+            detections=plate_detections,
+            roi_shape=image.shape,
+            profile=profile,
+        )
+        plate_gate_elapsed_sec = time.perf_counter() - gate_start
+        gated_plate_candidate_count = len(candidate_detections)
+
+        for index, detection in enumerate(candidate_detections, start=1):
+            ocr_attempt_count += 1
+
+            crop_start = time.perf_counter()
+            crop_path, crop_bbox = save_crop(source_image, detection["bbox"], crop_dir, index)
+            crop_save_elapsed_total += time.perf_counter() - crop_start
+
+            ocr_start = time.perf_counter()
+            det_confidence = float(detection["confidence"])
+            ocr_result = recognize_plate_image(
+                self.ocr_model,
+                crop_path,
+                self.config.ocr_min_score,
+                variant_preset="fast",
+            )
+            fast_pass = bool(ocr_result["is_valid_plate"]) and float(ocr_result["ocr_confidence"]) >= self.config.ocr_min_score
+            ran_full_ocr = False
+            if det_confidence >= self.config.full_ocr_det_conf_thres and not fast_pass:
+                ocr_result = recognize_plate_image(
+                    self.ocr_model,
+                    crop_path,
+                    self.config.ocr_min_score,
+                    variant_preset="full",
+                )
+                ran_full_ocr = True
+            ocr_elapsed_total += time.perf_counter() - ocr_start
+
+            plate_results.append(
+                {
+                    "image_path": str(source_image),
+                    "bbox": list(detection["bbox"]),
+                    "crop_bbox": list(crop_bbox),
+                    "det_confidence": round(float(detection["confidence"]), 6),
+                    "crop_path": str(crop_path),
+                    "plate_text": ocr_result["plate_text"],
+                    "ocr_confidence": ocr_result["ocr_confidence"],
+                    "is_valid_plate": ocr_result["is_valid_plate"],
+                    "ocr_variant": ocr_result["ocr_variant"],
+                    "ocr_profile": ocr_result.get("ocr_profile", "full"),
+                    "full_ocr_triggered": ran_full_ocr,
+                    "status": (
+                        "ready_for_whitelist_compare"
+                        if ocr_result["status"] == "ocr_pass"
+                        else "manual_review"
+                    ),
+                    "primary_car_bbox": None,
+                    "primary_car_crop_bbox": None,
+                }
+            )
+
+        valid_plate_results = [
+            item
+            for item in plate_results
+            if bool(item.get("is_valid_plate")) and item.get("status") == "ready_for_whitelist_compare"
+        ]
+        returned_plate_results = valid_plate_results if profile == "video" else plate_results
+        best_plate_result = pick_best_plate_result(returned_plate_results)
+        image_result = {
+            "image_path": str(source_image),
+            "car_detected": False,
+            "car_detection_count": 0,
+            "car_detections": [],
+            "primary_car": None,
+            "plate_detected": bool(returned_plate_results),
+            "plate_detection_count": len(returned_plate_results),
+            "plate_results": returned_plate_results,
+            "best_plate_result": best_plate_result,
+            "status": "plate_found" if returned_plate_results else "no_plate_detected",
+        }
+
+        total_elapsed_sec = time.perf_counter() - pipeline_start
+        payload = {
+            "source": str(source_image),
+            "car_detection_json": str(run_root / "car_detector" / "detections.json"),
+            "plate_result_json": str(run_root / "plate_pipeline" / "pipeline_results.json"),
+            "image_count": 1,
+            "vehicle_positive_count": 0,
+            "plate_positive_count": int(bool(returned_plate_results)),
+            "stage_timings": {
+                "car_detection_sec": 0.0,
+                "gated_source_prepare_sec": 0.0,
+                "plate_pipeline_sec": round(
+                    plate_detection_elapsed_sec + plate_gate_elapsed_sec + crop_save_elapsed_total + ocr_elapsed_total,
+                    6,
+                ),
+                "plate_detection_sec": round(plate_detection_elapsed_sec, 6),
+                "plate_gate_sec": round(plate_gate_elapsed_sec, 6),
+                "ocr_model_init_sec": 0.0,
+                "crop_save_total_sec": round(crop_save_elapsed_total, 6),
+                "ocr_sec": round(ocr_elapsed_total, 6),
+                "ocr_stage_total_sec": round(crop_save_elapsed_total + ocr_elapsed_total, 6),
+                "total_pipeline_sec": round(total_elapsed_sec, 6),
+                "runtime_warm_start": True,
+                "raw_plate_detection_count": raw_plate_detection_count,
+                "gated_plate_candidate_count": gated_plate_candidate_count,
+                "ocr_attempt_count": ocr_attempt_count,
+            },
+            "summary": f"Processed 1 image(s), plate-positive {int(bool(returned_plate_results))}.",
+            "results": [image_result],
+        }
+
+        (run_root / "car_detector").mkdir(parents=True, exist_ok=True)
+        (run_root / "plate_pipeline").mkdir(parents=True, exist_ok=True)
+        (run_root / "car_detector" / "detections.json").write_text(
+            json.dumps([], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (run_root / "plate_pipeline" / "pipeline_results.json").write_text(
+            json.dumps(returned_plate_results, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (run_root / "plate_pipeline" / "timings.json").write_text(
+            json.dumps(payload["stage_timings"], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (run_root / "plate_only_results.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return payload
+
     def _run_locked(self, source_image: Path, run_root: Path, profile: str = "image") -> dict[str, Any]:
         pipeline_start = time.perf_counter()
         car_visual_path = run_root / "car_detector" / source_image.name
@@ -223,22 +493,19 @@ class WebInferenceRuntime:
         ocr_attempt_count = 0
 
         if primary_detection is not None:
+            primary_payload = self._prepare_primary_car_assets(
+                source_image,
+                primary_detection,
+                primary_visual_path,
+                primary_input_dir,
+            )
+            assert primary_payload is not None
             image = cv2.imread(str(source_image))
             if image is None:
                 raise ValueError(f"Image is unreadable: {source_image}")
-            img_h, img_w = image.shape[:2]
-            crop_bbox = expand_primary_bbox(primary_detection["bbox"], img_w, img_h)
-            x1, y1, x2, y2 = crop_bbox
+            x1, y1, x2, y2 = primary_payload["crop_bbox"]
             roi_image = image[y1:y2, x1:x2]
-            primary_input_dir.mkdir(parents=True, exist_ok=True)
-            primary_crop_path = primary_input_dir / f"{source_image.stem}_primary{source_image.suffix}"
-            cv2.imwrite(str(primary_crop_path), roi_image)
-            save_primary_vehicle_visual(source_image, primary_visual_path, primary_detection)
-
-            primary_payload = dict(primary_detection)
-            primary_payload["crop_bbox"] = crop_bbox
-            primary_payload["crop_path"] = str(primary_crop_path)
-            primary_payload["visual_path"] = str(primary_visual_path)
+            primary_crop_path = Path(str(primary_payload["crop_path"]))
 
             plate_detections_roi, plate_detection_elapsed_sec = self.plate_detector.infer(
                 primary_crop_path,
