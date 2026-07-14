@@ -3,6 +3,7 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { generateAdvice } from '../ai-advisor.js';
 import type { Database } from '../db/index.js';
 import { matchWhitelistPlate, type PlateMatchResult } from '../plate-match.js';
+import { isWxPusherConfigured, sendWxPusherMessage, type WxPusherConfig } from '../notify/wxpusher.js';
 
 type User = { id: string; role: 'admin' | 'operator' };
 type Hub = { publishPatrol: (message: { vehicleId: string; [key: string]: unknown }) => void };
@@ -16,6 +17,7 @@ export interface ResponseRouteDeps {
   audit: (action: string, outcome: string, actorUserId?: string, vehicleId?: string, metadata?: Record<string, unknown>) => Promise<void>;
   hub: Hub;
   ai: { baseUrl?: string; apiKey?: string; model: string };
+  wxPusher: WxPusherConfig;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -42,6 +44,9 @@ const RESPONSE_SELECT = `
     rt.failure_reason AS "failureReason", rt.created_at AS "createdAt", rt.confirmed_at AS "confirmedAt",
     rt.assigned_at AS "assignedAt", rt.navigation_started_at AS "navigationStartedAt",
     rt.arrived_at AS "arrivedAt", rt.completed_at AS "completedAt",
+    rt.owner_wx_uid AS "ownerWxUid",
+    rt.sms_status AS "smsStatus", rt.sms_error AS "smsError",
+    rt.sms_sent_at AS "smsSentAt",
     d.display_name AS "destinationName", d.map_version AS "mapVersion", d.x, d.y, d.yaw,
     sv.name AS "sourceVehicleName", av.name AS "assignedVehicleName",
     po.evidence_image_url AS "evidenceUrl", po.confidence, pw.name AS waypoint
@@ -93,8 +98,8 @@ export async function createResponseCandidate(
   }
 
   const lookupPlate = resolvedMatch.matchedPlate || input.matchedPlate || input.plate;
-  const match = await db.query<{ owner_name: string; building: string; destination_id: string | null }>(
-    `SELECT e.owner_name,e.building,e.destination_id
+  const match = await db.query<{ owner_name: string; building: string; destination_id: string | null; wx_uid: string }>(
+    `SELECT e.owner_name,e.building,e.destination_id,COALESCE(e.wx_uid,'') AS wx_uid
      FROM patrol_tasks t JOIN whitelist_entries e ON e.whitelist_id=t.whitelist_id
      WHERE t.id=$1 AND e.plate=$2 AND e.category='private' LIMIT 1`,
     [input.taskId, lookupPlate],
@@ -128,9 +133,9 @@ export async function createResponseCandidate(
     );
     await client.query(
       `INSERT INTO response_tasks
-       (id,observation_id,violation_id,source_patrol_task_id,source_vehicle_id,destination_id,plate,owner_name,building,status,eligibility_reason)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending_review','eligible_after_operator_confirmation')`,
-      [responseTaskId, input.observationId, violationId, input.taskId, input.vehicleId, destinationId, plateForRecord, entry.owner_name, entry.building],
+       (id,observation_id,violation_id,source_patrol_task_id,source_vehicle_id,destination_id,plate,owner_name,building,owner_wx_uid,status,eligibility_reason)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending_review','eligible_after_operator_confirmation')`,
+      [responseTaskId, input.observationId, violationId, input.taskId, input.vehicleId, destinationId, plateForRecord, entry.owner_name, entry.building, entry.wx_uid],
     );
     return { id: responseTaskId, violationId, newlyCreated: true };
   });
@@ -174,8 +179,81 @@ async function assignVehicle(db: Database, taskId: string): Promise<string> {
   });
 }
 
+export type OwnerPushStatus = {
+  status: 'sent' | 'failed' | 'skipped_no_uid' | 'skipped_not_configured';
+  message: string;
+  requestId?: string;
+};
+
+/** Exported for unit tests */
+export async function notifyOwnerPush(
+  db: Database,
+  push: WxPusherConfig,
+  input: { responseTaskId: string; plate: string; wxUid: string; location: string; content: string },
+): Promise<OwnerPushStatus> {
+  const wxUid = input.wxUid.trim();
+  if (!wxUid) {
+    await db.query(
+      `UPDATE response_tasks SET sms_status='skipped_no_uid', sms_error='', updated_at=now() WHERE id=$1`,
+      [input.responseTaskId],
+    );
+    await db.query(
+      `INSERT INTO sms_notifications (id, response_task_id, plate, wx_uid, body, provider, status, error)
+       VALUES ($1,$2,$3,'',$4,'wxpusher','skipped','no wx_uid on whitelist entry')`,
+      [randomUUID(), input.responseTaskId, input.plate, input.content],
+    );
+    return { status: 'skipped_no_uid', message: '白名单未登记 WxPusher UID，已跳过推送' };
+  }
+
+  if (!isWxPusherConfigured(push)) {
+    await db.query(
+      `UPDATE response_tasks SET sms_status='skipped_not_configured', sms_error='WxPusher is not configured', updated_at=now() WHERE id=$1`,
+      [input.responseTaskId],
+    );
+    await db.query(
+      `INSERT INTO sms_notifications (id, response_task_id, plate, wx_uid, body, provider, status, error)
+       VALUES ($1,$2,$3,$4,$5,'wxpusher','skipped','WxPusher is not configured')`,
+      [randomUUID(), input.responseTaskId, input.plate, wxUid, input.content],
+    );
+    return { status: 'skipped_not_configured', message: '未配置 WxPusher，已跳过推送' };
+  }
+
+  const body = `【巡牌通乱停通知】\n车牌：${input.plate}\n位置：${input.location}\n${input.content}`;
+  await db.query(`UPDATE response_tasks SET sms_status='queued', updated_at=now() WHERE id=$1`, [input.responseTaskId]);
+  const result = await sendWxPusherMessage(push, {
+    uid: wxUid,
+    content: body,
+    summary: `乱停通知 · ${input.plate}`,
+  });
+
+  if (result.ok) {
+    await db.query(
+      `UPDATE response_tasks SET sms_status='sent', sms_sent_at=now(), sms_error='', updated_at=now() WHERE id=$1`,
+      [input.responseTaskId],
+    );
+    await db.query(
+      `INSERT INTO sms_notifications (id, response_task_id, plate, wx_uid, body, provider, provider_request_id, status)
+       VALUES ($1,$2,$3,$4,$5,'wxpusher',$6,'sent')`,
+      [randomUUID(), input.responseTaskId, input.plate, wxUid, body, result.messageId ?? null],
+    );
+    return { status: 'sent', message: '车主 WxPusher 推送已发送', requestId: result.messageId };
+  }
+
+  const error = result.error ?? 'WxPusher send failed';
+  await db.query(
+    `UPDATE response_tasks SET sms_status='failed', sms_error=$2, updated_at=now() WHERE id=$1`,
+    [input.responseTaskId, error],
+  );
+  await db.query(
+    `INSERT INTO sms_notifications (id, response_task_id, plate, wx_uid, body, provider, provider_request_id, status, error)
+     VALUES ($1,$2,$3,$4,$5,'wxpusher',$6,'failed',$7)`,
+    [randomUUID(), input.responseTaskId, input.plate, wxUid, body, result.messageId ?? null, error],
+  );
+  return { status: 'failed', message: `推送失败：${error}`, requestId: result.messageId };
+}
+
 export function registerResponsePlatformRoutes(app: FastifyInstance, deps: ResponseRouteDeps): void {
-  const { db, requireUser, requireAdmin, canAccessVehicle, deviceVehicle, audit, hub, ai } = deps;
+  const { db, requireUser, requireAdmin, canAccessVehicle, deviceVehicle, audit, hub, ai, wxPusher } = deps;
 
   app.get('/api/resident-destinations', async (request) => {
     const user = await requireUser(request);
@@ -243,8 +321,11 @@ export function registerResponsePlatformRoutes(app: FastifyInstance, deps: Respo
 
   app.post('/api/response-tasks/:id/confirm', async (request) => {
     const user = await requireUser(request); const id = (request.params as { id: string }).id;
-    const row = await db.query<{ source_vehicle_id: string; plate: string; building: string; waypoint: string; confidence: number }>(
-      `SELECT rt.source_vehicle_id,rt.plate,rt.building,pw.name AS waypoint,po.confidence FROM response_tasks rt
+    const row = await db.query<{
+      source_vehicle_id: string; plate: string; building: string; waypoint: string; confidence: number; owner_wx_uid: string;
+    }>(
+      `SELECT rt.source_vehicle_id,rt.plate,rt.building,pw.name AS waypoint,po.confidence,COALESCE(rt.owner_wx_uid,'') AS owner_wx_uid
+       FROM response_tasks rt
        JOIN plate_observations po ON po.id=rt.observation_id JOIN patrol_waypoints pw ON pw.id=po.waypoint_id
        WHERE rt.id=$1 AND rt.status='pending_review'`, [id],
     );
@@ -255,15 +336,24 @@ export function registerResponsePlatformRoutes(app: FastifyInstance, deps: Respo
     if (!confirmed.rowCount) throw Object.assign(new Error('Response task was already confirmed'), { statusCode: 409 });
     await audit('response.confirm', 'success', user.id, row.rows[0].source_vehicle_id, { responseTaskId: id, adviceSource: advice.source });
     hub.publishPatrol({ type: 'response_status', responseTaskId: id, vehicleId: row.rows[0].source_vehicle_id, status: 'confirmed' });
+
+    const pushResult = await notifyOwnerPush(db, wxPusher, {
+      responseTaskId: id,
+      plate: row.rows[0].plate,
+      wxUid: row.rows[0].owner_wx_uid,
+      location: row.rows[0].waypoint,
+      content: advice.notification,
+    });
+
     try {
       const vehicleId = await assignVehicle(db, id);
       await audit('response.assign', 'success', user.id, vehicleId, { responseTaskId: id });
       hub.publishPatrol({ type: 'assignment_changed', responseTaskId: id, vehicleId, status: 'assigned' });
-      return { ok: true, assignedVehicleId: vehicleId, assignmentPending: false, advice };
+      return { ok: true, assignedVehicleId: vehicleId, assignmentPending: false, advice, push: pushResult };
     } catch (error) {
       if ((error as { statusCode?: number }).statusCode !== 409) throw error;
       await audit('response.assign', 'pending', user.id, row.rows[0].source_vehicle_id, { responseTaskId: id, reason: 'no_safe_vehicle' });
-      return { ok: true, assignedVehicleId: null, assignmentPending: true, advice };
+      return { ok: true, assignedVehicleId: null, assignmentPending: true, advice, push: pushResult };
     }
   });
 

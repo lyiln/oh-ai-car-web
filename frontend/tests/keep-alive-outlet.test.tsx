@@ -1,5 +1,5 @@
-import { act, render, screen, waitFor } from '@testing-library/react';
-import { createMemoryRouter, RouterProvider } from 'react-router-dom';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
 import { KeepAliveOutlet } from '../src/components/layout/KeepAliveOutlet.js';
 
@@ -15,39 +15,42 @@ function MountCounter({ label }: { label: string }) {
 }
 (MountCounter as unknown as { counts: Record<string, number> }).counts = {};
 
+function TestNavigation() {
+  const navigate = useNavigate();
+  return (
+    <nav>
+      <button type="button" onClick={() => navigate('/a')}>Go to A</button>
+      <button type="button" onClick={() => navigate('/b')}>Go to B</button>
+    </nav>
+  );
+}
+
 describe('KeepAliveOutlet', () => {
   it('keeps visited routes mounted when navigating away and back', async () => {
     (MountCounter as unknown as { counts: Record<string, number> }).counts = {};
-    const router = createMemoryRouter(
-      [
-        {
-          path: '/',
-          element: <KeepAliveOutlet />,
-          children: [
-            { path: 'a', element: <MountCounter label="page-a" /> },
-            { path: 'b', element: <MountCounter label="page-b" /> },
-          ],
-        },
-      ],
-      { initialEntries: ['/a'] },
+    render(
+      <MemoryRouter initialEntries={['/a']}>
+        <TestNavigation />
+        <Routes>
+          <Route path="/" element={<KeepAliveOutlet />}>
+            <Route path="a" element={<MountCounter label="page-a" />} />
+            <Route path="b" element={<MountCounter label="page-b" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
     );
 
-    render(<RouterProvider router={router} />);
     expect(screen.getByRole('heading', { name: 'page-a' })).toBeInTheDocument();
     expect(screen.getByTestId('page-a-mounts')).toHaveTextContent('1');
 
-    await act(async () => {
-      await router.navigate('/b');
-    });
+    fireEvent.click(screen.getByRole('button', { name: 'Go to B' }));
     await waitFor(() => {
       expect(screen.getByRole('heading', { name: 'page-b' })).toBeInTheDocument();
     });
     expect(screen.getByTestId('page-a-mounts')).toHaveTextContent('1');
     expect(screen.getByTestId('page-b-mounts')).toHaveTextContent('1');
 
-    await act(async () => {
-      await router.navigate('/a');
-    });
+    fireEvent.click(screen.getByRole('button', { name: 'Go to A' }));
     await waitFor(() => {
       expect(screen.getByRole('heading', { name: 'page-a' })).toBeInTheDocument();
     });

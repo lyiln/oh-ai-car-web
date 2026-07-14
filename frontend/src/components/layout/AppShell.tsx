@@ -1,5 +1,6 @@
 import { Car } from 'lucide-react';
 import { NavLink, useLocation, useNavigate } from 'react-router-dom';
+import { AdvisorPanel } from '../ai/AdvisorPanel.js';
 import { useAuth } from '../../contexts/AuthContext.js';
 import { useSelectedDevice } from '../../contexts/SelectedDeviceContext.js';
 import { KeepAliveOutlet } from './KeepAliveOutlet.js';
@@ -77,6 +78,7 @@ export function AppShell() {
           <span className="shell-device-bar-muted">{online ? '在线' : '离线'}</span>
         </footer>
       </div>
+      <AdvisorPanel />
     </div>
   );
 }
