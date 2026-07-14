@@ -121,6 +121,6 @@ describe('PlateScanPanel', () => {
     expect(await screen.findByText(/YOLO 就绪/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '识别当前帧' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '开始定时扫描' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: '添加到违规车辆（测试）' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '添加到违规车辆' })).toBeDisabled();
   });
 });

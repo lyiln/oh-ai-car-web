@@ -7,6 +7,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { GenericContainer, Wait, type StartedTestContainer } from 'testcontainers';
 import { createApp } from '../../src/app.js';
 import { Database } from '../../src/db/index.js';
+import { migration021, migration022 } from '../../src/db/schema.js';
 import { saveEvidenceJpeg } from '../../src/evidence-storage.js';
 
 const origin = 'https://platform.example.test';
@@ -78,7 +79,7 @@ beforeAll(async () => {
     await waitForDatabase(db);
     await Promise.all([db.migrate(), secondMigrator.migrate()]);
     const migrations = await db.query<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version');
-    expect(migrations.rows).toHaveLength(22);
+    expect(migrations.rows).toHaveLength(24);
     expect(new Set(migrations.rows.map((row) => row.version))).toEqual(new Set([
       '001',
       '002-patrol-inspection',
@@ -102,6 +103,8 @@ beforeAll(async () => {
       '018-patrol-routes-code',
       '019-goto-goals',
       '020-vehicle-nav-state',
+      '021-persistent-control-sessions',
+      '022-twenty-minute-control-leases',
     ]));
   } finally {
     await secondMigrator.close();
@@ -139,6 +142,29 @@ beforeEach(async () => {
 });
 
 describe('platform API against PostGIS', () => {
+  it('migrates duplicate persistent sessions back to one expiring lease', async () => {
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const vehicleId = randomUUID();
+      await client.query("INSERT INTO vehicles (id,code,name,tcp_host,tcp_port,video_port) VALUES ($1,$2,'迁移测试车','192.168.1.88',6000,6500)", [vehicleId, `MIG-${vehicleId.slice(0, 8)}`]);
+      await client.query('DROP INDEX control_leases_vehicle_single_active_idx');
+      await client.query('ALTER TABLE control_leases ALTER COLUMN expires_at DROP NOT NULL');
+      await client.query('INSERT INTO control_leases (id,vehicle_id,user_id,expires_at) VALUES ($1,$2,$3,NULL),($4,$2,$3,NULL)', [randomUUID(), vehicleId, ids.operatorA, randomUUID()]);
+
+      await client.query(migration021);
+      await client.query(migration022);
+
+      const active = await client.query<{ count: string }>('SELECT count(*)::text AS count FROM control_leases WHERE vehicle_id=$1 AND released_at IS NULL', [vehicleId]);
+      expect(active.rows[0].count).toBe('1');
+      const columns = await client.query<{ column_name: string; is_nullable: string }>("SELECT column_name,is_nullable FROM information_schema.columns WHERE table_name='control_leases' AND column_name IN ('expires_at','gateway_heartbeat_at') ORDER BY column_name");
+      expect(columns.rows).toEqual([{ column_name: 'expires_at', is_nullable: 'NO' }]);
+    } finally {
+      await client.query('ROLLBACK');
+      client.release();
+    }
+  });
+
   it('enforces roles, serializes leases, and accepts idempotent telemetry', async () => {
     const adminCookie = await login('admin', defaultPassword);
     const created = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-1', name: '巡检车', host: '192.168.1.11', tcpPort: 6000, videoPort: 6500 } });
@@ -157,6 +183,30 @@ describe('platform API against PostGIS', () => {
     expect((await app.inject({ method: 'POST', url: '/device/v1/telemetry', headers: { authorization: `Bearer ${token}` }, payload: { points: [point] } })).json()).toEqual({ accepted: 0 });
     const track = await app.inject({ method: 'GET', url: `/api/vehicles/${vehicleId}/track`, headers: { cookie: operatorACookie } });
     expect(track.statusCode).toBe(200); expect(track.json<{ points: unknown[] }>().points).toHaveLength(1);
+  });
+
+  it('issues renewable 20-minute control leases and permits takeover after expiry', async () => {
+    const adminCookie = await login('admin', defaultPassword);
+    const created = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-SESSION', name: '持续控制车', host: '192.168.1.55', tcpPort: 6000, videoPort: 6500 } });
+    const vehicleId = created.json<{ vehicle: { id: string } }>().vehicle.id;
+    await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA, ids.operatorB] } });
+    const operatorACookie = await login('operator-a', defaultPassword);
+    const operatorBCookie = await login('operator-b', defaultPassword);
+
+    const session = await app.inject({ method: 'POST', url: `/api/vehicles/${vehicleId}/control-lease`, headers: { origin, cookie: operatorACookie } });
+    expect(session.statusCode).toBe(200);
+    const lease = session.json<{ leaseId: string; expiresAt: string; gatewayToken: string }>();
+    const initialExpiry = new Date(lease.expiresAt).getTime();
+    expect(initialExpiry).toBeGreaterThan(Date.now() + 19 * 60_000);
+    expect(initialExpiry).toBeLessThanOrEqual(Date.now() + 20 * 60_000);
+    expect(lease.gatewayToken).toBeTruthy();
+    const renewedResponse = await app.inject({ method: 'POST', url: `/api/control-leases/${lease.leaseId}/renew`, headers: { origin, cookie: operatorACookie } });
+    expect(renewedResponse.statusCode).toBe(200);
+    expect(new Date(renewedResponse.json<{ expiresAt: string }>().expiresAt).getTime()).toBeGreaterThanOrEqual(initialExpiry);
+    expect((await app.inject({ method: 'POST', url: `/api/vehicles/${vehicleId}/control-lease`, headers: { origin, cookie: operatorBCookie } })).statusCode).toBe(409);
+
+    await db.query("UPDATE control_leases SET expires_at=now()-interval '1 second' WHERE id=$1", [lease.leaseId]);
+    expect((await app.inject({ method: 'POST', url: `/api/vehicles/${vehicleId}/control-lease`, headers: { origin, cookie: operatorBCookie } })).statusCode).toBe(200);
   });
 
   it('isolates route waypoints and evidence by vehicle membership', async () => {

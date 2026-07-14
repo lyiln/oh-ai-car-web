@@ -38,11 +38,11 @@ interface VehicleRow {
   last_patrol_at?: Date | null;
 }
 interface DeviceCredentialRow { vehicle_id: string; secret_hash: string; }
-interface SessionPayload extends SignedPayload { sub: string; role: Role; }
+interface SessionPayload extends SignedPayload { sub: string; role: Role; exp: number; }
 interface LeasePayload extends SignedPayload { sub: string; role: Role; leaseId: string; vehicleId: string; }
 type PatrolSocket = { send: (value: string) => void; vehicleId: string };
 const SESSION_COOKIE = 'oh_ai_session';
-const LEASE_MS = 60_000;
+const LEASE_MS = 20 * 60_000;
 const USER_SELECT = 'id, username, display_name, password_hash, role, active, email';
 
 function object(value: unknown): Record<string, unknown> | null { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null; }
@@ -200,7 +200,9 @@ export async function createApp(services: AppServices = {}) {
       archived: row.archived,
     };
   }
-  function leaseToken(leaseId: string, vehicleId: string, user: UserRow, expiresAt: Date) { return sign({ sub: user.id, role: user.role, leaseId, vehicleId, exp: expiresAt.getTime() }, config.sessionSecret); }
+  function leaseToken(leaseId: string, vehicleId: string, user: UserRow, expiresAt: Date) {
+    return sign({ sub: user.id, role: user.role, leaseId, vehicleId, exp: expiresAt.getTime() }, config.sessionSecret);
+  }
 
   app.setErrorHandler(async (error, request, reply) => {
     const statusCode = (error as { statusCode?: number }).statusCode ?? 400;
@@ -497,20 +499,38 @@ export async function createApp(services: AppServices = {}) {
     const gotoActive = await client.query("SELECT 1 FROM goto_goals WHERE vehicle_id=$1 AND status IN ('queued','navigating','cancellation_requested') LIMIT 1", [vehicleId]);
     if (gotoActive.rowCount) throw Object.assign(new Error('Goto navigation is active; cancel it first'), { statusCode: 409 });
     await client.query("UPDATE control_leases SET released_at=now(),release_reason='expired' WHERE vehicle_id=$1 AND released_at IS NULL AND expires_at<=now()", [vehicleId]);
-    const existing = await client.query<{ user_id: string }>('SELECT user_id FROM control_leases WHERE vehicle_id=$1 AND released_at IS NULL AND expires_at>now() LIMIT 1', [vehicleId]);
+    const existing = await client.query<{ id: string; user_id: string }>('SELECT id, user_id FROM control_leases WHERE vehicle_id=$1 AND released_at IS NULL AND expires_at>now() LIMIT 1', [vehicleId]);
     if (existing.rows[0] && existing.rows[0].user_id !== user.id) throw Object.assign(new Error('Vehicle is controlled by another operator'), { statusCode: 409 });
-    const expiresAt = new Date(Date.now() + LEASE_MS); const id = existing.rows[0] ? (await client.query<{ id: string }>('UPDATE control_leases SET expires_at=$1 WHERE vehicle_id=$2 AND user_id=$3 AND released_at IS NULL RETURNING id', [expiresAt, vehicleId, user.id])).rows[0].id : randomUUID();
+    const expiresAt = new Date(Date.now() + LEASE_MS);
+    const id = existing.rows[0]
+      ? (await client.query<{ id: string }>('UPDATE control_leases SET expires_at=$1 WHERE id=$2 RETURNING id', [expiresAt, existing.rows[0].id])).rows[0].id
+      : randomUUID();
     if (!existing.rows[0]) await client.query('INSERT INTO control_leases (id,vehicle_id,user_id,expires_at) VALUES ($1,$2,$3,$4)', [id, vehicleId, user.id, expiresAt]);
     return { id, expiresAt };
   }
   app.post('/api/vehicles/:id/control-lease', async (request) => { const user = await requireUser(request); const vehicleId = (request.params as { id: string }).id; if (!await canAccessVehicle(user, vehicleId)) throw Object.assign(new Error('Vehicle access denied'), { statusCode: 403 }); const lease = await db.transaction((client) => acquireLease(client, user, vehicleId)); await audit('control-lease.acquire', 'success', user.id, vehicleId); return { leaseId: lease.id, expiresAt: lease.expiresAt.toISOString(), gatewayToken: leaseToken(lease.id, vehicleId, user, lease.expiresAt) }; });
   app.post('/api/control-leases/:id/renew', async (request) => { const user = await requireUser(request); const leaseId = (request.params as { id: string }).id; const expiresAt = new Date(Date.now() + LEASE_MS); const result = await db.query<{ vehicle_id: string }>('UPDATE control_leases SET expires_at=$1 WHERE id=$2 AND user_id=$3 AND released_at IS NULL AND expires_at>now() RETURNING vehicle_id', [expiresAt, leaseId, user.id]); if (!result.rows[0]) throw Object.assign(new Error('Control lease expired'), { statusCode: 409 }); await audit('control-lease.renew', 'success', user.id, result.rows[0].vehicle_id); return { expiresAt: expiresAt.toISOString(), gatewayToken: leaseToken(leaseId, result.rows[0].vehicle_id, user, expiresAt) }; });
   app.delete('/api/control-leases/:id', async (request) => { const user = await requireUser(request); const leaseId = (request.params as { id: string }).id; const result = await db.query<{ vehicle_id: string }>("UPDATE control_leases SET released_at=now(),release_reason='operator' WHERE id=$1 AND user_id=$2 AND released_at IS NULL RETURNING vehicle_id", [leaseId, user.id]); if (result.rows[0]) await audit('control-lease.release', 'success', user.id, result.rows[0].vehicle_id); return { ok: true }; });
-  app.post('/internal/control-lease/verify', async (request) => { const body = object(request.body); const token = string(body?.token, 'token'); const claim = verify<LeasePayload>(token, config.sessionSecret); if (!claim?.leaseId || !claim.vehicleId) return { valid: false }; const result = await db.query<VehicleRow>(`SELECT v.* FROM control_leases l JOIN vehicles v ON v.id=l.vehicle_id JOIN users u ON u.id=l.user_id
-    WHERE l.id=$1 AND l.vehicle_id=$2 AND l.user_id=$3 AND l.released_at IS NULL AND l.expires_at>now() AND u.active=true
-      AND NOT EXISTS (SELECT 1 FROM response_tasks rt WHERE rt.assigned_vehicle_id=l.vehicle_id AND rt.status IN ('assigned','navigating','arrived','cancellation_requested'))`, [claim.leaseId, claim.vehicleId, claim.sub]); return result.rows[0] ? { valid: true, vehicle: vehicleDto(result.rows[0]), expiresAt: new Date(claim.exp).toISOString() } : { valid: false };
+  const verifiedControlSession = async (token: string) => {
+    const claim = verify<LeasePayload>(token, config.sessionSecret);
+    if (!claim?.leaseId || !claim.vehicleId) return null;
+    const result = await db.query<VehicleRow>(`SELECT v.* FROM control_leases l JOIN vehicles v ON v.id=l.vehicle_id JOIN users u ON u.id=l.user_id
+      WHERE l.id=$1 AND l.vehicle_id=$2 AND l.user_id=$3 AND l.released_at IS NULL AND l.expires_at>now() AND u.active=true
+        AND NOT EXISTS (SELECT 1 FROM response_tasks rt WHERE rt.assigned_vehicle_id=l.vehicle_id AND rt.status IN ('assigned','navigating','arrived','cancellation_requested'))`, [claim.leaseId, claim.vehicleId, claim.sub]);
+    return result.rows[0] ? { claim, vehicle: result.rows[0] } : null;
+  };
+  app.post('/internal/control-lease/verify', async (request) => {
+    const session = await verifiedControlSession(string(object(request.body)?.token, 'token'));
+    if (!session) return { valid: false };
+    return { valid: true, vehicle: vehicleDto(session.vehicle), expiresAt: new Date(session.claim.exp).toISOString() };
   });
-
+  app.post('/internal/control-lease/release', async (request) => {
+    const token = string(object(request.body)?.token, 'token'); const claim = verify<LeasePayload>(token, config.sessionSecret);
+    if (!claim?.leaseId || !claim.vehicleId) return { ok: false };
+    const result = await db.query<{ vehicle_id: string }>("UPDATE control_leases SET released_at=now(),release_reason='gateway_disconnect' WHERE id=$1 AND vehicle_id=$2 AND user_id=$3 AND released_at IS NULL RETURNING vehicle_id", [claim.leaseId, claim.vehicleId, claim.sub]);
+    if (result.rows[0]) await audit('control-session.gateway-release', 'success', claim.sub, result.rows[0].vehicle_id);
+    return { ok: true };
+  });
   app.post('/device/v1/telemetry', async (request, reply) => {
     const authorization = request.headers.authorization; const token = authorization?.startsWith('Bearer ') ? authorization.slice(7) : ''; const [credentialId, secret] = token.split('.'); if (!credentialId || !secret) return reply.status(401).send({ error: 'Invalid device credential' });
     const credential = await db.query<{ vehicle_id: string; secret_hash: string }>('SELECT vehicle_id,secret_hash FROM device_credentials WHERE id=$1 AND active=true', [credentialId]); if (!credential.rows[0] || credential.rows[0].secret_hash !== hashSecret(secret)) return reply.status(401).send({ error: 'Invalid device credential' });

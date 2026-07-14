@@ -750,3 +750,38 @@ CREATE TABLE IF NOT EXISTS vehicle_nav_state (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 `;
+
+// 控制会话不再按固定时长过期；网关心跳仅用于识别崩溃后遗留的占用。
+export const migration021 = `
+UPDATE control_leases
+SET released_at=now(), release_reason='expired_before_session_migration'
+WHERE released_at IS NULL AND expires_at<=now();
+
+ALTER TABLE control_leases ALTER COLUMN expires_at DROP NOT NULL;
+ALTER TABLE control_leases ADD COLUMN IF NOT EXISTS gateway_heartbeat_at timestamptz;
+DROP INDEX IF EXISTS control_leases_vehicle_active_idx;
+WITH ranked AS (
+  SELECT id, row_number() OVER (PARTITION BY vehicle_id ORDER BY acquired_at DESC, id DESC) AS ordinal
+  FROM control_leases
+  WHERE released_at IS NULL
+)
+UPDATE control_leases AS lease
+SET released_at=now(), release_reason='duplicate_before_session_migration'
+FROM ranked
+WHERE lease.id=ranked.id AND ranked.ordinal>1;
+CREATE UNIQUE INDEX IF NOT EXISTS control_leases_vehicle_single_active_idx
+  ON control_leases(vehicle_id) WHERE released_at IS NULL;
+`;
+
+// 恢复有时限租约：活动租约统一获得 20 分钟过渡期，并移除临时心跳字段。
+export const migration022 = `
+UPDATE control_leases
+SET expires_at = CASE
+  WHEN released_at IS NULL THEN now() + interval '20 minutes'
+  ELSE COALESCE(released_at, acquired_at, now())
+END
+WHERE expires_at IS NULL;
+
+ALTER TABLE control_leases ALTER COLUMN expires_at SET NOT NULL;
+ALTER TABLE control_leases DROP COLUMN IF EXISTS gateway_heartbeat_at;
+`;

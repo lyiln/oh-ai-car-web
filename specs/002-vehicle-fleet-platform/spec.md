@@ -16,8 +16,8 @@ deployment.
 - `POST /device/v1/telemetry` accepts a bearer device credential and an ordered
   `points` array containing `occurredAt`, WGS-84 `longitude`, WGS-84
   `latitude`, and optional state fields.
-- `POST /internal/control-lease/verify` validates a short-lived lease token for
-  the localhost gateway. A missing or expired lease must prevent TCP control.
+- `POST /internal/control-lease/verify` validates an unexpired control-lease token for
+  the localhost gateway. A missing, expired, released, or mismatched lease must prevent TCP control.
 - Live `/ws` subscribers may receive only the `vehicle.position` events for
   vehicles they are authorised to view.
 
@@ -28,7 +28,9 @@ deployment.
 - The backend accepts credentialed browser requests only from explicit trusted
   origins. Cookie-authenticated state changes reject missing or untrusted
   Origins; device and gateway internal endpoints use their own credentials.
-- A lease expiry or renewal failure causes the gateway to attempt Stop before
-  closing its car TCP connection.
+- Control leases last 20 minutes and the browser renews them every five minutes. A
+  renewal failure or lease expiry causes the gateway to attempt Stop before closing TCP.
+- Browser closure, explicit disconnect, or gateway shutdown also follows the Stop-and-close
+  path and makes a best-effort lease release. No gateway heartbeat is required.
 - The platform does not alter the unverified car TCP encoder or represent
   automated tests as real-car validation.

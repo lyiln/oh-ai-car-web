@@ -747,8 +747,7 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
 
       {!health?.ok && (
         <p className="notice">
-          请先在本机启动 YOLO 推理服务（:8010；车牌识别工作台必需）：
-          <code>npm run dev:plate-api</code>
+          YOLO 服务未启动。运行 <code>npm run dev:plate-api</code> 后刷新。
         </p>
       )}
 
@@ -759,12 +758,12 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
           disabled={submitBusy || !violationCandidate || !vehicleId}
           onClick={() => void submitToViolations()}
         >
-          {submitBusy ? '上传中…' : '添加到违规车辆（测试）'}
+          {submitBusy ? '上传中…' : '添加到违规车辆'}
         </button>
         <p className="muted">
           {violationCandidate
-            ? `将把 ${violationCandidate.plate} 与截图写入「违规车辆」并进入「待人工审核」；若命中白名单会被拒绝`
-            : '识别出有效车牌后可一键写入违规并进入审核队列（测试用；白名单车牌会被拦截）'}
+            ? `将把 ${violationCandidate.plate} 与截图写入「违规车辆」并进入「待人工审核」；命中白名单的车牌不可加入违规车辆`
+            : '识别出有效车牌后可一键写入违规并进入审核队列。'}
         </p>
       </div>
       {submitError && <p className="error-text">{submitError}</p>}

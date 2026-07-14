@@ -28,6 +28,7 @@ function probeHint(probe: ProbeResult): string {
 
 export function ConsolePage() {
   const { selectedDevice, selectedId } = useSelectedDevice();
+  const recognitionRef = useRef<HTMLDivElement>(null);
   const gateway = useMemo(() => new ControlClient(), []);
   const [state, setState] = useState<StateEnvelope>({
     type: 'state',
@@ -66,6 +67,12 @@ export function ConsolePage() {
       setMediaPending(false);
       setTrackingPending(false);
     }
+    if (!next.ownsControl && leaseRef.current) {
+      setLeaseId(null);
+      setGatewayToken(null);
+      setExpiresAt(null);
+      leaseRef.current = null;
+    }
     if (next.lastError) setError(next.lastError);
   }), [gateway]);
 
@@ -74,32 +81,9 @@ export function ConsolePage() {
       try { await gateway.send('disconnect', {}); } catch { /* best effort */ }
       const lease = leaseRef.current;
       if (lease) await deviceClient.releaseLease(lease.leaseId).catch(() => undefined);
+      leaseRef.current = null;
       gateway.close();
     })();
-  }, [gateway]);
-
-  useEffect(() => {
-    if (!selectedId) return;
-    let cancelled = false;
-    void deviceClient.track(selectedId)
-      .then((next) => { if (!cancelled) setPoints(next); })
-      .catch(() => { if (!cancelled) setPoints([]); });
-    return () => { cancelled = true; };
-  }, [selectedId]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const check = async () => {
-      try {
-        await gateway.open();
-        if (!cancelled) setGatewayReachable(true);
-      } catch {
-        if (!cancelled) setGatewayReachable(false);
-      }
-    };
-    void check();
-    const timer = window.setInterval(() => { void check(); }, 8_000);
-    return () => { cancelled = true; window.clearInterval(timer); };
   }, [gateway]);
 
   useEffect(() => {
@@ -125,16 +109,41 @@ export function ConsolePage() {
       }).catch(async () => {
         setStatus('控制租约续期失败，正在安全断开。');
         setError('租约已失效，请重新连接');
-        try { await gateway.send('disconnect', {}); } catch { /* ignore */ }
+        try { await gateway.send('disconnect', {}); } catch { /* best effort */ }
+        await deviceClient.releaseLease(leaseId).catch(() => undefined);
         setLeaseId(null);
         setGatewayToken(null);
         setExpiresAt(null);
         leaseRef.current = null;
         setConnectStep('error');
       });
-    }, 20_000);
+    }, 5 * 60_000);
     return () => window.clearInterval(timer);
   }, [leaseId, gatewayToken, state.connected, state.ownsControl, gateway, selectedDevice, selectedId]);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    let cancelled = false;
+    void deviceClient.track(selectedId)
+      .then((next) => { if (!cancelled) setPoints(next); })
+      .catch(() => { if (!cancelled) setPoints([]); });
+    return () => { cancelled = true; };
+  }, [selectedId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const check = async () => {
+      try {
+        await gateway.open();
+        if (!cancelled) setGatewayReachable(true);
+      } catch {
+        if (!cancelled) setGatewayReachable(false);
+      }
+    };
+    void check();
+    const timer = window.setInterval(() => { void check(); }, 8_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [gateway]);
 
   const send = useCallback(async (command: string, payload: unknown) => {
     try {
@@ -171,9 +180,17 @@ export function ConsolePage() {
       setGatewayReachable(true);
 
       setConnectStep('lease');
-      setStatus('② 正在申请控制租约…');
+      setStatus('② 正在申请 20 分钟控制租约…');
       const session = await deviceClient.connectDevice(selectedId);
-      leaseToRelease = session.leaseId ?? null;
+      if (!session.leaseId || !session.gatewayToken || !session.expiresAt) throw new Error('控制租约响应不完整');
+      leaseToRelease = session.leaseId;
+      leaseRef.current = {
+        leaseId: session.leaseId,
+        gatewayToken: session.gatewayToken,
+        host: session.host,
+        tcpPort: session.tcpPort,
+        videoPort: session.videoPort,
+      };
 
       setConnectStep('probe');
       setStatus(`③ 正在探测小车 TCP ${session.host}:${session.tcpPort}…`);
@@ -190,8 +207,9 @@ export function ConsolePage() {
         setConnectStep('error');
         setError(hint);
         setStatus('探测失败，未建立控制连接');
-        if (leaseToRelease) await deviceClient.releaseLease(leaseToRelease).catch(() => undefined);
+        await deviceClient.releaseLease(session.leaseId).catch(() => undefined);
         leaseToRelease = null;
+        leaseRef.current = null;
         return;
       }
 
@@ -206,30 +224,22 @@ export function ConsolePage() {
       });
       connected = true;
 
-      setLeaseId(session.leaseId ?? null);
-      setGatewayToken(session.gatewayToken ?? null);
-      setExpiresAt(session.expiresAt ?? null);
-      if (session.leaseId && session.gatewayToken) {
-        leaseRef.current = {
-          leaseId: session.leaseId,
-          gatewayToken: session.gatewayToken,
-          host: session.host,
-          tcpPort: session.tcpPort,
-          videoPort: session.videoPort,
-        };
-      }
+      setLeaseId(session.leaseId);
+      setGatewayToken(session.gatewayToken);
+      setExpiresAt(session.expiresAt);
       setConnectStep('ready');
       setStatus(`已连接 ${selectedDevice.name}（${session.host}:${session.tcpPort}）`);
     } catch (reason) {
       if (!connected && leaseToRelease) await deviceClient.releaseLease(leaseToRelease).catch(() => undefined);
+      if (!connected) leaseRef.current = null;
       setConnectStep('error');
       const message = reason instanceof Error ? reason.message : '连接失败';
       setError(message);
       if (message.includes('本地网关') || message.includes('gateway')) {
         setGatewayReachable(false);
         setStatus('本地网关不可用');
-      } else if (message.includes('租约') || message.includes('lease') || message.includes('401') || message.includes('403') || message.includes('409')) {
-        setStatus('租约申请失败');
+      } else if (message.includes('控制') || message.includes('lease') || message.includes('401') || message.includes('403') || message.includes('409')) {
+        setStatus('控制权限申请失败');
       } else {
         setStatus('连接失败');
       }
@@ -281,9 +291,8 @@ export function ConsolePage() {
 
   const disabled = !state.connected || !state.ownsControl;
   const leaseExpiringSoon = expiresAt
-    ? new Date(expiresAt).getTime() - Date.now() < 25_000
+    ? new Date(expiresAt).getTime() - Date.now() < 5 * 60_000
     : false;
-
   return (
     <div className="page console-page">
       <header className="page-header">
@@ -310,7 +319,7 @@ export function ConsolePage() {
           小车 TCP {state.connected ? '已连接' : '未连接'}
         </span>
         <span className={leaseId ? (leaseExpiringSoon ? 'tag tag-warning' : 'tag tag-success') : 'tag'}>
-          租约 {leaseId ? (leaseExpiringSoon ? '即将过期' : '有效') : '无'}
+          租约 {leaseId ? (leaseExpiringSoon ? '即将到期' : '有效（20 分钟）') : '无'}
         </span>
         <span className="tag">步骤 {connectStep}</span>
       </section>
@@ -334,11 +343,22 @@ export function ConsolePage() {
         </p>
       )}
 
+      <section className="panel console-map-panel">
+        <LiveMap points={points} follow />
+      </section>
       <div className="console-layout">
-        <section className="panel console-map-panel">
-          <LiveMap points={points} follow />
+        <section className="console-video-column">
+          <VideoPanel host={host} port={videoPort} onOpenRecognition={() => recognitionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })} />
+          <div ref={recognitionRef} className="console-plate-section">
+            <PlateScanPanel
+              host={host}
+              videoPort={videoPort}
+              vehicleId={selectedId}
+              disabled={disabled}
+            />
+          </div>
         </section>
-        <aside className="console-side">
+        <aside className="panel console-side console-control-column">
           <section className="panel">
             <div className="panel-heading">
               <h2>{selectedDevice.name}</h2>
@@ -346,7 +366,6 @@ export function ConsolePage() {
                 {state.connected ? (state.ownsControl ? '已接管' : '已连接') : '未连接'}
               </span>
             </div>
-            <p className="muted">视频 http://{host}:{videoPort}/index2</p>
             <div className="login-tabs" role="tablist">
               <button type="button" className={tab === 'buttons' ? 'login-tab-active' : undefined} onClick={() => setTab('buttons')}>方向按钮</button>
               <button type="button" className={tab === 'rocker' ? 'login-tab-active' : undefined} onClick={() => setTab('rocker')}>摇杆</button>
@@ -381,16 +400,19 @@ export function ConsolePage() {
             </div>
             <p className="muted">松开方向键 / 窗口失焦自动停止（对齐 APP）</p>
           </section>
+          <section className="console-control-status" aria-label="实时控制状态">
+            <div>
+              <h2>实时控制状态</h2>
+              <p className="muted">{status || '连接设备后可执行方向、媒体和循迹操作。'}</p>
+            </div>
+            <div className="console-control-status-grid">
+              <span><small>本地网关</small><strong>{gatewayReachable ? '已就绪' : '未连接'}</strong></span>
+              <span><small>小车 TCP</small><strong>{state.connected ? '已连接' : '未连接'}</strong></span>
+              <span><small>控制租约</small><strong>{leaseId ? (leaseExpiringSoon ? '即将到期' : '有效') : '无'}</strong></span>
+            </div>
+            <p className="muted">松开方向键、窗口失焦或页面隐藏时，系统会发送停止指令。</p>
+          </section>
         </aside>
-      </div>
-      <div className="console-media-layout">
-        <VideoPanel host={host} port={videoPort} />
-        <PlateScanPanel
-          host={host}
-          videoPort={videoPort}
-          vehicleId={selectedId}
-          disabled={disabled}
-        />
       </div>
     </div>
   );

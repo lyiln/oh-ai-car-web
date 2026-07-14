@@ -142,7 +142,7 @@ python edge-agent/tests/test_platform_hook_mapping.py
 
 ## 7. 控制台前端识别（本机）
 
-控制台「视频预览」旁的 **车牌识别** 面板通过：
+控制台「视频预览」下方保留完整的 **车牌识别工作台**；视频卡片底部的“车牌识别”按钮会滚动到该工作台。识别链路通过：
 
 1. Gateway `GET /api/video/snapshot` 代理拉取小车视频帧（解决 iframe 跨域无法读像素）
 2. 前端 `POST /plate-api/api/infer` → 本机 YOLO FastAPI `:8010`

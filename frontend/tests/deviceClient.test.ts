@@ -86,7 +86,25 @@ describe('deviceClient', () => {
       tcpPort: 6000,
       videoPort: 6500,
       leaseId: 'lease-1',
+      expiresAt: '2099-01-01T00:00:00.000Z',
       gatewayToken: 'token-1',
     });
+  });
+
+  it('renews and releases a control lease through the lease endpoints', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/renew')) return new Response(JSON.stringify({ expiresAt: '2099-01-01T00:00:00.000Z', gatewayToken: 'token-2' }), { status: 200 });
+      if (init?.method === 'DELETE') return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      return new Response(JSON.stringify({ error: 'not found' }), { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(deviceClient.renewLease('lease-1')).resolves.toMatchObject({ gatewayToken: 'token-2' });
+    await expect(deviceClient.releaseLease('lease-1')).resolves.toEqual({ ok: true });
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual([
+      expect.stringContaining('/api/control-leases/lease-1/renew'),
+      expect.stringContaining('/api/control-leases/lease-1'),
+    ]);
   });
 });

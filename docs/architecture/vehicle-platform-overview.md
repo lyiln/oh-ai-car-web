@@ -35,7 +35,7 @@ Fastify 应用入口是 `backend/src/app.ts`；启动时 `backend/src/index.ts` 
 | --- | --- | --- |
 | 登录与角色 | 管理员创建账号；所有活跃账号可使用 Argon2 密码登录，已绑定邮箱的管理员还可通过后端 SMTP 接收一次性验证码；签名 Cookie 保存 8 小时会话 | `users`、`auth_otps` |
 | 车辆档案 | 保存车辆名称、编号、TCP 主机/端口、视频端口及成员授权 | `vehicles`、`vehicle_members` |
-| 控制权 | 每辆车同一时刻只允许一个有效租约；租约有效期 60 秒，页面每 20 秒续期 | `control_leases` |
+| 控制权 | 每辆车同一时刻只允许一个 20 分钟控制租约；控制页每 5 分钟续租，主动断开、控制页关闭或网关断开时释放，租约到期时网关安全停车并断开 | `control_leases` |
 | GPS | 设备令牌验证后批量写入 WGS-84 轨迹点；同车同采集时间重复上报会忽略 | `device_credentials`、`telemetry_points` |
 | 实时更新 | GPS 成功写入后向已授权的 `/ws` 订阅者推送 `vehicle.position` | 内存订阅表 |
 | 巡检任务 | 路线 YAML、全局白名单 CSV、单车单活动任务、调度事件、车牌证据与 HTML 报告 | `patrol_*`、`whitelist_*`、`plate_observations` |
@@ -56,8 +56,8 @@ Fastify 应用入口是 `backend/src/app.ts`；启动时 `backend/src/index.ts` 
 | `GET/POST/PATCH /api/vehicles...` | 管理员/操作员 | 查询已授权车辆；管理员创建和更新档案 |
 | `PUT /api/vehicles/:id/members` | 管理员 | 用用户 ID 列表整体覆盖车辆成员授权 |
 | `POST /api/vehicles/:id/device-credentials` | 管理员 | 轮换设备令牌；返回值只在本次调用中展示 |
-| `POST /api/vehicles/:id/control-lease` | 操作员 | 获取或延长自己的控制租约与网关令牌 |
-| `POST/DELETE /api/control-leases/:id...` | 操作员 | 续约或主动释放控制权 |
+| `POST /api/vehicles/:id/control-lease` | 操作员 | 获取或延长自己的 20 分钟控制租约与网关令牌 |
+| `POST/DELETE /api/control-leases/:id...` | 操作员 | 续租或主动释放控制权 |
 | `GET /api/vehicles/:id/track` | 已授权用户 | 按 `from`/`to` 时间范围查询轨迹；省略时为最近 24 小时 |
 | `GET /api/audit-logs` | 管理员 | 读取最近 200 条审计记录 |
 | `GET/POST/PUT/DELETE /api/whitelist...`、`POST /api/whitelist/import` | 管理员 | 维护所有巡检车共享的全局白名单；任务启动时复制为不可变快照 |
@@ -65,7 +65,7 @@ Fastify 应用入口是 `backend/src/app.ts`；启动时 `backend/src/index.ts` 
 | `/api/vehicles/:id/patrol-routes` | 管理员/已授权用户 | 管理员导入路线 YAML；已授权用户读取路线与航点 |
 | `/api/vehicles/:id/patrol-tasks...` | 已授权用户 | 创建、启动、停止、查看任务与下载 HTML 报告；启动前须安全断开本机网关并释放有效人工控制租约 |
 | `/device/v1/patrol/tasks/next`、`.../events` | 巡检调度器 | 凭车辆设备令据领取任务，上报航点、状态与识别记录 |
-| `POST /internal/control-lease/verify` | 本机网关 | 验证租约令牌、车辆和当前连接目标 |
+| `POST /internal/control-lease/verify`、`.../release` | 本机网关 | 验证控制租约，并在断开后尽力释放租约 |
 | `GET /ws` | 已授权浏览器 | 建连后发送 `{"type":"subscribe","vehicleId":"..."}`，接收实时位置 |
 
 管理员接口已经由后端提供；当前 MVP 页面主要展示用户、车辆和审计信息，批量成员授权、账号创建和设备令牌轮换可先通过上述管理员 API 完成。
@@ -84,10 +84,10 @@ Fastify 应用入口是 `backend/src/app.ts`；启动时 `backend/src/index.ts` 
 
 1. 操作员登录平台，后端在 HttpOnly Cookie 中保存签名会话。
 2. 前端只读取该操作员被授权的车辆档案，得到已保存的 TCP 和视频配置。
-3. 操作员点击连接。前端请求 `POST /api/vehicles/:id/control-lease`，后端在事务中拒绝其他用户的有效租约，或签发/延长自己的 60 秒租约。
+3. 操作员点击连接。前端请求 `POST /api/vehicles/:id/control-lease`，后端在事务中拒绝其他用户的有效租约，或将自己的租约延长到 20 分钟后。
 4. 前端先以车辆 ID、租约令牌与保存的连接配置请求 probe；网关只探测与租约完全一致的目标，且 probe 不占用控制会话。
 5. 前端仅在 probe 可达后把相同配置提交给本机 `ws://127.0.0.1:8787/control` 网关。网关必须设置 `PLATFORM_API_URL` 并调用后端 `/internal/control-lease/verify`；只有令牌、用户、车辆、未过期租约及连接配置完全一致，且该车没有活动或待确认停止的巡检任务时，网关才允许 TCP 连接。
-6. 前端每 20 秒续约，并把新令牌以 `leaseRefresh` 更新给网关。更新失败或租约到期时，网关沿用既有安全路径：先尝试发送 Stop，再关闭 TCP。TCP 意外断开时，网关不会自动重连或重发运动命令，操作员必须重新连接。
+6. 前端每 5 分钟续租，并通过 `leaseRefresh` 把新令牌和到期时间交给网关。续租失败或租约到期时，网关先尝试发送 Stop，再关闭 TCP；页面关闭、显式断开或网关关闭时也沿用该安全路径并尽力释放租约。TCP 意外断开时不会自动重连或重发运动命令；即使网关进程崩溃，后端租约也会在最长 20 分钟后失效。
 
 这套机制不会改变当前已知但尚未真车确认的小车 TCP 编码。有关协议风险请始终查看 [PROTOCOL_STATUS.md](../../PROTOCOL_STATUS.md)。
 
