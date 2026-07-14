@@ -1,13 +1,18 @@
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
-import { migration001, migration002, migration003, migration004, migration005, migration006, migration007, migration008, migration009, migration010, migration011, migration012 } from './schema.js';
+import {
+  migration001, migration002, migration003, migration004, migration005,
+  migration006, migration007, migration008, migration009, migration010,
+  migration011, migration012, migration012AiAgents, migration013,
+  migration014, migration015,
+} from './schema.js';
 
 export class Database {
   readonly pool: Pool;
   constructor(connectionString: string) { this.pool = new Pool({ connectionString }); }
-  query<T extends QueryResultRow = QueryResultRow>(text: string, values: unknown[] = []) { return this.pool.query<T>(text, values); }
-  async transaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
+  query<T extends QueryResultRow = QueryResultRow>(text: string, params: unknown[] = []) { return this.pool.query<T>(text, params); }
+  async transaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
-    try { await client.query('BEGIN'); const result = await work(client); await client.query('COMMIT'); return result; }
+    try { await client.query('BEGIN'); const result = await fn(client); await client.query('COMMIT'); return result; }
     catch (error) { await client.query('ROLLBACK'); throw error; }
     finally { client.release(); }
   }
@@ -32,6 +37,10 @@ export class Database {
         { version: '010-whitelist-entry-fields', sql: migration010 },
         { version: '011-patrol-event-details', sql: migration011 },
         { version: '012-patrol-rule-snapshots', sql: migration012 },
+        { version: '012-ai-agents', sql: migration012AiAgents },
+        { version: '013-whitelist-phone-sms', sql: migration013 },
+        { version: '014-wxpusher-uid', sql: migration014 },
+        { version: '015-drop-phone-aliyun', sql: migration015 },
       ]) {
         await client.query('BEGIN');
         try {

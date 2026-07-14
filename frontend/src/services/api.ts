@@ -93,6 +93,7 @@ export interface WhitelistEntry {
   owner?: string | null;
   building?: string | null;
   parkingSpot?: string | null;
+  wxUid?: string | null;
   vehicleType?: 'private' | 'visitor';
   validUntil?: string | null;
 }
@@ -182,6 +183,10 @@ export interface ResponseTask {
   plate: string;
   ownerName: string;
   building: string;
+  ownerWxUid?: string;
+  smsStatus?: string;
+  smsError?: string;
+  smsSentAt?: string | null;
   status: 'pending_review' | 'confirmed' | 'assigned' | 'navigating' | 'arrived' | 'cancellation_requested' | 'completed' | 'cancelled' | 'failed';
   eligibilityReason: string;
   aiSuggestion?: string;

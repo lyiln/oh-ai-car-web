@@ -17,7 +17,13 @@ export async function tasks(): Promise<ResponseTask[]> {
   return result.tasks;
 }
 
-export async function confirm(id: string): Promise<{ ok: true; assignedVehicleId: string | null; assignmentPending: boolean; advice: { suggestion: string; notification: string; source: string } }> {
+export async function confirm(id: string): Promise<{
+  ok: true;
+  assignedVehicleId: string | null;
+  assignmentPending: boolean;
+  advice: { suggestion: string; notification: string; source: string };
+  push?: { status: string; message: string; requestId?: string };
+}> {
   return apiRequest(`/api/response-tasks/${id}/confirm`, { method: 'POST', body: '{}' });
 }
 

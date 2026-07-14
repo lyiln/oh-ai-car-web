@@ -9,6 +9,7 @@ import { parseDocument } from 'yaml';
 import { loadConfig, type Config } from './config.js';
 import { Database } from './db/index.js';
 import { createSmtpOtpMailer, type OtpMailer } from './otp-mailer.js';
+import { registerAiPlatformRoutes } from './routes/ai-platform.js';
 import { registerPatrolPlatformRoutes } from './routes/patrol-platform.js';
 import { createResponseCandidate, registerResponsePlatformRoutes } from './routes/response-platform.js';
 import { hashSecret, randomSecret, sign, verify, type SignedPayload } from './security.js';
@@ -570,6 +571,16 @@ export async function createApp(services: AppServices = {}) {
     audit,
     hub,
     ai: { baseUrl: config.aiBaseUrl, apiKey: config.aiApiKey, model: config.aiModel },
+    wxPusher: {
+      appToken: config.wxPusherAppToken,
+      endpoint: config.wxPusherEndpoint,
+    },
+  });
+
+  registerAiPlatformRoutes(app, {
+    db,
+    config,
+    requireUser,
   });
 
   app.addHook('onClose', async () => { if (!services.db) await db.close(); });
