@@ -7,6 +7,34 @@ import os
 from pathlib import Path
 
 
+def _repo_candidates(root: Path) -> list[Path]:
+    env_path = os.environ.get("YOLO_REPO_PATH", "").strip()
+    candidates = [
+        Path(env_path) if env_path else None,
+        root / "yolo-v5" / "oh-ai-car-YOLOv5",
+        root / "vendor" / "oh-ai-car-YOLOv5",
+        root.parents[1] / "YOLOv5" / "oh-ai-car-YOLOv5",
+    ]
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def _resolve_repo(root: Path) -> Path:
+    for candidate in _repo_candidates(root):
+        if candidate.is_dir():
+            return candidate
+    return _repo_candidates(root)[0]
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
     secrets_path = root / "scripts" / ".local-jetson-gps.json"
@@ -25,13 +53,15 @@ def main() -> None:
         if task_info.get("waypointId"):
             os.environ["PLATE_VISION_WAYPOINT_ID"] = task_info["waypointId"]
 
-    os.environ.setdefault("YOLO_REPO_PATH", str(root / "yolo-v5" / "oh-ai-car-YOLOv5"))
+    yolo_repo = _resolve_repo(root)
+    os.environ.setdefault("YOLO_REPO_PATH", str(yolo_repo))
     os.environ.setdefault("YOLO_DEVICE", "cpu")
     os.environ.setdefault("PLATE_DETECTOR_MODE", os.environ.get("PLATE_DETECTOR_MODE", "auto"))
     os.environ.setdefault("EVIDENCE_PUBLIC_BASE_URL", "http://127.0.0.1:8089/evidence")
     os.environ.setdefault("PLATE_SCAN_INTERVAL_SECONDS", "5")
+    os.environ.setdefault("YOLO_RUNTIME_PROFILE", "video")
 
-    demo = root / "yolo-v5" / "oh-ai-car-YOLOv5" / "demo_input" / "first_batch"
+    demo = yolo_repo / "demo_input" / "first_batch"
     if demo.is_dir() and "PLATE_VIDEO_SOURCE" not in os.environ:
         images = sorted(demo.glob("*.jpg"))
         if images:

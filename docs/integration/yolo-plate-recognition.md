@@ -28,6 +28,20 @@ yolo-v5/oh-ai-car-YOLOv5/
 └─ platform_hook.py        # 由 setup 脚本或示例文件生成
 ```
 
+当前 `WEB` 仓库也会自动尝试发现你本机现有的外部仓库路径：
+
+```text
+../YOLOv5/oh-ai-car-YOLOv5/
+```
+
+也就是本项目旁边的：
+
+```text
+c:\Users\jfkyx\Desktop\小车web\YOLOv5\oh-ai-car-YOLOv5
+```
+
+如需覆盖自动发现结果，显式设置 `YOLO_REPO_PATH` 即可。
+
 仓库为私有时，需先接受 GitHub 邀请：
 
 <https://github.com/JMshepherd227/oh-ai-car-YOLOv5/invitations>
@@ -139,7 +153,15 @@ npm run dev:plate-api
 
 依赖：`pip install fastapi uvicorn`，以及 YOLO 仓库所需的 torch / paddleocr / ultralytics。
 
-控制台操作：连接小车 → 视频 iframe 正常 → 「识别当前帧」或「开始定时扫描」。
+控制台操作：
+
+1. 连接小车并确认视频 iframe 正常
+2. 进入控制台下方的「车牌识别工作台」
+3. 可选模式：
+   - `实时快照`：对当前小车视频帧执行识别
+   - `本地图片`：上传单张图片测试两阶段流程
+   - `本地视频`：上传视频并查看抽帧统计、命中帧列表、详情复核、主体车 ROI 与车牌裁剪图
+   - `浏览器摄像头`：直接用浏览器摄像头做连续抓帧识别
 
 这些本地/Fake TCP 验证不构成真实车辆或模型精度验证；真实车辆操作仍须遵循 `PROTOCOL_STATUS.md`。
 

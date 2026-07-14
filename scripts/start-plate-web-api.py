@@ -3,12 +3,44 @@
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import sys
 import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-YOLO_ROOT = ROOT / "yolo-v5" / "oh-ai-car-YOLOv5"
+
+
+def _repo_candidates() -> list[Path]:
+    env_path = os.environ.get("YOLO_REPO_PATH", "").strip()
+    candidates = [
+        Path(env_path) if env_path else None,
+        ROOT / "yolo-v5" / "oh-ai-car-YOLOv5",
+        ROOT / "vendor" / "oh-ai-car-YOLOv5",
+        ROOT.parents[1] / "YOLOv5" / "oh-ai-car-YOLOv5",
+    ]
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def _resolve_repo_root() -> Path:
+    for candidate in _repo_candidates():
+        if (candidate / "scripts" / "web_api_server.py").is_file():
+            return candidate
+    return _repo_candidates()[0]
+
+
+YOLO_ROOT = _resolve_repo_root()
 SCRIPTS = YOLO_ROOT / "scripts"
 SERVER = SCRIPTS / "web_api_server.py"
 
@@ -54,22 +86,80 @@ def _preflight() -> int:
         print("Missing dependencies for plate web API:", file=sys.stderr)
         print("\n".join(missing), file=sys.stderr)
         return 1
+    try:
+        import paddle  # noqa: PLC0415
+
+        version = getattr(paddle, "__version__", "0.0.0")
+        match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
+        if match:
+            parsed = tuple(int(part) for part in match.groups())
+            if parsed < (3, 3, 1):
+                print(
+                    "Incompatible paddlepaddle version for current PaddleOCR runtime. "
+                    f"Detected {version}, require >= 3.3.1. Run: python -m pip install --upgrade paddlepaddle",
+                    file=sys.stderr,
+                )
+                return 1
+    except ImportError:
+        pass
     return 0
+
+
+def _ensure_legacy_plate_weights() -> None:
+    explicit = os.environ.get("YOLO_PLATE_WEIGHTS", "").strip()
+    if explicit:
+        return
+
+    modern_candidates = [
+        YOLO_ROOT / "weights" / "best_plate_detector_v2.pt",
+        YOLO_ROOT / "weights" / "best_plate_detector.pt",
+    ]
+    legacy_target = YOLO_ROOT / "runs" / "train" / "plate_ccpd_gpu_v3_continue" / "weights" / "best.pt"
+    if legacy_target.is_file():
+        return
+
+    source = next((path for path in modern_candidates if path.is_file()), None)
+    if source is None:
+        return
+
+    legacy_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, legacy_target)
+    print(f"Prepared legacy plate weights: {legacy_target}", flush=True)
+
+
+def _configure_windows_cpu_paddle_runtime() -> None:
+    device = os.environ.get("PLATE_WEB_DEVICE", os.environ.get("YOLO_DEVICE", "cpu")).strip().lower()
+    if os.name != "nt" or device not in {"", "cpu"}:
+        return
+
+    # PaddleOCR 3.x on Windows CPU can crash in the PIR -> oneDNN path.
+    os.environ.setdefault("FLAGS_enable_pir_api", "0")
+    os.environ.setdefault("FLAGS_use_mkldnn", "0")
+    os.environ.setdefault("FLAGS_use_onednn", "0")
+    os.environ.setdefault("PADDLE_USE_ONEDNN", "0")
 
 
 def main() -> int:
     if not SERVER.is_file():
-        print(f"Missing {SERVER}. Place oh-ai-car-YOLOv5 under yolo-v5/ first.", file=sys.stderr)
+        tried = "\n".join(f"  - {candidate}" for candidate in _repo_candidates())
+        print(
+            f"Missing {SERVER}. Configure YOLO_REPO_PATH or place oh-ai-car-YOLOv5 in one of:\n{tried}",
+            file=sys.stderr,
+        )
         return 1
 
     if _preflight() != 0:
         return 1
 
     _shim_pathlib_local()
+    _ensure_legacy_plate_weights()
+    os.environ.setdefault("YOLO_REPO_PATH", str(YOLO_ROOT))
     os.chdir(YOLO_ROOT)
     sys.path.insert(0, str(SCRIPTS))
     os.environ.setdefault("PLATE_WEB_DEVICE", os.environ.get("YOLO_DEVICE", "cpu"))
+    _configure_windows_cpu_paddle_runtime()
 
+    print(f"Using YOLO repo: {YOLO_ROOT}", flush=True)
     print("Loading YOLO models + OCR (first start may take a minute)…", flush=True)
     try:
         from web_api_server import app  # noqa: PLC0415
