@@ -124,12 +124,15 @@ class Nav2Backend:
         map_frame: str = "map",
         cmd_vel_topic: str = "/cmd_vel",
     ) -> None:
-        from action_msgs.msg import GoalStatus
+        import rclpy
+        from action_msgs.msg import GoalStatus, GoalStatusArray
         from geometry_msgs.msg import Twist
         from nav2_msgs.action import NavigateToPose
         from rclpy.action import ActionClient
+        from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
         self._node = node
+        self._rclpy = rclpy
         self._map_frame = map_frame
         self._GoalStatus = GoalStatus
         self._NavigateToPose = NavigateToPose
@@ -138,14 +141,52 @@ class Nav2Backend:
         self._action_name = name if name.startswith("/") else f"/{name}"
         self._client = ActionClient(node, NavigateToPose, self._action_name)
         self._goal_handle = None
+        self._status_by_goal: dict[bytes, int] = {}
+        self._status_stamp_by_goal: dict[bytes, int] = {}
         self._last_cmd = Twist()
         self._cmd_lock = threading.Lock()
-        node.create_subscription(Twist, cmd_vel_topic, self._on_cmd, 10)
+        self._cmd_subscription = node.create_subscription(Twist, cmd_vel_topic, self._on_cmd, 10)
+        status_qos = QoSProfile(depth=10)
+        status_qos.reliability = ReliabilityPolicy.RELIABLE
+        status_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self._status_subscription = node.create_subscription(
+            GoalStatusArray,
+            f"{self._action_name}/_action/status",
+            self._on_status,
+            status_qos,
+        )
         self._node.get_logger().info(f"Nav2 backend action={self._action_name}")
 
     def _on_cmd(self, message) -> None:
         with self._cmd_lock:
             self._last_cmd = message
+
+    def _on_status(self, message) -> None:
+        for item in message.status_list:
+            goal_key = bytes(item.goal_info.goal_id.uuid)
+            status = int(item.status)
+            self._status_by_goal[goal_key] = status
+            stamp = item.goal_info.stamp
+            self._status_stamp_by_goal[goal_key] = stamp.sec * 1_000_000_000 + stamp.nanosec
+            if status in (
+                self._GoalStatus.STATUS_SUCCEEDED,
+                self._GoalStatus.STATUS_ABORTED,
+                self._GoalStatus.STATUS_CANCELED,
+            ):
+                self._node.get_logger().info(
+                    f"NavigateToPose terminal status uuid={goal_key.hex()} status={status}"
+                )
+
+    def _latest_status_after(self, sent_at_ns: int) -> tuple[Optional[bytes], Optional[int]]:
+        candidates = [
+            (stamp, goal_key, self._status_by_goal.get(goal_key))
+            for goal_key, stamp in self._status_stamp_by_goal.items()
+            if stamp >= sent_at_ns - 1_000_000_000
+        ]
+        if not candidates:
+            return None, None
+        _, goal_key, status = max(candidates, key=lambda item: item[0])
+        return goal_key, status
 
     def cancel(self) -> None:
         handle = self._goal_handle
@@ -220,12 +261,24 @@ class Nav2Backend:
         request.pose.pose.position.y = float(goal.y)
         request.pose.pose.orientation.z = math.sin(goal.yaw / 2.0)
         request.pose.pose.orientation.w = math.cos(goal.yaw / 2.0)
+        sent_at_ns = self._node.get_clock().now().nanoseconds
 
         self._node.get_logger().info(
             f"sending NavigateToPose x={goal.x:.2f} y={goal.y:.2f} yaw={goal.yaw:.2f}"
         )
         send_future = self._client.send_goal_async(request)
         while not send_future.done():
+            fallback_key, fallback_status = self._latest_status_after(sent_at_ns)
+            if fallback_key is not None and fallback_status == self._GoalStatus.STATUS_SUCCEEDED:
+                self._node.get_logger().warning(
+                    "NavigateToPose send response stalled; accepted SUCCEEDED from action status topic"
+                )
+                return True
+            if fallback_status in (
+                self._GoalStatus.STATUS_ABORTED,
+                self._GoalStatus.STATUS_CANCELED,
+            ):
+                return False
             if should_cancel():
                 return False
             time.sleep(0.05)
@@ -235,7 +288,22 @@ class Nav2Backend:
             return False
 
         result_future = self._goal_handle.get_result_async()
+        goal_key = bytes(self._goal_handle.goal_id.uuid)
+        self._node.get_logger().info(f"waiting NavigateToPose result uuid={goal_key.hex()}")
         while not result_future.done():
+            action_status = self._status_by_goal.get(goal_key)
+            if action_status == self._GoalStatus.STATUS_SUCCEEDED:
+                self._goal_handle = None
+                self._node.get_logger().warning(
+                    "NavigateToPose result service stalled; accepted SUCCEEDED from action status topic"
+                )
+                return True
+            if action_status in (
+                self._GoalStatus.STATUS_ABORTED,
+                self._GoalStatus.STATUS_CANCELED,
+            ):
+                self._goal_handle = None
+                return False
             if should_cancel():
                 self.cancel()
                 return False

@@ -802,6 +802,17 @@ export async function createApp(services: AppServices = {}) {
     return { goal: result.rows[0] ? gotoDto(result.rows[0]) : null };
   });
 
+  app.get('/api/vehicles/:id/goto/latest', async (request) => {
+    const user = await requireUser(request);
+    const vehicleId = (request.params as { id: string }).id;
+    if (!await canAccessVehicle(user, vehicleId)) throw Object.assign(new Error('Vehicle access denied'), { statusCode: 403 });
+    const result = await db.query<{ id: string; vehicle_id: string; x: number; y: number; yaw: number; status: string; created_at: Date; claimed_at: Date | null; finished_at: Date | null; failure_reason: string | null }>(
+      'SELECT * FROM goto_goals WHERE vehicle_id=$1 ORDER BY created_at DESC LIMIT 1',
+      [vehicleId],
+    );
+    return { goal: result.rows[0] ? gotoDto(result.rows[0]) : null };
+  });
+
   app.post('/api/vehicles/:id/goto', async (request) => {
     const user = await requireUser(request);
     const vehicleId = (request.params as { id: string }).id;
@@ -820,6 +831,12 @@ export async function createApp(services: AppServices = {}) {
       if (response.rowCount) throw Object.assign(new Error('Doorstep response is active'), { statusCode: 409 });
       const lease = await client.query('SELECT 1 FROM control_leases WHERE vehicle_id=$1 AND released_at IS NULL AND expires_at>now() LIMIT 1', [vehicleId]);
       if (lease.rowCount) throw Object.assign(new Error('Manual control lease is active; release console control first'), { statusCode: 409 });
+      const navState = await client.query<NavStateRow>('SELECT * FROM vehicle_nav_state WHERE vehicle_id=$1', [vehicleId]);
+      const status = navState.rows[0] ? navStatusDto(navState.rows[0]) : null;
+      if (!status?.supervisorOnline || !status.gotoOk || !status.ready) {
+        const detail = status?.detail || 'Jetson navigation supervisor is offline';
+        throw Object.assign(new Error(`Navigation is not ready: ${detail}`), { statusCode: 409 });
+      }
       // 新目标覆盖旧活跃目标（贴近 RViz 连续点 Goal）
       await client.query(
         "UPDATE goto_goals SET status='cancelled',finished_at=now(),failure_reason='superseded' WHERE vehicle_id=$1 AND status IN ('queued','navigating','cancellation_requested')",
@@ -963,6 +980,7 @@ export async function createApp(services: AppServices = {}) {
       gotoOk: row.goto_ok,
       nav2Ok: row.nav2_ok,
       bringupOk: row.bringup_ok,
+      navMode: row.nav2_ok ? 'nav2' : row.ready ? 'sim' : 'unknown',
       ready: row.ready && supervisorOnline,
       detail: row.detail,
       updatedAt: row.updated_at.toISOString(),
@@ -1066,6 +1084,10 @@ export async function createApp(services: AppServices = {}) {
        WHERE vehicle_id=$1`,
       [vehicleId, poseOk, gotoOk, nav2Ok, bringupOk, ready, detail, consumedSeq],
     );
+    // A successful navigation heartbeat is authoritative device activity even
+    // before AMCL can publish the first pose. Keep the fleet/device status in
+    // sync with the dedicated navigation status.
+    await db.query('UPDATE vehicles SET last_seen_at=now() WHERE id=$1', [vehicleId]);
     const row = await ensureNavState(vehicleId);
     hub.publishPatrol({ type: 'nav_status', vehicleId, ...navStatusDto(row) });
     return { status: navStatusDto(row) };

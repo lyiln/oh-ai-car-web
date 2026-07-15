@@ -8,12 +8,17 @@ export interface NavStatus {
   gotoOk: boolean;
   nav2Ok: boolean;
   bringupOk: boolean;
+  navMode: 'nav2' | 'sim' | 'unknown';
   ready: boolean;
   detail: string;
   updatedAt?: string;
   pendingInitialPose?: boolean;
   hasInitialPoseOnce?: boolean;
   initialPose?: { x: number; y: number; yaw: number; seq: number } | null;
+}
+
+export function canCreateGoto(status: NavStatus | null | undefined): boolean {
+  return status?.ready === true;
 }
 
 export async function navStatus(vehicleId: string): Promise<NavStatus> {

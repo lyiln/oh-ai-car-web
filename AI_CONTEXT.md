@@ -2,18 +2,19 @@
 
 ## Project State
 
-- **Active handoff:** before further doorstep-response or real-car work, read
-  `NEXT_SESSION.md`, `tasks/code-review-doorstep-response.md`, and
-  `tasks/real-car-doorstep-integration-plan.md`. Stage 0 and the repository
-  deployment/security gate fixes are implemented; the next allowed step is
-  read-only stage 1 hardware/ROS discovery. Physical autonomous motion is not
-  approved yet.
+- **Active handoff:** read `NEXT_SESSION.md` and
+  `docs/architecture/jetson-yahboom-x3-environment-baseline.md` first. The ROS
+  runtime is confirmed inside Docker `oh-ai-nav`, and Web single-goal navigation
+  has passed a suspended-wheel/disabled-drive test. Wheels-on-ground autonomous
+  motion is still not approved; doorstep response remains a separate unfinished
+  flow.
 
 - `oh-ai-car-web` is an independent npm workspace for browser-based smart-car
   control. The original OpenHarmony project is not required to clone, build,
   test, or run this repository.
 - v1 local control is implemented and has automated protocol, gateway, and
-  frontend tests. Controlled real-car validation is still pending.
+  frontend tests. The Nav2 single-goal path has guarded hardware evidence, but
+  the direct TCP `Front` packet conflict and ground-driving validation remain.
 - The **巡牌通 · PatrolPlate** management platform extends the fleet MVP with a
   dark AppShell, React Router pages (dashboard, fleet, console, patrol,
   map, violations, reviews, whitelist, reports, settings), password login and
@@ -37,7 +38,7 @@ Browser UI -> ws://127.0.0.1:8787/control -> local Node gateway -> car TCP :6000
 Browser UI -> direct car video HTTP :6500/index2
 
 Platform browser -> Vite/Nginx -> Fastify API -> PostgreSQL/PostGIS
-ROS2 /gps/fix -> Python edge agent -> HTTPS device telemetry API
+ROS2/Nav2 in Jetson Docker -> Python edge agents -> HTTP(S) device APIs
 Platform browser -> lease -> local gateway -> car TCP :6000
 Platform browser -> /patrol/live WS -> pose_update / patrol_* events
 Device response scheduler -> /device/v1/response/* -> Nav2 pause/goal/resume
@@ -49,6 +50,9 @@ Device response scheduler -> /device/v1/response/* -> Nav2 pause/goal/resume
 - `backend/`: Fastify API, SQL migrations, sessions, leases, telemetry,
   patrol/map/ops routes, audit, and retention cleanup.
 - `edge-agent/`: ROS2 `NavSatFix` to HTTPS telemetry bridge with SQLite outbox.
+- FloorMap navigation additionally uses `nav_supervisor.py`, `pose_agent.py` and
+  `goto_scheduler.py`; it requires manual initial-pose seeding before AMCL can
+  refine/track pose and Nav2 can accept a clicked destination.
 - Network defaults: `192.168.1.11`, TCP `6000`, video `6500`.
 - The gateway accepts only the documented localhost production/Vite Origins and
   permits one controlling browser session at a time.

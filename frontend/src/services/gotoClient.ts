@@ -18,6 +18,15 @@ export async function activeGoto(vehicleId: string): Promise<GotoGoal | null> {
   return result.goal ?? null;
 }
 
+export async function latestGoto(vehicleId: string): Promise<GotoGoal | null> {
+  const result = await apiRequest<{ goal: GotoGoal | null }>(`/api/vehicles/${vehicleId}/goto/latest`);
+  return result.goal ?? null;
+}
+
+export function isGotoActive(goal: GotoGoal | null | undefined): boolean {
+  return Boolean(goal && ['queued', 'navigating', 'cancellation_requested'].includes(goal.status));
+}
+
 export async function createGoto(vehicleId: string, input: { x: number; y: number; yaw?: number }): Promise<GotoGoal> {
   const result = await apiRequest<{ goal: GotoGoal }>(`/api/vehicles/${vehicleId}/goto`, {
     method: 'POST',
