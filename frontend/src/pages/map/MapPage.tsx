@@ -84,7 +84,7 @@ export function MapPage() {
     const [nextMeta, nextDestinations, nextGoal, nextNav, nextZones] = await Promise.all([
       mapClient.basemap(selectedId),
       selectedId ? responseClient.destinations(selectedId) : Promise.resolve([] as ResidentDestination[]),
-      selectedId ? gotoClient.activeGoto(selectedId) : Promise.resolve(null),
+      selectedId ? gotoClient.latestGoto(selectedId) : Promise.resolve(null),
       selectedId ? navClient.navStatus(selectedId) : Promise.resolve(null),
       selectedId ? mapClient.floorZones(selectedId) : Promise.resolve([] as mapClient.FloorMapZone[]),
     ]);
@@ -107,7 +107,7 @@ export function MapPage() {
     if (!selectedId) return undefined;
     const timer = window.setInterval(() => {
       void Promise.all([
-        gotoClient.activeGoto(selectedId).then(setActiveGoal),
+        gotoClient.latestGoto(selectedId).then(setActiveGoal),
         navClient.navStatus(selectedId).then(setNavStatus),
       ]).catch(() => undefined);
     }, 2000);
@@ -121,14 +121,15 @@ export function MapPage() {
     }
     setError('');
     setPendingPoints([]);
-    setMode('goto');
+    setMode('idle');
     try {
       const status = await navClient.prepareNav(selectedId);
       setNavStatus(status);
+      if (navClient.canCreateGoto(status)) setMode('goto');
       setMessage(
         status.ready
           ? '导航已就绪：可点地图前往。若车位不准，先用「设初始位」。'
-          : '已请求车上准备导航，请等待就绪指示灯变绿（需 Jetson 上运行 nav_supervisor）',
+          : '已请求车上准备导航，但当前不可下发目标；请等待 Jetson 导航代理和 Nav2 就绪后重试。',
       );
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '准备导航失败');
@@ -147,8 +148,8 @@ export function MapPage() {
     }
     if (mode === 'goto') {
       if (!selectedId) return setError('请先选择设备');
-      if (navStatus && !navStatus.ready) {
-        setError(`导航未就绪：${navStatus.detail || '等待车上 supervisor'}`);
+      if (!navClient.canCreateGoto(navStatus)) {
+        setError(`导航未就绪：${navStatus?.detail || '等待车上 supervisor'}`);
         return;
       }
       const yaw = pose ? Math.atan2(world.y - pose.y, world.x - pose.x) : 0;
@@ -207,7 +208,7 @@ export function MapPage() {
     void (async () => {
       try {
         // 设位前先清掉活跃前往，否则错误初始位会触发 Nav2 recovery 原地转圈。
-        if (activeGoal) {
+        if (gotoClient.isGotoActive(activeGoal)) {
           await gotoClient.cancelGoto(selectedId, { force: true });
           setActiveGoal(null);
         }
@@ -267,13 +268,13 @@ export function MapPage() {
       const stuck = activeGoal?.status === 'cancellation_requested';
       await gotoClient.cancelGoto(selectedId, { force: stuck });
       setMessage(stuck ? '已强制结束前往' : '已请求取消前往');
-      setActiveGoal(await gotoClient.activeGoto(selectedId));
+      setActiveGoal(await gotoClient.latestGoto(selectedId));
     } catch (reason) {
       // 普通取消失败时再强制一次（代理离线导致卡死）
       try {
         await gotoClient.cancelGoto(selectedId, { force: true });
         setMessage('已强制结束前往');
-        setActiveGoal(await gotoClient.activeGoto(selectedId));
+        setActiveGoal(await gotoClient.latestGoto(selectedId));
         setError('');
       } catch {
         setError(reason instanceof Error ? reason.message : '取消失败');
@@ -325,6 +326,10 @@ export function MapPage() {
   const ready = hasBasemap(meta);
   const clickable = mode === 'mark' || mode === 'goto' || mode === 'zone';
   const navReady = Boolean(navStatus?.ready);
+  const gotoActive = gotoClient.isGotoActive(activeGoal);
+  const queuedSeconds = activeGoal?.status === 'queued' && activeGoal.createdAt
+    ? Math.max(0, Math.floor((Date.now() - new Date(activeGoal.createdAt).getTime()) / 1000))
+    : 0;
 
   return (
     <div className="page map-page">
@@ -412,7 +417,7 @@ export function MapPage() {
             清除轨迹
           </button>
           <button type="button" className="primary" disabled={pendingPoints.length < 3} onClick={openSaveModal}>保存为巡航路线</button>
-          <button type="button" className="secondary" disabled={!activeGoal || !selectedId} onClick={() => void cancelGoto()}>取消前往</button>
+          <button type="button" className="secondary" disabled={!gotoActive || !selectedId} onClick={() => void cancelGoto()}>取消前往</button>
           {isAdmin && <button type="button" className="secondary" onClick={() => setUploadOpen(true)}>上传底图</button>}
         </div>
       </header>
@@ -477,6 +482,7 @@ export function MapPage() {
             <dt>代理</dt><dd>{navStatus?.supervisorOnline ? '在线' : '离线'}</dd>
             <dt>位姿桥</dt><dd>{navStatus?.poseOk ? 'OK' : '—'}</dd>
             <dt>前往调度</dt><dd>{navStatus?.gotoOk ? 'OK' : '—'}</dd>
+            <dt>导航模式</dt><dd>{navStatus?.navMode ?? 'unknown'}</dd>
             <dt>Nav2</dt><dd>{navStatus?.nav2Ok ? 'OK' : '—'}</dd>
             <dt>Bringup</dt><dd>{navStatus?.bringupOk ? 'OK' : '—'}</dd>
             <dt>说明</dt><dd className="muted">{navStatus?.detail || '点「前往模式」会请求准备'}</dd>
@@ -493,6 +499,8 @@ export function MapPage() {
                 ? `${activeGoal.status} (${activeGoal.x.toFixed(2)}, ${activeGoal.y.toFixed(2)})`
                 : '无'}
             </dd>
+            {queuedSeconds >= 5 && <><dt>排队提示</dt><dd className="error">等待 Jetson 调度器领取（已 {queuedSeconds} 秒）</dd></>}
+            {activeGoal?.failureReason && <><dt>失败原因</dt><dd className="error">{activeGoal.failureReason}</dd></>}
             <dt>待保存标点</dt><dd>{pendingPoints.length}</dd>
           </dl>
 

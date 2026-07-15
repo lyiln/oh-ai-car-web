@@ -11,9 +11,9 @@ stop_pidfile() {
     pid="$(cat "$file" 2>/dev/null || true)"
     if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
       echo "stopping $name pid=$pid"
-      kill "$pid" 2>/dev/null || true
+      kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
       sleep 1
-      kill -9 "$pid" 2>/dev/null || true
+      kill -9 -- "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
     fi
     rm -f "$file"
   fi

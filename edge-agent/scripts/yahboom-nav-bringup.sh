@@ -13,6 +13,10 @@ SKIP_DISPLAY="${SKIP_DISPLAY:-1}"
 LOG_DIR="${LOG_DIR:-/tmp/oh-ai-car-nav}"
 ROS_SETUP="${ROS_SETUP:-/opt/ros/foxy/setup.bash}"
 WS_SETUP="${WS_SETUP:-}"
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-30}"
+export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-1}"
+export ROBOT_TYPE="${ROBOT_TYPE:-x3}"
+export RPLIDAR_TYPE="${RPLIDAR_TYPE:-a1}"
 mkdir -p "$LOG_DIR"
 
 run_bg() {
@@ -20,7 +24,7 @@ run_bg() {
   local cmd="$2"
   local log="$3"
   local pidfile="$4"
-  nohup bash -c "
+  nohup setsid bash -c "
     set +u
     [[ -f \"$ROS_SETUP\" ]] && source \"$ROS_SETUP\"
     [[ -n \"$WS_SETUP\" && -f \"$WS_SETUP\" ]] && source \"$WS_SETUP\"
@@ -37,6 +41,7 @@ BRINGUP2="${BRINGUP2:-ros2 launch yahboomcar_nav display_nav_launch.py}"
 NAV_LAUNCH="${NAV_LAUNCH:-ros2 launch yahboomcar_nav navigation_dwa_launch.py map:=${MAP_YAML}}"
 
 echo "[bringup] MAP_YAML=$MAP_YAML"
+echo "[bringup] ROS_DOMAIN_ID=$ROS_DOMAIN_ID ROS_LOCALHOST_ONLY=$ROS_LOCALHOST_ONLY ROBOT_TYPE=$ROBOT_TYPE RPLIDAR_TYPE=$RPLIDAR_TYPE"
 run_bg "laser" "$BRINGUP1" "$LOG_DIR/bringup1.log" "$LOG_DIR/bringup1.pid"
 sleep 3
 

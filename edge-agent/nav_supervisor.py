@@ -124,16 +124,22 @@ class InitialPosePublisher:
         self._node = None
         self._pub = None
         self._ok = False
+        self._tf_buffer = None
         try:
             import rclpy
             from geometry_msgs.msg import PoseWithCovarianceStamped
             from rclpy.node import Node
+            from rclpy.time import Time
+            from tf2_ros import Buffer, TransformListener
 
             if not rclpy.ok():
                 rclpy.init()
             self._PoseWithCovarianceStamped = PoseWithCovarianceStamped
+            self._Time = Time
             self._node = Node("oh_ai_car_initial_pose")
             self._pub = self._node.create_publisher(PoseWithCovarianceStamped, topic, 10)
+            self._tf_buffer = Buffer()
+            self._tf_listener = TransformListener(self._tf_buffer, self._node, spin_thread=False)
             self._executor_stop = threading.Event()
 
             def spin() -> None:
@@ -149,6 +155,16 @@ class InitialPosePublisher:
     @property
     def ok(self) -> bool:
         return self._ok
+
+    @property
+    def localized(self) -> bool:
+        if self._tf_buffer is None or self._node is None:
+            return False
+        try:
+            self._tf_buffer.lookup_transform("map", "base_footprint", self._Time())
+            return True
+        except Exception:
+            return False
 
     def publish(self, x: float, y: float, yaw: float) -> bool:
         if not self._ok or self._pub is None or self._node is None:
@@ -336,9 +352,12 @@ class NavSupervisor:
         else:
             goto_ok = self.goto_child.alive()
             if bringup_ok or self.assume_bringup:
-                nav2_ok = self.nav2_probe.ready()
-                if not nav2_ok:
+                action_ready = self.nav2_probe.ready()
+                nav2_ok = action_ready and self.pose_pub.localized
+                if not action_ready:
                     detail_parts.append(f"NavigateToPose '{self.action_name}' not ready yet")
+                elif not self.pose_pub.localized:
+                    detail_parts.append("AMCL localization not ready; set initial pose and wait for map transform")
             if self.assume_bringup and not bringup_ok:
                 bringup_ok = True
 

@@ -1,15 +1,46 @@
 # Web Control Real-Car Validation
 
-Status: Stage 1 read-only discoveries performed on 2026-07-12 and 2026-07-14.
-Unit and fake-TCP tests do not prove vehicle behavior; no movement, Nav2 goal,
-TCP command, Docker start or `/cmd_vel` publication was sent during these
-discoveries.
+Status: Stage 1 read-only discovery was performed on 2026-07-12 and 2026-07-14;
+ROS/Nav2 container recovery and a guarded suspended-wheel/disabled-drive goal
+test were completed on 2026-07-15. Unit and fake-TCP tests still do not prove
+vehicle behavior, and the 2026-07-15 result is not a ground-driving acceptance.
 
-Doorstep-response Web stage 0 is complete at commit `7ebcabc`. This does not
-authorize physical motion. Complete the stage 1 inventory below before writing
-or starting the ROS response scheduler.
+Doorstep-response Web stage 0 is complete at commit `7ebcabc`. The Web single-goal
+path is now connected to Nav2, but this does not authorize autonomous motion with
+the wheels on the ground. The ROS response scheduler remains separate and
+unimplemented.
 
-## Stage 1 Environment Inventory (Read-only)
+## 2026-07-15 Guarded Navigation Record
+
+Test preconditions supplied by the operator: wheels suspended or drive disabled,
+a person on site, and emergency stop available. The test used the current vehicle
+at `10.82.66.179`; secrets are intentionally omitted.
+
+| Check | Observed result |
+| --- | --- |
+| Runtime architecture | Host has no ROS installation. ROS 2 Foxy/Nav2 runs in persistent Docker container `oh-ai-nav`; host Rosmaster-App was stopped to avoid serial/video contention. |
+| ROS inputs | `/vel_raw`, `/odom_raw`, `/odom` about 25 Hz; `/scan` about 8.5 Hz. |
+| Localization/navigation | `odom -> base_footprint`, `map -> base_footprint`, and `/navigate_to_pose` Action server observed. |
+| Short goal within tolerance | About 0.15 m; Nav2 returned success without meaningful velocity output. |
+| Motion-producing suspended-wheel goal | About 0.4 m; non-zero command reached about 0.22 m/s, then returned to zero; Nav2 returned success. |
+| Platform result path | After the scheduler fix, a final goal progressed `queued -> navigating -> arrived`; Nav2 terminal status was `SUCCEEDED`. |
+
+Two runtime faults were found and repaired: Fast DDS discovery was unstable on
+the multi-NIC host until the single-container graph used `ROS_LOCALHOST_ONLY=1`,
+and Foxy Action completion could remain pending when the Executor started before
+the ActionClient/subscriptions were created. Current readiness also requires a
+valid `map -> base_footprint` in the current supervisor lifetime.
+
+Remaining Stage D evidence: wheels-on-ground low-speed/short-distance behavior,
+map alignment accuracy, obstacle avoidance, stop distance, localization recovery,
+cancel/emergency-stop response, and repeated-route reliability.
+
+## Historical Stage 1 Environment Inventory (Read-only)
+
+The table below preserves what was known before the 2026-07-15 container start.
+Where it conflicts with the guarded navigation record or the
+[current environment baseline](../architecture/jetson-yahboom-x3-environment-baseline.md),
+the newer dated evidence takes precedence.
 
 Fill every known value from actual commands or labels. Write `unknown` when a
 value cannot be observed; do not guess.
@@ -36,7 +67,7 @@ value cannot be observed; do not guess.
 | Platform host reachable from vehicle | not tested; platform host was not provided | network inventory | pending |
 | Clock synchronization | Jetson reports `2026-07-12T13:10:23+08:00`; host comparison not recorded | `date -Is` | partial |
 
-## Stage 1 Discovery Result
+## Historical Stage 1 Discovery Result
 
 The Jetson is reachable and has connected RPLidar, Orbbec depth and two video
 devices. Its **host** is not a runnable ROS/Nav2 environment: `/opt/ros` is
@@ -47,17 +78,15 @@ can start. The source contains a Yahboom X3 bringup and RTAB-Map/DWA/TEB
 configuration, including Nav2-style parameters, but the candidate map YAMLs
 still contain a stale `/root/...` image path.
 
-Do not proceed to the response scheduler, simulator, or any physical-motion
-stage. First obtain approval for a separate non-motion Docker-runtime and
-architecture check: verify the current USB mappings, start the selected vendor
-container, select an exact map and repair its paths, then prove the live graph,
-lifecycle, topics, battery conversion and hardware emergency stop while the
-drivetrain remains disabled.
+This paragraph described the 2026-07-14 gate. The Docker-runtime and guarded
+non-ground navigation check were subsequently completed on 2026-07-15 as
+recorded above. It does not remove the Stage D ground-test gate or authorize the
+doorstep-response scheduler.
 
-Stage 1 permits only network reachability, ROS graph/topic/type inspection,
-Nav2 lifecycle inspection, configuration-file reading, video-page loading and
-device-credential authentication. Do not publish `/cmd_vel`, send a Nav2 goal,
-or send movement packets during this inventory.
+At that historical Stage 1 gate, only network reachability, ROS graph/topic/type
+inspection, Nav2 lifecycle inspection, configuration-file reading,
+video-page loading and device-credential authentication were permitted. The
+later guarded goal test used the separately stated 2026-07-15 safety conditions.
 
 Before testing, ensure the vehicle has a clear stopping area and an operator
 can immediately stop power or motion. Validate the connection, each button

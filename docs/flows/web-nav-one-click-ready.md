@@ -23,9 +23,18 @@ Jetson nav_supervisor 轮询 /device/v1/nav/state
 2. 登记车辆、上传与车上一致的底图、签发设备凭据
 3. 防火墙放行 `8788`；记下 PC 局域网 IP
 
+## 2026-07-15 现场确认
+
+- ROS 2 Foxy/Nav2 在 Docker 容器 `oh-ai-nav` 中，不在 Jetson 宿主系统中。
+- 宿主的 `ros`/`run` 启动的是 `/home/jetson/Rosmaster-App/rosmaster` Python App；它会与 ROS 容器争用串口和摄像头，不能并行运行。
+- 当前容器必须使用 `ROS_DOMAIN_ID=30`、`ROS_LOCALHOST_ONLY=1`、`ROBOT_TYPE=x3`、`RPLIDAR_TYPE=a1`。
+- `ready` 不只检查 Action server，还检查 AMCL 已形成 `map -> base_footprint`；未设初始位时 Web 不应允许发送目标。
+- 详细环境和已完成的悬空轮验证见 [Jetson 现场环境基线](../architecture/jetson-yahboom-x3-environment-baseline.md)。
+
 ## Jetson 最省事（推荐）
 
-进容器后**一条命令**（后台起激光+Nav2，前台跑代理）：
+进容器后**一条命令**（起激光+Nav2，随后立即起代理，使 Web 可在 Action
+完全就绪前设置初始位；脚本最终前台守护代理）：
 
 ```bash
 cd /tmp/edge-agent
@@ -39,7 +48,7 @@ bash ~/oh-ai-car-web/edge-agent/scripts/host-start-all.sh <容器名>
 ```
 
 停止导航后台：`bash /tmp/edge-agent/scripts/stop-yahboom-nav.sh`  
-换热点：只改 `agent.env` 里 `PLATFORM_API_URL`，再跑 `start_all_nav.sh`。
+换热点：检查 `agent.env` 里 `PLATFORM_API_URL`，再跑 `start_all_nav.sh`。`agent.env` 还包含设备凭据和 ROS 参数；不要提交真实凭据。
 
 网页仍要：**设初始位** → 前往模式 → 点目标。
 
@@ -80,7 +89,7 @@ bash start_nav_agent.sh
 export PLATFORM_API_URL=http://<PC局域网IP>:8788
 export DEVICE_CREDENTIAL='<uuid.secret>'
 export NAV_MODE=nav2
-export MAP_VERSION=yahboomcar          # 与 Web 上传底图的「地图版本」尽量一致
+export MAP_VERSION=floor-map-v1        # 与当前 Web 底图版本一致
 export NAV_ASSUME_BRINGUP=true         # 告诉 Web：Nav2 你已手动拉起
 export EDGE_AGENT_DIR=/path/to/edge-agent
 export MAP_YAML=/root/yahboomcar_ros2_ws/yahboomcar_ws/src/yahboomcar_nav/maps/yahboomcar.yaml
@@ -123,7 +132,10 @@ export BRINGUP2='你的n2真实命令'
 
 ### Web 底图
 
-用车上同一份 `yahboomcar.yaml` 的 `resolution` / `origin`，PNG 由对应 `yahboomcar.pgm` 转换；地图版本建议填 `yahboomcar`。
+用车上同一份 `yahboomcar.yaml` 的 `resolution` / `origin`，PNG 由对应
+`yahboomcar.pgm` 转换。当前现场基线为 `resolution=0.05`、
+`origin=[-10.5,-24.8,0]`、`1088 x 896`，Web/代理版本标签为
+`floor-map-v1`。
 
 ## 浏览器操作顺序
 
@@ -143,7 +155,7 @@ export BRINGUP2='你的n2真实命令'
 | poseOk / gotoOk | 位姿桥、前往调度子进程在跑 |
 | nav2Ok | `NavigateToPose` action 可连 |
 | bringupOk | bringup 命令成功或 `NAV_ASSUME_BRINGUP` |
-| ready | 代理在线且 pose+goto+(nav2\|bringup) |
+| ready | 代理在线、pose/goto/bringup 正常、Nav2 Action 可用，且已建立 `map -> base_footprint` |
 
 ## 安全
 

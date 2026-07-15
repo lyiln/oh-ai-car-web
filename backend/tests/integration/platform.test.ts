@@ -143,6 +143,76 @@ beforeEach(async () => {
 });
 
 describe('platform API against PostGIS', () => {
+  it('refreshes vehicle presence from a navigation supervisor heartbeat', async () => {
+    const adminCookie = await login('admin', defaultPassword);
+    const vehicle = await app.inject({
+      method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie },
+      payload: { code: `CAR-NAV-${randomUUID().slice(0, 8)}`, name: '导航心跳测试车', host: '192.168.1.91', tcpPort: 6000, videoPort: 6500 },
+    });
+    expect(vehicle.statusCode).toBe(200);
+    const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
+    const credential = await app.inject({
+      method: 'POST', url: `/api/vehicles/${vehicleId}/device-credentials`, headers: { origin, cookie: adminCookie },
+    });
+    const token = credential.json<{ credential: { token: string } }>().credential.token;
+
+    const heartbeat = await app.inject({
+      method: 'POST', url: '/device/v1/nav/status', headers: { authorization: `Bearer ${token}` },
+      payload: { poseOk: true, gotoOk: true, nav2Ok: false, bringupOk: true, navMode: 'nav2', detail: 'waiting for initial pose' },
+    });
+    expect(heartbeat.statusCode).toBe(200);
+    expect(heartbeat.json()).toMatchObject({ status: { supervisorOnline: true, ready: false } });
+
+    const current = await app.inject({ method: 'GET', url: `/api/vehicles/${vehicleId}`, headers: { cookie: adminCookie } });
+    expect(current.statusCode).toBe(200);
+    expect(current.json<{ vehicle: { lastSeenAt: string | null } }>().vehicle.lastSeenAt).not.toBeNull();
+  });
+
+  it('rejects goto while Jetson navigation is unavailable and preserves the latest failure', async () => {
+    const adminCookie = await login('admin', defaultPassword);
+    const vehicle = await app.inject({
+      method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie },
+      payload: { code: `CAR-GOTO-${randomUUID().slice(0, 8)}`, name: '前往测试车', host: '192.168.1.90', tcpPort: 6000, videoPort: 6500 },
+    });
+    expect(vehicle.statusCode).toBe(200);
+    const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
+
+    const blocked = await app.inject({
+      method: 'POST', url: `/api/vehicles/${vehicleId}/goto`, headers: { origin, cookie: adminCookie },
+      payload: { x: 1.5, y: -2.25, yaw: 0.5 },
+    });
+    expect(blocked.statusCode).toBe(409);
+    expect(blocked.json<{ error: string }>().error).toContain('Navigation is not ready');
+
+    await db.query(
+      `INSERT INTO vehicle_nav_state (vehicle_id,supervisor_seen_at,pose_ok,goto_ok,nav2_ok,bringup_ok,ready,detail)
+       VALUES ($1,now(),true,true,true,true,true,'NavigateToPose ready')
+       ON CONFLICT (vehicle_id) DO UPDATE SET
+         supervisor_seen_at=now(),pose_ok=true,goto_ok=true,nav2_ok=true,bringup_ok=true,ready=true,detail='NavigateToPose ready'`,
+      [vehicleId],
+    );
+    const created = await app.inject({
+      method: 'POST', url: `/api/vehicles/${vehicleId}/goto`, headers: { origin, cookie: adminCookie },
+      payload: { x: 1.5, y: -2.25, yaw: 0.5 },
+    });
+    expect(created.statusCode).toBe(200);
+    const goalId = created.json<{ goal: { id: string; status: string } }>().goal.id;
+
+    const credential = await app.inject({ method: 'POST', url: `/api/vehicles/${vehicleId}/device-credentials`, headers: { origin, cookie: adminCookie } });
+    const token = credential.json<{ credential: { token: string } }>().credential.token;
+    const claimed = await app.inject({ method: 'GET', url: '/device/v1/goto/next', headers: { authorization: `Bearer ${token}` } });
+    expect(claimed.json<{ goal: { id: string } }>().goal.id).toBe(goalId);
+    const failed = await app.inject({
+      method: 'POST', url: `/device/v1/goto/${goalId}/events`, headers: { authorization: `Bearer ${token}` },
+      payload: { type: 'failed', reason: 'NavigateToPose unavailable' },
+    });
+    expect(failed.statusCode).toBe(200);
+
+    const latest = await app.inject({ method: 'GET', url: `/api/vehicles/${vehicleId}/goto/latest`, headers: { cookie: adminCookie } });
+    expect(latest.statusCode).toBe(200);
+    expect(latest.json()).toMatchObject({ goal: { id: goalId, status: 'failed', failureReason: 'NavigateToPose unavailable' } });
+  });
+
   it('migrates duplicate persistent sessions back to one expiring lease', async () => {
     const client = await db.pool.connect();
     try {

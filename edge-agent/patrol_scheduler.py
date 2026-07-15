@@ -110,6 +110,7 @@ class PatrolScheduler:
 
     def _build_nav(self):
         if self.nav_mode == "nav2":
+            import threading
             import rclpy
             from rclpy.executors import SingleThreadedExecutor
             from rclpy.node import Node
@@ -120,14 +121,7 @@ class PatrolScheduler:
             self._ros_executor = SingleThreadedExecutor()
             self._ros_executor.add_node(self._node)
 
-            def spin() -> None:
-                while rclpy.ok():
-                    self._ros_executor.spin_once(timeout_sec=0.05)
-
-            import threading
-            threading.Thread(target=spin, daemon=True).start()
-
-        return create_nav_backend(
+        nav = create_nav_backend(
             self.nav_mode,
             platform_api_url=os.environ["PLATFORM_API_URL"],
             device_credential=os.environ["DEVICE_CREDENTIAL"],
@@ -137,6 +131,13 @@ class PatrolScheduler:
             cmd_vel_topic=self.cmd_vel_topic,
             travel_seconds=self.travel_seconds,
         )
+        if self._ros_executor is not None:
+            def spin() -> None:
+                while rclpy.ok():
+                    self._ros_executor.spin_once(timeout_sec=0.05)
+
+            threading.Thread(target=spin, daemon=True).start()
+        return nav
 
     def _should_cancel(self, task_id: str) -> bool:
         if self._cancel_requested:

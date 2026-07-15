@@ -83,15 +83,7 @@ class GotoScheduler:
             self._ros_executor = SingleThreadedExecutor()
             self._ros_executor.add_node(self._node)
 
-            def spin() -> None:
-                while rclpy.ok():
-                    self._ros_executor.spin_once(timeout_sec=0.05)
-
-            threading.Thread(target=spin, daemon=True).start()
-            # Give DDS discovery a moment before ActionClient attaches.
-            time.sleep(2.0)
-
-        return create_nav_backend(
+        nav = create_nav_backend(
             self.nav_mode,
             platform_api_url=os.environ["PLATFORM_API_URL"],
             device_credential=os.environ["DEVICE_CREDENTIAL"],
@@ -102,6 +94,14 @@ class GotoScheduler:
             travel_seconds=self.travel_seconds,
             action_name=os.environ.get("NAV2_ACTION", "/navigate_to_pose"),
         )
+        if self._ros_executor is not None:
+            def spin() -> None:
+                while rclpy.ok():
+                    self._ros_executor.spin_once(timeout_sec=0.05)
+
+            threading.Thread(target=spin, daemon=True).start()
+            time.sleep(2.0)
+        return nav
 
     def _should_cancel(self, goal_id: str) -> bool:
         try:

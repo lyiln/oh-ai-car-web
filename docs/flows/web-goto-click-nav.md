@@ -21,9 +21,21 @@ npm run sim:goto -- <uuid.secret> http://127.0.0.1:8788
 
 取消：点 **取消前往**。
 
-## 真车（Nav2，需阶段 D 门禁）
+## 真车当前能力边界
 
-车上仍按手册启动 `navigation_dwa/teb`，并用 RViz **2D Pose Estimate** 设初始位姿（Web 不做这一步）。
+当前 Web 已支持在 FloorMap 上设初始位，不再要求只能通过 RViz 操作。完整顺序是：
+
+1. 加载与车端 `yaml/pgm` 坐标一致的 Web 底图（分辨率、原点、地图版本必须匹配）。
+2. 在 FloorMap 用“设初始位”点选车辆的大致真实位置和朝向。
+3. 车端 supervisor 向 `/initialpose` 发布；AMCL 用雷达扫描与既有地图匹配，细化并持续跟踪位姿。
+4. 等 `map -> base_footprint` 和 `NavigateToPose` 都就绪。
+5. 切到“前往模式”点目标，车端调用 Nav2 `NavigateToPose`。
+
+因此：**对已经保存并正确登记的地图，可以“人工给初值 → AMCL 自动校准/跟踪 → 点终点导航”**。当前还不能在完全不知道初始位置时，仅凭一次雷达扫描自动识别车辆处于地图的哪个位置。
+
+如果“雷达扫描后的图”指刚用 SLAM 新建的地图，当前也不会自动把它同步到 FloorMap。必须先保存对应 `yaml + pgm/png`，把 `resolution`、`origin` 和版本登记到 Web，并切换到定位/导航模式。实时建图、地图上传/版本注册、建图到导航的模式切换、全局重定位仍是后续能力。
+
+车端运行方式见 [真车一键导航就绪](web-nav-one-click-ready.md) 和 [Jetson 现场环境基线](../architecture/jetson-yahboom-x3-environment-baseline.md)。
 
 ```bash
 export PLATFORM_API_URL=https://<platform>
@@ -34,7 +46,7 @@ python3 edge-agent/pose_agent.py   # 可选：单独上报 /amcl_pose
 python3 edge-agent/goto_scheduler.py
 ```
 
-`goto_scheduler` 在 `NAV_MODE=nav2` 时调用与巡航相同的 `NavigateToPose`。轮子着地前须完成 [patrol-stage-d-real-car.md](patrol-stage-d-real-car.md) D0–D1。
+`goto_scheduler` 在 `NAV_MODE=nav2` 时调用与巡航相同的 `NavigateToPose`。2026-07-15 已在车轮悬空或驱动禁用条件下验证短目标和结果回传；轮子着地前仍须完成 [patrol-stage-d-real-car.md](patrol-stage-d-real-car.md) D0–D1。
 
 ## API 摘要
 
