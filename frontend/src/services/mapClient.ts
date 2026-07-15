@@ -84,3 +84,46 @@ export async function updateZone(id: string, patch: Partial<MapZone>): Promise<M
 export async function deleteZone(id: string): Promise<{ ok: true }> {
   return apiRequest<{ ok: true }>(`/api/map/zones/${id}`, { method: 'DELETE' });
 }
+
+export interface FloorMapZone {
+  id: string;
+  vehicleId: string;
+  mapVersion: string;
+  name: string;
+  active: boolean;
+  ring: Array<[number, number]>;
+}
+
+export async function floorZones(vehicleId: string, mapVersion?: string): Promise<FloorMapZone[]> {
+  const qs = mapVersion ? `?mapVersion=${encodeURIComponent(mapVersion)}` : '';
+  const result = await apiRequest<{ zones: FloorMapZone[] }>(`/api/vehicles/${vehicleId}/floor-zones${qs}`);
+  return result.zones ?? [];
+}
+
+export async function createFloorZone(
+  vehicleId: string,
+  input: { name: string; mapVersion: string; ring: Array<[number, number]> },
+): Promise<FloorMapZone> {
+  const result = await apiRequest<{ zone: FloorMapZone }>(`/api/vehicles/${vehicleId}/floor-zones`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+  return result.zone;
+}
+
+export async function deleteFloorZone(vehicleId: string, zoneId: string): Promise<{ ok: true }> {
+  return apiRequest<{ ok: true }>(`/api/vehicles/${vehicleId}/floor-zones/${zoneId}`, { method: 'DELETE' });
+}
+
+export async function checkFloorNoParking(
+  vehicleId: string,
+  mapVersion?: string,
+): Promise<{
+  inNoParking: boolean;
+  reason: string;
+  pose: { x: number; y: number; mapVersion: string; occurredAt: string } | null;
+  zone: { id: string; name: string } | null;
+}> {
+  const qs = mapVersion ? `?mapVersion=${encodeURIComponent(mapVersion)}` : '';
+  return apiRequest(`/api/vehicles/${vehicleId}/floor-zones/check${qs}`);
+}

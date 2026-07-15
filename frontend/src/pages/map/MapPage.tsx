@@ -15,7 +15,7 @@ import { usePoseStream } from '../../hooks/usePoseStream.js';
 import { useSelectedDevice } from '../../contexts/SelectedDeviceContext.js';
 import { useAuth } from '../../contexts/AuthContext.js';
 
-type MapMode = 'idle' | 'mark' | 'goto' | 'setPose';
+type MapMode = 'idle' | 'mark' | 'goto' | 'setPose' | 'zone';
 
 function computeYaw(points: WorldPoint[], index: number): number {
   const from = points[index];
@@ -64,6 +64,9 @@ export function MapPage() {
   const [activeGoal, setActiveGoal] = useState<GotoGoal | null>(null);
   const [navStatus, setNavStatus] = useState<NavStatus | null>(null);
   const [lastInitialPose, setLastInitialPose] = useState<{ x: number; y: number; yaw: number } | null>(null);
+  const [floorZones, setFloorZones] = useState<mapClient.FloorMapZone[]>([]);
+  const [draftZone, setDraftZone] = useState<WorldPoint[]>([]);
+  const [zoneName, setZoneName] = useState('禁停区');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
 
@@ -78,16 +81,20 @@ export function MapPage() {
   const { pose, trail, connected, clearTrail, seedPose } = usePoseStream(selectedId);
 
   const refresh = async () => {
-    const [nextMeta, nextDestinations, nextGoal, nextNav] = await Promise.all([
+    const [nextMeta, nextDestinations, nextGoal, nextNav, nextZones] = await Promise.all([
       mapClient.basemap(selectedId),
       selectedId ? responseClient.destinations(selectedId) : Promise.resolve([] as ResidentDestination[]),
       selectedId ? gotoClient.latestGoto(selectedId) : Promise.resolve(null),
       selectedId ? navClient.navStatus(selectedId) : Promise.resolve(null),
+      selectedId ? mapClient.floorZones(selectedId) : Promise.resolve([] as mapClient.FloorMapZone[]),
     ]);
     setMeta(nextMeta);
     setDestinations(nextDestinations.map((item) => ({ id: item.id, displayName: item.displayName, x: item.x, y: item.y })));
     setActiveGoal(nextGoal);
     setNavStatus(nextNav);
+    setFloorZones(nextMeta?.mapVersion
+      ? nextZones.filter((zone) => zone.mapVersion === nextMeta.mapVersion)
+      : nextZones);
     if (nextMeta?.mapVersion && !routeMapVersion) setRouteMapVersion(nextMeta.mapVersion);
   };
 
@@ -134,6 +141,11 @@ export function MapPage() {
       setPendingPoints((current) => [...current, world]);
       return;
     }
+    if (mode === 'zone') {
+      setDraftZone((current) => [...current, world]);
+      setMessage(`禁停区顶点 ${draftZone.length + 1}（至少 3 点，双击或点「完成禁停区」闭合）`);
+      return;
+    }
     if (mode === 'goto') {
       if (!selectedId) return setError('请先选择设备');
       if (!navClient.canCreateGoto(navStatus)) {
@@ -149,6 +161,36 @@ export function MapPage() {
           setMessage(`已下发前往目标 (${world.x.toFixed(2)}, ${world.y.toFixed(2)})`);
         })
         .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : '下发前往失败'));
+    }
+  };
+
+  const finishZone = async () => {
+    if (!selectedId || !meta) return setError('请先选择设备并加载底图');
+    if (draftZone.length < 3) return setError('禁停区至少需要 3 个顶点');
+    setError('');
+    try {
+      await mapClient.createFloorZone(selectedId, {
+        name: zoneName.trim() || '禁停区',
+        mapVersion: meta.mapVersion,
+        ring: draftZone.map((point) => [point.x, point.y] as [number, number]),
+      });
+      setDraftZone([]);
+      setMode('idle');
+      setMessage('禁停区已保存；控制台识别提交违规时会用小车位姿判定是否在区内');
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '保存禁停区失败');
+    }
+  };
+
+  const removeFloorZone = async (zoneId: string) => {
+    if (!selectedId) return;
+    try {
+      await mapClient.deleteFloorZone(selectedId, zoneId);
+      setMessage('已删除禁停区');
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '删除失败');
     }
   };
 
@@ -282,7 +324,7 @@ export function MapPage() {
   }, [pose]);
 
   const ready = hasBasemap(meta);
-  const clickable = mode === 'mark' || mode === 'goto';
+  const clickable = mode === 'mark' || mode === 'goto' || mode === 'zone';
   const navReady = Boolean(navStatus?.ready);
   const gotoActive = gotoClient.isGotoActive(activeGoal);
   const queuedSeconds = activeGoal?.status === 'queued' && activeGoal.createdAt
@@ -323,10 +365,44 @@ export function MapPage() {
             type="button"
             className={mode === 'mark' ? 'primary' : 'secondary'}
             disabled={!ready}
-            onClick={() => setMode((value) => (value === 'mark' ? 'idle' : 'mark'))}
+            onClick={() => {
+              setMode((value) => (value === 'mark' ? 'idle' : 'mark'));
+              setDraftZone([]);
+            }}
           >
             {mode === 'mark' ? '退出标点' : '标点模式'}
           </button>
+          {isAdmin && (
+            <button
+              type="button"
+              className={mode === 'zone' ? 'primary' : 'secondary'}
+              disabled={!ready || !selectedId}
+              onClick={() => {
+                setMode((value) => (value === 'zone' ? 'idle' : 'zone'));
+                setPendingPoints([]);
+                setDraftZone([]);
+                setMessage(mode === 'zone' ? '' : '单击加点，至少 3 点后双击或点「完成禁停区」');
+              }}
+            >
+              {mode === 'zone' ? '退出绘制禁停' : '绘制禁停区'}
+            </button>
+          )}
+          {mode === 'zone' && (
+            <>
+              <input
+                value={zoneName}
+                onChange={(event) => setZoneName(event.target.value)}
+                placeholder="禁停区名称"
+                style={{ maxWidth: 140 }}
+              />
+              <button type="button" className="secondary" disabled={draftZone.length < 3} onClick={() => void finishZone()}>
+                完成禁停区
+              </button>
+              <button type="button" className="secondary" disabled={!draftZone.length} onClick={() => setDraftZone((c) => c.slice(0, -1))}>
+                撤销顶点
+              </button>
+            </>
+          )}
           <button type="button" className="secondary" disabled={!pendingPoints.length} onClick={undoPending}>撤销</button>
           <button type="button" className="secondary" disabled={!pendingPoints.length} onClick={clearPending}>清除标点</button>
           <button
@@ -372,9 +448,19 @@ export function MapPage() {
               pendingPoints={pendingPoints}
               goal={activeGoal}
               initialPose={lastInitialPose}
+              zones={floorZones.map((zone) => ({
+                id: zone.id,
+                name: zone.name,
+                active: zone.active,
+                ring: zone.ring.map(([x, y]) => ({ x, y })),
+              }))}
+              draftZone={draftZone}
               clickable={clickable}
               poseEstimate={mode === 'setPose'}
               onMapClick={onMapClick}
+              onMapDoubleClick={() => {
+                if (mode === 'zone' && draftZone.length >= 3) void finishZone();
+              }}
               onPoseEstimate={onPoseEstimate}
             />
           ) : (
@@ -417,6 +503,25 @@ export function MapPage() {
             {activeGoal?.failureReason && <><dt>失败原因</dt><dd className="error">{activeGoal.failureReason}</dd></>}
             <dt>待保存标点</dt><dd>{pendingPoints.length}</dd>
           </dl>
+
+          <h3 className="mt-16">楼道禁停区</h3>
+          {floorZones.length === 0 ? (
+            <p className="muted">暂无。管理员可点「绘制禁停区」在底图上框选。</p>
+          ) : (
+            <ul className="event-stream">
+              {floorZones.map((zone) => (
+                <li key={zone.id}>
+                  {zone.name}（{zone.ring.length} 点）
+                  {isAdmin && (
+                    <>
+                      {' '}
+                      <button type="button" className="secondary" onClick={() => void removeFloorZone(zone.id)}>删除</button>
+                    </>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
 
           <h3 className="mt-16">一层住户目的地</h3>
           {destinations.length === 0 ? <div className="empty-state">当前设备暂无住户目的地</div> : (

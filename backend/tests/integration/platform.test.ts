@@ -79,7 +79,7 @@ beforeAll(async () => {
     await waitForDatabase(db);
     await Promise.all([db.migrate(), secondMigrator.migrate()]);
     const migrations = await db.query<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version');
-    expect(migrations.rows).toHaveLength(24);
+    expect(migrations.rows).toHaveLength(25);
     expect(new Set(migrations.rows.map((row) => row.version))).toEqual(new Set([
       '001',
       '002-patrol-inspection',
@@ -105,6 +105,7 @@ beforeAll(async () => {
       '020-vehicle-nav-state',
       '021-persistent-control-sessions',
       '022-twenty-minute-control-leases',
+      '023-floor-map-zones',
     ]));
   } finally {
     await secondMigrator.close();
