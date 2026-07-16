@@ -28,6 +28,15 @@ Waypoint and observation events are rejected during cancellation and after a
 terminal state. The platform lease verifier rejects manual gateway connection
 while a task is queued, running, or awaiting this confirmation.
 
+## Violation notification
+
+- Qualified observations are idempotently written to `violations`; no-parking
+  takes precedence and outside-zone whitelist matches are not violations.
+- `POST /api/response-tasks/:id/confirm` confirms a notification-only task and
+  sends WxPusher without assigning a vehicle.
+- `POST /api/response-tasks/:id/retry-push` refreshes the current WxPusher UID
+  and retries a confirmed notification.
+
 This is an interface-level safety control. It is not evidence that a physical
 vehicle has stopped; real-car Nav2 cancellation and zero-velocity validation
 remain required.

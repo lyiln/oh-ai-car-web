@@ -53,8 +53,10 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
   const displayVideoRef = useRef<HTMLVideoElement | null>(null);
   const displayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const displayStreamRef = useRef<MediaStream | null>(null);
+  const autoSubmittedRef = useRef(new Map<string, number>());
 
   const [tab, setTab] = useState<PlatePanelTab>('live');
+  const manualSubmission = tab === 'image' || tab === 'video';
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
 
@@ -288,7 +290,7 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
         plate: violationCandidate.plate,
         confidence: violationCandidate.confidence,
         jpegBase64,
-        waypoint: '控制台识别测试',
+        waypoint: '控制台手动识别',
       });
       const np = created.noParking;
       const noParkingLabel = np?.inNoParking
@@ -296,12 +298,14 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
         : np?.reason === 'no_recent_pose'
           ? '未判禁停（无近时位姿）'
           : '不在禁停区';
-      setSubmitOk({
+      if (!created.recorded || !created.violation) {
+        setSubmitError(created.message ?? (created.reason === 'pending_review' ? '已进入待人工审核，暂未生成违规' : '识别结果无需记录违规'));
+      } else setSubmitOk({
         id: created.violation.id,
         plate: created.violation.plate,
         evidenceUrl: created.violation.evidenceUrl,
-        eventId: created.review.eventId,
-        noParkingLabel,
+        eventId: created.review?.eventId,
+        noParkingLabel: created.deduplicated ? `已去重 · ${noParkingLabel}` : noParkingLabel,
       });
     } catch (reason) {
       setSubmitError(reason instanceof Error ? reason.message : '添加到违规车辆失败');
@@ -309,6 +313,39 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
       setSubmitBusy(false);
     }
   }, [vehicleId, violationCandidate]);
+
+  const autoSubmitRecognition = useCallback(async (result: InferResponse, blob: Blob, source: string) => {
+    const plate = normalizePlateText(result.bestPlateResult?.plate_text);
+    if (!vehicleId || !plate || !result.plateDetected) return;
+    const now = Date.now();
+    const previous = autoSubmittedRef.current.get(plate) ?? 0;
+    if (now - previous < 10_000) return;
+    autoSubmittedRef.current.set(plate, now);
+    try {
+      const created = await opsClient.createViolationFromConsoleScan({
+        vehicleId,
+        plate,
+        confidence: result.bestPlateResult?.ocr_confidence ?? null,
+        jpegBase64: await blobToBase64(blob),
+        waypoint: source,
+      });
+      if (created.recorded && created.violation) {
+        setSubmitError(null);
+        setSubmitOk({
+          id: created.violation.id,
+          plate: created.violation.plate,
+          evidenceUrl: created.violation.evidenceUrl,
+          eventId: created.review?.eventId,
+          noParkingLabel: created.deduplicated ? '自动识别：已去重' : '自动识别：已记录',
+        });
+      } else {
+        setSubmitOk(null);
+        setSubmitError(created.message ?? (created.reason === 'pending_review' ? '自动识别：已进入待审核' : '自动识别：白名单正常'));
+      }
+    } catch (reason) {
+      setSubmitError(reason instanceof Error ? `自动提交失败：${reason.message}` : '自动提交失败');
+    }
+  }, [vehicleId]);
 
   useEffect(() => {
     if (!hits.length) {
@@ -558,6 +595,7 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
           },
           ...previous,
         ].slice(0, 10));
+        void autoSubmitRecognition(result, blob, '小车视频自动识别');
       }
     } catch (reason) {
       setDisplayError(reason instanceof Error ? reason.message : '小车视频扫描失败');
@@ -565,7 +603,7 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
     } finally {
       setDisplayBusy(false);
     }
-  }, [captureDisplayFrame, displayBusy, displayFramesScanned, displayReady]);
+  }, [autoSubmitRecognition, captureDisplayFrame, displayBusy, displayFramesScanned, displayReady]);
 
   const runOnce = useCallback(async () => {
     if (disabled || processingRef.current) return;
@@ -597,6 +635,7 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
           capturedAt: new Date().toISOString(),
         };
         setHits((prev) => [hit, ...prev].slice(0, 10));
+        void autoSubmitRecognition(result, blob, '实时快照自动识别');
       }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '识别失败');
@@ -605,7 +644,7 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
       processingRef.current = false;
       setBusy(false);
     }
-  }, [captureDisplayFrame, disabled, displayReady, host, videoPort]);
+  }, [autoSubmitRecognition, captureDisplayFrame, disabled, displayReady, host, videoPort]);
 
   useEffect(() => {
     if (!scanning || disabled) return;
@@ -740,6 +779,7 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
           },
           ...previous,
         ].slice(0, 10));
+        void autoSubmitRecognition(result, blob, '浏览器摄像头自动识别');
       }
     } catch (reason) {
       setCameraError(reason instanceof Error ? reason.message : '浏览器摄像头识别失败');
@@ -748,7 +788,7 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
       cameraProcessingRef.current = false;
       setCameraBusy(false);
     }
-  }, [cameraFramesScanned, runGateThenInfer]);
+  }, [autoSubmitRecognition, cameraFramesScanned, runGateThenInfer]);
 
   useEffect(() => {
     if (!cameraReady || !cameraScanning) return;
@@ -797,23 +837,27 @@ export function PlateScanPanel({ host, videoPort, vehicleId = null, disabled }: 
         </p>
       )}
 
-      <div className="plate-scan-actions plate-violation-test-bar">
-        <button
-          type="button"
-          className="secondary"
-          disabled={submitBusy || !violationCandidate || !vehicleId}
-          onClick={() => void submitToViolations()}
-        >
-          {submitBusy ? '上传中…' : '添加到违规车辆'}
-        </button>
-        <p className="muted">
-          {!vehicleId
-            ? '请先在上方选择小车。'
-            : violationCandidate
-            ? `将把 ${violationCandidate.plate} 与截图写入「违规车辆」并进入「待人工审核」；白名单车牌不可加入。提交时用上方最新 map 位姿判定禁停区。`
-            : '识别出有效车牌后可一键写入违规并进入审核队列。'}
-        </p>
-      </div>
+      {manualSubmission ? (
+        <div className="plate-scan-actions plate-violation-test-bar">
+          <button
+            type="button"
+            className="secondary"
+            disabled={submitBusy || !violationCandidate || !vehicleId}
+            onClick={() => void submitToViolations()}
+          >
+            {submitBusy ? '上传中…' : '添加到违规车辆'}
+          </button>
+          <p className="muted">
+            {!vehicleId
+              ? '请先在上方选择小车。'
+              : violationCandidate
+              ? `将提交 ${violationCandidate.plate} 与当前证据；后端会按白名单、置信度和禁停位置决定正常、待审核或违规。`
+              : '识别出有效车牌后可手动提交。'}
+          </p>
+        </div>
+      ) : (
+        <p className="muted">实时来源识别到有效车牌和证据后会自动提交；重复帧由后端统一去重。</p>
+      )}
       {submitError && <p className="error-text">{submitError}</p>}
       {submitOk && (
         <p className="notice">

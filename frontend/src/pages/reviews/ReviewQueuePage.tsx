@@ -18,6 +18,7 @@ function plateMatchLabel(match: PlateMatchInfo): string {
 
 function reviewReasonLabel(reason: string): string {
   if (reason === 'console_scan_test') return '控制台识别测试';
+  if (reason === 'console_scan') return '控制台识别';
   if (reason === 'low_confidence') return '低置信度';
   return reason;
 }

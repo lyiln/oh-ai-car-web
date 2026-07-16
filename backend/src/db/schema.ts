@@ -801,3 +801,19 @@ CREATE TABLE IF NOT EXISTS floor_map_zones (
 CREATE INDEX IF NOT EXISTS floor_map_zones_vehicle_idx ON floor_map_zones(vehicle_id, map_version);
 ALTER TABLE violations ADD COLUMN IF NOT EXISTS floor_zone_id uuid REFERENCES floor_map_zones(id) ON DELETE SET NULL;
 `;
+
+// 新识别闭环使用微信通知替代派车上门；历史 response_tasks 仍保留原调度字段。
+export const migration024 = `
+ALTER TABLE response_tasks ADD COLUMN IF NOT EXISTS notification_only boolean NOT NULL DEFAULT false;
+ALTER TABLE response_tasks ALTER COLUMN destination_id DROP NOT NULL;
+
+ALTER TABLE violations ADD COLUMN IF NOT EXISTS source text;
+ALTER TABLE violations ADD COLUMN IF NOT EXISTS dedupe_key text;
+ALTER TABLE violations ADD COLUMN IF NOT EXISTS dedupe_bucket timestamptz;
+ALTER TABLE violations ADD COLUMN IF NOT EXISTS observation_id uuid REFERENCES plate_observations(id) ON DELETE SET NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS violations_observation_idx
+  ON violations(observation_id) WHERE observation_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS violations_auto_dedupe_idx
+  ON violations(vehicle_id, dedupe_key, dedupe_bucket)
+  WHERE dedupe_key IS NOT NULL AND dedupe_bucket IS NOT NULL;
+`;

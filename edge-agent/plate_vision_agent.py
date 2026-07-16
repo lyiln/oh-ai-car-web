@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,14 +73,18 @@ def _annotate(frame_bgr, detections: list[PlateDetection]):
     return annotated
 
 
-def _pick_waypoint(task: dict) -> dict | None:
-    override = os.environ.get("PLATE_VISION_WAYPOINT_ID")
-    waypoints = task.get("waypoints") or []
-    if override:
-        for item in waypoints:
-            if item.get("id") == override:
-                return item
-    return waypoints[0] if waypoints else None
+def _shared_patrol_context() -> tuple[str | None, str | None]:
+    path = os.environ.get("STATE_PATH", "patrol-scheduler-state.sqlite3")
+    if not Path(path).is_file():
+        return None, None
+    try:
+        with sqlite3.connect(path, timeout=1) as connection:
+            rows = dict(connection.execute(
+                "SELECT key,value FROM state WHERE key IN ('active_task_id','active_waypoint_id')"
+            ).fetchall())
+        return rows.get("active_task_id"), rows.get("active_waypoint_id")
+    except sqlite3.Error:
+        return None, None
 
 
 def _should_post(det: PlateDetection) -> bool:
@@ -103,12 +108,8 @@ def run_loop() -> None:
 
     source = os.environ.get("PLATE_VIDEO_SOURCE", "0")
     interval = _env_float("PLATE_SCAN_INTERVAL_SECONDS", 2.0)
-    task_poll = _env_float("PLATE_TASK_POLL_SECONDS", 5.0)
-
     fixed_task_id = os.environ.get("PLATE_VISION_TASK_ID")
-    active_task: dict | None = None
-    active_waypoint: dict | None = None
-    last_task_poll = 0.0
+    fixed_waypoint_id = os.environ.get("PLATE_VISION_WAYPOINT_ID")
 
     capture = _open_capture(source)
     if not capture.isOpened():
@@ -117,20 +118,10 @@ def run_loop() -> None:
     print(f"Plate vision agent started source={source}", flush=True)
     try:
         while True:
-            now = time.time()
             if fixed_task_id:
-                if active_task is None:
-                    active_task = {"id": fixed_task_id, "waypoints": []}
-                    active_waypoint = {"id": os.environ["PLATE_VISION_WAYPOINT_ID"]} if os.environ.get("PLATE_VISION_WAYPOINT_ID") else {"id": "manual"}
-            elif now - last_task_poll >= task_poll:
-                last_task_poll = now
-                claimed = client.claim_next_patrol_task()
-                if claimed:
-                    active_task = claimed
-                    active_waypoint = _pick_waypoint(claimed)
-                    print(f"Claimed patrol task {claimed.get('id')} waypoint={active_waypoint and active_waypoint.get('id')}", flush=True)
-                elif active_task is None:
-                    print("No queued patrol task; waiting…", flush=True)
+                active_task_id, active_waypoint_id = fixed_task_id, fixed_waypoint_id or "manual"
+            else:
+                active_task_id, active_waypoint_id = _shared_patrol_context()
 
             ok, frame = capture.read()
             if not ok:
@@ -138,7 +129,7 @@ def run_loop() -> None:
                 continue
 
             detections = [det for det in detector.detect(frame) if _should_post(det)]
-            if not detections or active_task is None or active_waypoint is None:
+            if not detections or active_task_id is None or active_waypoint_id is None:
                 time.sleep(interval)
                 continue
 
@@ -161,7 +152,7 @@ def run_loop() -> None:
 
             event = {
                 "type": "observation",
-                "waypointId": active_waypoint["id"],
+                "waypointId": active_waypoint_id,
                 "occurredAt": datetime.now(timezone.utc).isoformat(),
                 "plate": best.plate,
                 "confidence": best.confidence,
@@ -173,7 +164,7 @@ def run_loop() -> None:
                 event["longitude"] = longitude
                 event["latitude"] = latitude
 
-            result = client.post_patrol_event(active_task["id"], event)
+            result = client.post_patrol_event(active_task_id, event)
             print(f"Posted observation plate={best.plate} conf={best.confidence:.2f} -> {result}", flush=True)
             time.sleep(interval)
     finally:

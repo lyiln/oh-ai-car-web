@@ -25,7 +25,7 @@ export async function violation(id: string): Promise<Violation | null> {
   }
 }
 
-/** Console plate-scan workbench: upload JPEG evidence and create a pending violation + review for UI tests. */
+/** Console plate-scan workbench: classify and idempotently record a recognised plate. */
 export async function createViolationFromConsoleScan(input: {
   vehicleId: string;
   plate: string;
@@ -34,8 +34,12 @@ export async function createViolationFromConsoleScan(input: {
   waypoint?: string;
   mapVersion?: string;
 }): Promise<{
-  violation: Pick<Violation, 'id' | 'plate' | 'evidenceUrl' | 'deviceId' | 'waypoint' | 'status' | 'type' | 'zoneName'>;
-  review: { id: string; eventId: string };
+  recorded: boolean;
+  deduplicated: boolean;
+  reason: string;
+  message?: string;
+  violation?: Pick<Violation, 'id' | 'plate' | 'evidenceUrl' | 'deviceId' | 'waypoint' | 'status' | 'type' | 'zoneName'>;
+  review?: { id: string; eventId: string };
   noParking?: {
     inNoParking: boolean;
     reason: string;

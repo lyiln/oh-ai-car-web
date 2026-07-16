@@ -129,7 +129,7 @@ npm run dev:frontend
 ## 当前边界与尚未验证项
 
 - TypeScript 构建、workspace 自动化测试、临时 PostGIS 集成测试和 Docker Compose 完整栈冒烟验证已经通过；Compose 证据覆盖前端入口、登录、车辆创建和认证/未认证 WebSocket，但不代表真实 AMap、SMTP、AI、ROS2 或小车已验证。
-- 后端 `npm run test:integration --workspace=@oh-ai-car-web/backend` 的 20 项 PostGIS 集成测试已通过，覆盖迁移、路线、任务领取、ROI、白名单分类与快照、30 分钟去重、停止确认、车辆级授权、OTP 并发/限流、上门处置和并发写入。
+- 后端 `npm run test:integration --workspace=@oh-ai-car-web/backend` 的 26 项 PostGIS 集成测试已通过，覆盖迁移、路线、任务领取、ROI、白名单分类与快照、按位置 30 分钟去重、停止确认、车辆级授权、OTP 并发/限流、微信通知、历史上门任务兼容和并发写入。
 - 巡检车的 Nav2、OCR、停止确认和真车安全接管仍需独立实测并记录。
 - 巡检看板目前通过刷新读取任务事件和识别记录，尚未把这些事件推送到浏览器 WebSocket；它不能作为实时进度已验证的证据。
 - 浏览器加载视频页面不代表小车视频流健康；TCP 写成功也不代表小车已执行指令。

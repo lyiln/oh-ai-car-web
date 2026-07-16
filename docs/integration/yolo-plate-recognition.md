@@ -11,7 +11,7 @@
     → POST /device/v1/evidence  (JPEG → 主机 data/evidence/)
     → POST /device/v1/patrol/tasks/:id/events  { type: "observation", evidenceImageUrl: "/api/evidence/..." }
     → plate_observations → violations / reviews / 地图
-    → 管理员在「待审核」「违规车辆」页查看截图并人工判断
+    → 登记私家车禁停候选 → 人工确认 → WxPusher
 ```
 
 平台后端**不包含**推理代码；与 GPS 遥测一样，推理在 Jetson 边缘侧完成。
@@ -99,6 +99,7 @@ pip install -r edge-agent/requirements-plate.txt
 | `EVIDENCE_HOST`               | 本地证据服务监听；上传到主机时可不开启 `EVIDENCE_SERVE`                                        |
 | `PLATE_VISION_TASK_ID`        | 可选，固定任务 ID（调试）                                                              |
 | `PLATE_VISION_WAYPOINT_ID`    | 可选，固定航点 ID（调试）                                                              |
+| `STATE_PATH`                  | 与 `patrol_scheduler.py` 共用的 SQLite 状态文件；视觉只在调度器写入当前停留航点时上报                      |
 
 
 ### 主机 Web 可视化（管理员）
@@ -119,13 +120,13 @@ bash start-plate-vision.sh
 
 **前提：**
 
-1. 平台上有 **queued** 状态的巡逻任务（或由调度器 `GET /device/v1/patrol/tasks/next` 领取）
+1. `patrol_scheduler.py` 已领取平台上的巡逻任务，并与视觉进程使用相同 `STATE_PATH`
 2. 相机可用；调试可用图片路径作 `PLATE_VIDEO_SOURCE`
 3. 可选：GPS 遥测 agent 运行中（用于坐标；无 GPS 时平台用 ±60s 遥测回填）
 
 ## 6. 平台侧验证
 
-1. 前端 **违规列表** / **地图** / **审核队列** 出现新记录
+1. 前端 **违规列表** / **地图** / **审核队列** 出现新记录；私家车禁停还会出现在 **微信通知** 页
 2. 集成测试参考：`backend/tests/integration/platform.test.ts`（含中文车牌 observation）
 
 本地 mock 测试（无需 GPU）：

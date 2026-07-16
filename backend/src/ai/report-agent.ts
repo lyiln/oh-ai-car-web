@@ -37,7 +37,7 @@ function templateNarrative(stats: DailyReportStats, highlights: string[]): strin
     '## 物业建议',
     '- 对闯入车辆与乱停车辆进行现场确认并留存证据。',
     '- 低置信度识别请在「待人工审核」中复核，勿仅凭 AI 叙事定案。',
-    '- 需要上门处置时由人工确认后派车，勿由系统自动控车。',
+    '- 需要通知车主时由人工确认后通过 WxPusher 发送，勿由系统自动派车或控车。',
   ];
   return lines.join('\n');
 }
