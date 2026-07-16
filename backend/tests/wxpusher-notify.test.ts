@@ -29,4 +29,27 @@ describe('notifyOwnerPush', () => {
     });
     expect(result.status).toBe('skipped_not_configured');
   });
+
+  it('records a successful WxPusher request id', async () => {
+    const db = mockDb();
+    const sender = vi.fn(async () => ({ ok: true, messageId: 'request-42', code: 1000 }));
+    const result = await notifyOwnerPush(db, { appToken: 'AT_test' }, {
+      responseTaskId: 't1', plate: '京A12345', wxUid: 'UID_abc', location: '东门', content: '请挪车',
+    }, sender);
+
+    expect(result).toEqual({ status: 'sent', message: '车主 WxPusher 推送已发送', requestId: 'request-42' });
+    expect(db.query.mock.calls.some(([sql]) => String(sql).includes("sms_status='sent'"))).toBe(true);
+    expect(db.query.mock.calls.some(([sql]) => String(sql).includes('provider_request_id'))).toBe(true);
+  });
+
+  it('keeps a failed request retryable and records the provider error', async () => {
+    const db = mockDb();
+    const sender = vi.fn(async () => ({ ok: false, messageId: 'request-failed', error: 'timeout' }));
+    const result = await notifyOwnerPush(db, { appToken: 'AT_test' }, {
+      responseTaskId: 't1', plate: '京A12345', wxUid: 'UID_abc', location: '东门', content: '请挪车',
+    }, sender);
+
+    expect(result).toEqual({ status: 'failed', message: '推送失败：timeout', requestId: 'request-failed' });
+    expect(db.query.mock.calls.some(([sql, values]) => String(sql).includes("sms_status='failed'") && values?.includes('timeout'))).toBe(true);
+  });
 });

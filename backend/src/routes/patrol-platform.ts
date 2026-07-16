@@ -4,7 +4,8 @@ import type { PoolClient } from 'pg';
 import type { Database } from '../db/index.js';
 import { saveEvidenceJpeg } from '../evidence-storage.js';
 import { parseRing, pointInPolygon } from '../geometry/point-in-polygon.js';
-import { matchWhitelistPlate, normalisePlate } from '../plate-match.js';
+import { matchWhitelistPlate, normalisePlate, plateMatchDto, type PlateMatchResult } from '../plate-match.js';
+import { createResponseCandidate } from './response-platform.js';
 
 type AuthUser = {
   id: string;
@@ -780,7 +781,7 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
           count(*) FILTER (WHERE status='completed')::int AS completed,
           count(*) FILTER (WHERE ai_suggestion<>'')::int AS ai_used,
           avg(extract(epoch FROM (completed_at-created_at))) FILTER (WHERE completed_at IS NOT NULL)::float8 AS average_seconds
-         FROM response_tasks WHERE source_patrol_task_id=$1`, [id],
+         FROM response_tasks WHERE source_patrol_task_id=$1 AND notification_only=true`, [id],
       );
       const stats = {
         eventCount: eventCount.rows[0]?.c ?? 0,
@@ -865,10 +866,10 @@ export function registerPatrolPlatformRoutes(app: FastifyInstance, deps: PatrolR
 <tr><td>已登记私家车</td><td>${stats.registeredPrivate}</td></tr>
 <tr><td>访客车辆</td><td>${stats.visitorCount}</td></tr>
 <tr><td>疑似外来车辆</td><td>${stats.suspectedExternal}</td></tr>
-<tr><td>上门处置任务</td><td>${stats.responseCount}</td></tr>
-<tr><td>已完成上门处置</td><td>${stats.responseCompleted}</td></tr>
-<tr><td>已生成处置建议</td><td>${stats.responseAiAdviceCount}</td></tr>
-<tr><td>平均处置耗时（秒）</td><td>${stats.responseAverageSeconds === null ? '—' : Math.round(stats.responseAverageSeconds as number)}</td></tr>
+<tr><td>微信通知任务</td><td>${stats.responseCount}</td></tr>
+<tr><td>已完成微信通知</td><td>${stats.responseCompleted}</td></tr>
+<tr><td>已生成通知建议</td><td>${stats.responseAiAdviceCount}</td></tr>
+<tr><td>平均通知耗时（秒）</td><td>${stats.responseAverageSeconds === null ? '—' : Math.round(stats.responseAverageSeconds as number)}</td></tr>
 <tr><td>待人工审核</td><td>${stats.pendingReview}</td></tr>
 <tr><td>违规停车</td><td>${stats.noParkingCount}</td></tr>
 <tr><td>违规记录</td><td>${stats.violationCount}</td></tr>
@@ -1304,19 +1305,13 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
        WHERE vehicle_id IS NULL AND is_snapshot=false
        ORDER BY created_at DESC, id DESC LIMIT 1`,
     );
+    let whitelistMatch: PlateMatchResult | null = null;
     if (liveWhitelist.rows[0]) {
       const entries = await db.query<{ plate: string; category: 'private' | 'visitor' }>(
         'SELECT plate, category FROM whitelist_entries WHERE whitelist_id=$1',
         [liveWhitelist.rows[0].id],
       );
-      const hit = matchWhitelistPlate(plate, entries.rows);
-      if (hit) {
-        const kind = hit.category === 'private' ? '登记私家车' : '登记访客';
-        throw httpError(
-          `白名单车辆：已匹配 ${hit.matchedPlate}（${kind}），不允许添加到违规车辆`,
-          409,
-        );
-      }
+      whitelistMatch = matchWhitelistPlate(plate, entries.rows);
     }
 
     const jpegRaw = typeof body.jpegBase64 === 'string' ? body.jpegBase64.trim() : '';
@@ -1333,7 +1328,7 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
       : 0.5;
     const waypoint = typeof body.waypoint === 'string' && body.waypoint.trim()
       ? body.waypoint.trim().slice(0, 120)
-      : '控制台识别测试';
+      : '控制台自动识别';
 
     const mapVersionHint = typeof body.mapVersion === 'string' && body.mapVersion.trim()
       ? body.mapVersion.trim().slice(0, 120)
@@ -1371,13 +1366,24 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
     }
     const inNoParking = Boolean(floorZoneId);
     const violationType = inNoParking ? 'no_parking' : 'suspected_external';
+    if (whitelistMatch && !inNoParking) {
+      return {
+        recorded: false,
+        deduplicated: false,
+        reason: 'whitelist_normal',
+        plateMatch: plateMatchDto(whitelistMatch),
+        message: `白名单车辆 ${whitelistMatch.matchedPlate} 未处于禁停区，无需记录违规`,
+      };
+    }
 
-    const route = await db.query<{ id: string }>(
-      'SELECT id FROM patrol_routes WHERE vehicle_id=$1 ORDER BY created_at DESC LIMIT 1',
+    const route = await db.query<{ id: string; waypoint_id: string; waypoint_name: string }>(
+      `SELECT r.id,w.id AS waypoint_id,w.name AS waypoint_name FROM patrol_routes r
+       JOIN LATERAL (SELECT id,name FROM patrol_waypoints WHERE route_id=r.id ORDER BY ordinal LIMIT 1) w ON true
+       WHERE r.vehicle_id=$1 ORDER BY r.created_at DESC LIMIT 1`,
       [vehicleId],
     );
     if (!route.rows[0]) {
-      throw httpError('请先为该设备创建巡逻路线，测试审核需要挂接到任务事件', 409);
+      throw httpError('请先为该设备创建巡逻路线，识别审核需要挂接到任务事件', 409);
     }
     if (!liveWhitelist.rows[0]) {
       throw httpError('全局白名单为空；请先维护白名单后再测试', 409);
@@ -1385,10 +1391,45 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
 
     const saved = saveEvidenceJpeg(bytes, 'console-scan');
     const created = await db.transaction(async (client) => {
+      const matchedPlate = whitelistMatch?.matchedPlate ?? plate;
+      const bucket = new Date(Math.floor(Date.now() / 1_800_000) * 1_800_000);
+      const dedupeKey = `${matchedPlate}:${inNoParking ? floorZoneId : 'outside'}`;
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`${vehicleId}:${dedupeKey}:${bucket.toISOString()}`]);
+      const duplicate = await client.query<{ id: string; event_id: string | null; observation_id: string | null }>(
+        'SELECT id,event_id,observation_id FROM violations WHERE vehicle_id=$1 AND dedupe_key=$2 AND dedupe_bucket=$3 LIMIT 1',
+        [vehicleId, dedupeKey, bucket],
+      );
+      if (duplicate.rows[0]) {
+        if (duplicate.rows[0].observation_id) {
+          await client.query(
+            `UPDATE plate_observations SET
+               observation_count=observation_count+1,
+               last_seen_at=now(),
+               evidence_image_url=CASE WHEN $2>=confidence THEN $3 ELSE evidence_image_url END,
+               confidence=GREATEST(confidence,$2)
+             WHERE id=$1`,
+            [duplicate.rows[0].observation_id, confidence, saved.publicPath],
+          );
+          await client.query(
+            `UPDATE violations v SET evidence_url=o.evidence_image_url
+             FROM plate_observations o WHERE v.id=$1 AND o.id=$2`,
+            [duplicate.rows[0].id, duplicate.rows[0].observation_id],
+          );
+        }
+        return {
+          taskId: null,
+          violationId: duplicate.rows[0].id,
+          eventId: duplicate.rows[0].event_id,
+          reviewId: null,
+          observationId: duplicate.rows[0].observation_id,
+          deduplicated: true,
+        };
+      }
       const taskId = randomUUID();
       const eventId = randomUUID();
       const reviewId = randomUUID();
       const violationId = randomUUID();
+      const observationId = randomUUID();
 
       await client.query(
         `INSERT INTO patrol_tasks
@@ -1408,9 +1449,9 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
           confidence,
           saved.publicPath,
           JSON.stringify({
-            source: 'console_scan_test',
+            source: 'console_scan',
             vehicleId,
-            plateMatch: null,
+            plateMatch: plateMatchDto(whitelistMatch),
             inNoParking,
             floorZoneId,
             floorZoneName,
@@ -1420,17 +1461,26 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
       );
       await client.query(
         `INSERT INTO reviews (id, event_id, reason, status)
-         VALUES ($1, $2, 'console_scan_test', 'pending')`,
+         VALUES ($1, $2, 'console_scan', 'pending')`,
         [reviewId, eventId],
       );
       await client.query(
+        `INSERT INTO plate_observations
+           (id,task_id,waypoint_id,occurred_at,dedupe_bucket,dedupe_key,plate,confidence,classification,no_parking,evidence_image_url,last_seen_at)
+         VALUES ($1,$2,$3,now(),$4,$5,$6,$7,$8,$9,$10,now())`,
+        [observationId, taskId, route.rows[0].waypoint_id, bucket, dedupeKey, plate, confidence,
+          confidence < 0.75 ? 'pending_review' : whitelistMatch?.category === 'private' ? 'registered_private' : whitelistMatch?.category === 'visitor' ? 'visitor' : 'suspected_external',
+          inNoParking, saved.publicPath],
+      );
+      if (confidence >= 0.75) await client.query(
         `INSERT INTO violations
-           (id, event_id, plate, violation_type, task_id, vehicle_id, waypoint, priority, disposition, evidence_url, occurred_at, floor_zone_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, now(), $10)`,
+           (id,event_id,observation_id,plate,violation_type,task_id,vehicle_id,waypoint,priority,disposition,evidence_url,occurred_at,floor_zone_id,source,dedupe_key,dedupe_bucket)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,now(),$11,'console_scan',$12,$13)`,
         [
           violationId,
           eventId,
-          plate,
+          observationId,
+          matchedPlate,
           violationType,
           taskId,
           vehicleId,
@@ -1438,24 +1488,41 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
           inNoParking ? 'high' : 'normal',
           saved.publicPath,
           floorZoneId,
+          dedupeKey,
+          bucket,
         ],
       );
-      return { taskId, eventId, reviewId, violationId };
+      return { taskId, eventId, reviewId, violationId: confidence >= 0.75 ? violationId : null, observationId, deduplicated: false };
     });
 
-    hub.publishPatrol?.({
+    if (!created.deduplicated && created.violationId && created.observationId && whitelistMatch?.category === 'private' && inNoParking) {
+      await createResponseCandidate(db, { publishPatrol: (message) => hub.publishPatrol?.(message) }, {
+        observationId: created.observationId,
+        taskId: created.taskId as string,
+        vehicleId,
+        plate,
+        matchedPlate: whitelistMatch.matchedPlate,
+        plateMatch: whitelistMatch,
+        confidence,
+        noParking: true,
+        evidenceUrl: saved.publicPath,
+        violationId: created.violationId,
+      });
+    }
+
+    if (created.violationId && !created.deduplicated) hub.publishPatrol?.({
       type: 'violation_alert',
       violationId: created.violationId,
       vehicleId,
       plate,
       evidenceUrl: saved.publicPath,
-      source: 'console_scan_test',
+      source: 'console_scan',
       confidence,
       eventId: created.eventId,
       inNoParking,
       floorZoneId,
     });
-    await audit('violation.console_scan_test', 'success', user.id, vehicleId, {
+    await audit('violation.console_scan', created.deduplicated ? 'deduplicated' : 'success', user.id, vehicleId, {
       violationId: created.violationId,
       eventId: created.eventId,
       reviewId: created.reviewId,
@@ -1466,6 +1533,10 @@ ${followupTableRows || '<tr><td colspan="5">无需跟进项目</td></tr>'}
       floorZoneId,
     });
     return {
+      recorded: Boolean(created.violationId),
+      deduplicated: created.deduplicated,
+      reason: created.violationId ? 'violation_recorded' : 'pending_review',
+      plateMatch: plateMatchDto(whitelistMatch),
       violation: {
         id: created.violationId,
         plate,

@@ -10,3 +10,6 @@
 - [X] T008 Add cancellation-requested and confirmed-stop migration/state rules in backend/src/
 - [X] T009 Add patrol-to-gateway lease interlock and PostGIS regression coverage
 - [X] T010 Update the patrol UI and safety contract documentation
+- [X] T011 Make the patrol scheduler the sole task claimant and share the current dwell waypoint with vision
+- [X] T012 Idempotently create violations from qualified device and realtime-console recognition
+- [X] T013 Replace new doorstep dispatches with operator-confirmed WxPusher notification-only tasks

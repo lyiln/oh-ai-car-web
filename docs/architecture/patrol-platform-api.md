@@ -117,11 +117,12 @@
 | GET | `/api/reports` · `/api/reports/:id` |
 | GET/PUT | `/api/settings` |
 
-## 乱停车上门处置
+## 乱停车微信通知
 
 - 管理员通过 `GET/POST /api/resident-destinations` 和 `PUT /api/resident-destinations/:id` 维护楼栋一层公共门口的 Nav2 `x/y/yaw` 与地图版本。
-- 带证据的禁停 observation 只有在置信度不低于 0.75、命中登记私家车且存在启用目的地时，才创建 `pending_review` 处置候选。
-- 操作员通过 `POST /api/response-tasks/:id/confirm` 人工确认；后端生成 AI 或模板建议并尝试选择安全可用车辆。没有车辆时任务保留为 `confirmed`，可通过幂等的 `POST /api/response-tasks/:id/assign` 重试。`GET /api/response-tasks` 返回有权限车辆的处置看板。
+- 高置信度 observation 在禁停区内对所有车辆生成违规；禁停区外仅非白名单车生成“疑似外来”。低置信度结果只进入人工审核。
+- 禁停区内命中登记私家车时创建 `notification_only` 通知候选，不再要求住户 Nav2 目的地。操作员通过 `POST /api/response-tasks/:id/confirm` 人工确认并发送 WxPusher；失败、缺少 UID 或未配置 Token 时可通过 `POST /api/response-tasks/:id/retry-push` 重试。
+- 新通知任务不会分配车辆或进入设备 response API。历史上门任务仍保留原设备接口，仅用于安全完成或取消存量任务。
 - 设备通过 `GET /device/v1/response/tasks/next` 读取已分配或待安全取消的任务，并向 `POST /device/v1/response/tasks/:id/events` 上报 `navigation_started`、`arrived`、`arrival_evidence`、`completed`、`failed` 或 `stop_confirmed`。每个事件必须携带设备生成的 `eventId`；到达与完成要求 `zeroVelocity=true`，完成前必须已有到达证据。
 - `POST /api/response-tasks/:id/cancel` 对未分配任务直接取消；活动任务进入 `cancellation_requested`。只有设备上报 `stop_confirmed` 且 `zeroVelocity=true` 后才进入不可变的 `cancelled`。`completed`、`cancelled` 和 `failed` 终态拒绝新的非重复状态事件。
 - 活动处置任务与人工控制租约、其他处置任务及新巡检任务互斥。该接口不会直接发送速度命令，也不能证明真实车辆已停止。

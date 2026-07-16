@@ -48,6 +48,12 @@ task/plate/waypoint/30-minute window and appears in the report.
   the selected waypoint's camera-frame ROI.
 - **FR-007**: Reports contain task metadata, completion state, counts by
   result, evidence links and a property follow-up list.
+- **FR-008**: High-confidence no-parking observations create violations for any
+  plate; outside no-parking zones only non-whitelist plates create suspected-
+  external violations. Low-confidence observations require review.
+- **FR-009**: A registered private no-parking violation creates a notification-
+  only candidate. WxPusher is sent only after operator confirmation and never
+  dispatches a vehicle.
 
 ## Assumptions
 

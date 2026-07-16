@@ -47,11 +47,12 @@ const RESPONSE_SELECT = `
     rt.owner_wx_uid AS "ownerWxUid",
     rt.sms_status AS "smsStatus", rt.sms_error AS "smsError",
     rt.sms_sent_at AS "smsSentAt",
+    rt.notification_only AS "notificationOnly",
     d.display_name AS "destinationName", d.map_version AS "mapVersion", d.x, d.y, d.yaw,
     sv.name AS "sourceVehicleName", av.name AS "assignedVehicleName",
     po.evidence_image_url AS "evidenceUrl", po.confidence, pw.name AS waypoint
   FROM response_tasks rt
-  JOIN resident_destinations d ON d.id=rt.destination_id
+  LEFT JOIN resident_destinations d ON d.id=rt.destination_id
   JOIN vehicles sv ON sv.id=rt.source_vehicle_id
   LEFT JOIN vehicles av ON av.id=rt.assigned_vehicle_id
   JOIN plate_observations po ON po.id=rt.observation_id
@@ -72,8 +73,9 @@ export async function createResponseCandidate(
     confidence: number;
     noParking: boolean;
     evidenceUrl: string | null;
+    violationId: string;
   },
-): Promise<{ responseEligible: boolean; responseTaskId?: string; reason: string; ownerName?: string; building?: string; destinationId?: string }> {
+): Promise<{ responseEligible: boolean; responseTaskId?: string; reason: string; ownerName?: string; building?: string; destinationId?: string | null }> {
   if (!input.noParking) return { responseEligible: false, reason: 'not_in_no_parking_roi' };
   if (!input.evidenceUrl) return { responseEligible: false, reason: 'evidence_required' };
   if (!input.plate || input.confidence < 0.75) return { responseEligible: false, reason: 'plate_review_required' };
@@ -106,38 +108,21 @@ export async function createResponseCandidate(
   );
   const entry = match.rows[0];
   if (!entry) return { responseEligible: false, reason: 'registered_private_vehicle_required' };
-  let destinationId = entry.destination_id;
-  if (!destinationId) {
-    const destination = await db.query<{ id: string }>(
-      'SELECT id FROM resident_destinations WHERE vehicle_id=$1 AND building=$2 AND resident_key=$3 AND active=true ORDER BY created_at DESC LIMIT 1',
-      [input.vehicleId, entry.building, ''],
-    );
-    destinationId = destination.rows[0]?.id ?? null;
-  }
-  if (!destinationId) return { responseEligible: false, reason: 'resident_destination_required', ownerName: entry.owner_name, building: entry.building };
+  const destinationId = entry.destination_id;
   const responseTaskId = randomUUID();
-  const violationId = randomUUID();
   // Persist the resolved full plate so operators see the whitelist identity, not the OCR fragment.
   const plateForRecord = lookupPlate;
   const created = await db.transaction(async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`response:${input.observationId}`]);
     const existing = await client.query<{ id: string; violation_id: string | null }>('SELECT id,violation_id FROM response_tasks WHERE observation_id=$1 FOR UPDATE', [input.observationId]);
     if (existing.rows[0]) return { id: existing.rows[0].id, violationId: existing.rows[0].violation_id, newlyCreated: false };
-    const waypoint = await client.query<{ waypoint_id: string; name: string }>(
-      'SELECT po.waypoint_id,pw.name FROM plate_observations po JOIN patrol_waypoints pw ON pw.id=po.waypoint_id WHERE po.id=$1',
-      [input.observationId],
-    );
-    await client.query(
-      `INSERT INTO violations (id,plate,violation_type,task_id,vehicle_id,waypoint,priority,disposition,evidence_url,occurred_at)
-       SELECT $1,$2,'no_parking',$3,$4,$5,'high','pending',$6,occurred_at FROM plate_observations WHERE id=$7`,
-      [violationId, plateForRecord, input.taskId, input.vehicleId, waypoint.rows[0]?.name ?? '', input.evidenceUrl, input.observationId],
-    );
     await client.query(
       `INSERT INTO response_tasks
-       (id,observation_id,violation_id,source_patrol_task_id,source_vehicle_id,destination_id,plate,owner_name,building,owner_wx_uid,status,eligibility_reason)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending_review','eligible_after_operator_confirmation')`,
-      [responseTaskId, input.observationId, violationId, input.taskId, input.vehicleId, destinationId, plateForRecord, entry.owner_name, entry.building, entry.wx_uid],
+       (id,observation_id,violation_id,source_patrol_task_id,source_vehicle_id,destination_id,plate,owner_name,building,owner_wx_uid,status,eligibility_reason,notification_only)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending_review','wxpush_after_operator_confirmation',true)`,
+      [responseTaskId, input.observationId, input.violationId, input.taskId, input.vehicleId, destinationId, plateForRecord, entry.owner_name, entry.building, entry.wx_uid],
     );
-    return { id: responseTaskId, violationId, newlyCreated: true };
+    return { id: responseTaskId, violationId: input.violationId, newlyCreated: true };
   });
   if (created.newlyCreated) {
     hub.publishPatrol({ type: 'response_status', responseTaskId: created.id, vehicleId: input.vehicleId, status: 'pending_review' });
@@ -190,6 +175,7 @@ export async function notifyOwnerPush(
   db: Database,
   push: WxPusherConfig,
   input: { responseTaskId: string; plate: string; wxUid: string; location: string; content: string },
+  sender: typeof sendWxPusherMessage = sendWxPusherMessage,
 ): Promise<OwnerPushStatus> {
   const wxUid = input.wxUid.trim();
   if (!wxUid) {
@@ -220,7 +206,7 @@ export async function notifyOwnerPush(
 
   const body = `【巡牌通乱停通知】\n车牌：${input.plate}\n位置：${input.location}\n${input.content}`;
   await db.query(`UPDATE response_tasks SET sms_status='queued', updated_at=now() WHERE id=$1`, [input.responseTaskId]);
-  const result = await sendWxPusherMessage(push, {
+  const result = await sender(push, {
     uid: wxUid,
     content: body,
     summary: `乱停通知 · ${input.plate}`,
@@ -322,9 +308,10 @@ export function registerResponsePlatformRoutes(app: FastifyInstance, deps: Respo
   app.post('/api/response-tasks/:id/confirm', async (request) => {
     const user = await requireUser(request); const id = (request.params as { id: string }).id;
     const row = await db.query<{
-      source_vehicle_id: string; plate: string; building: string; waypoint: string; confidence: number; owner_wx_uid: string;
+      source_vehicle_id: string; plate: string; building: string; waypoint: string; confidence: number; owner_wx_uid: string; notification_only: boolean;
     }>(
-      `SELECT rt.source_vehicle_id,rt.plate,rt.building,pw.name AS waypoint,po.confidence,COALESCE(rt.owner_wx_uid,'') AS owner_wx_uid
+      `SELECT rt.source_vehicle_id,rt.plate,rt.building,pw.name AS waypoint,po.confidence,
+              COALESCE(rt.owner_wx_uid,'') AS owner_wx_uid,rt.notification_only
        FROM response_tasks rt
        JOIN plate_observations po ON po.id=rt.observation_id JOIN patrol_waypoints pw ON pw.id=po.waypoint_id
        WHERE rt.id=$1 AND rt.status='pending_review'`, [id],
@@ -345,6 +332,15 @@ export function registerResponsePlatformRoutes(app: FastifyInstance, deps: Respo
       content: advice.notification,
     });
 
+    if (row.rows[0].notification_only) {
+      if (pushResult.status === 'sent') {
+        await db.query("UPDATE response_tasks SET status='completed',completed_at=now(),updated_at=now() WHERE id=$1 AND notification_only=true", [id]);
+        hub.publishPatrol({ type: 'response_status', responseTaskId: id, vehicleId: row.rows[0].source_vehicle_id, status: 'completed' });
+      }
+      await audit('response.wxpush', pushResult.status, user.id, row.rows[0].source_vehicle_id, { responseTaskId: id, requestId: pushResult.requestId });
+      return { ok: true, notificationCompleted: pushResult.status === 'sent', advice, push: pushResult };
+    }
+
     try {
       const vehicleId = await assignVehicle(db, id);
       await audit('response.assign', 'success', user.id, vehicleId, { responseTaskId: id });
@@ -357,10 +353,49 @@ export function registerResponsePlatformRoutes(app: FastifyInstance, deps: Respo
     }
   });
 
+  app.post('/api/response-tasks/:id/retry-push', async (request) => {
+    const user = await requireUser(request); const id = (request.params as { id: string }).id;
+    const task = await db.query<{
+      source_vehicle_id: string; plate: string; waypoint: string; notification_text: string; owner_wx_uid: string; status: string;
+    }>(
+      `SELECT rt.source_vehicle_id,rt.plate,pw.name AS waypoint,COALESCE(rt.notification_text,'') AS notification_text,
+              COALESCE(rt.owner_wx_uid,'') AS owner_wx_uid,rt.status
+       FROM response_tasks rt JOIN plate_observations po ON po.id=rt.observation_id
+       JOIN patrol_waypoints pw ON pw.id=po.waypoint_id
+       WHERE rt.id=$1 AND rt.notification_only=true`, [id],
+    );
+    if (!task.rows[0] || !await canAccessVehicle(user, task.rows[0].source_vehicle_id)) {
+      throw Object.assign(new Error('Notification task not found'), { statusCode: 404 });
+    }
+    if (task.rows[0].status !== 'confirmed') {
+      throw Object.assign(new Error('Notification task is not ready for retry'), { statusCode: 409 });
+    }
+    const latestUid = await db.query<{ wx_uid: string }>(
+      `SELECT COALESCE(e.wx_uid,'') AS wx_uid FROM whitelist_imports w
+       JOIN whitelist_entries e ON e.whitelist_id=w.id
+       WHERE w.vehicle_id IS NULL AND w.is_snapshot=false AND e.plate=$1
+       ORDER BY w.created_at DESC,w.id DESC LIMIT 1`, [task.rows[0].plate],
+    );
+    const wxUid = latestUid.rows[0]?.wx_uid || task.rows[0].owner_wx_uid;
+    await db.query('UPDATE response_tasks SET owner_wx_uid=$2,status=\'confirmed\',completed_at=NULL,updated_at=now() WHERE id=$1', [id, wxUid]);
+    const push = await notifyOwnerPush(db, wxPusher, {
+      responseTaskId: id,
+      plate: task.rows[0].plate,
+      wxUid,
+      location: task.rows[0].waypoint,
+      content: task.rows[0].notification_text,
+    });
+    if (push.status === 'sent') await db.query("UPDATE response_tasks SET status='completed',completed_at=now(),updated_at=now() WHERE id=$1", [id]);
+    await audit('response.wxpush-retry', push.status, user.id, task.rows[0].source_vehicle_id, { responseTaskId: id, requestId: push.requestId });
+    hub.publishPatrol({ type: 'response_status', responseTaskId: id, vehicleId: task.rows[0].source_vehicle_id, status: push.status === 'sent' ? 'completed' : 'confirmed' });
+    return { ok: true, notificationCompleted: push.status === 'sent', push };
+  });
+
   app.post('/api/response-tasks/:id/assign', async (request) => {
     const user = await requireUser(request); const id = (request.params as { id: string }).id;
-    const task = await db.query<{ source_vehicle_id: string; assigned_vehicle_id: string | null; status: string }>('SELECT source_vehicle_id,assigned_vehicle_id,status FROM response_tasks WHERE id=$1', [id]);
+    const task = await db.query<{ source_vehicle_id: string; assigned_vehicle_id: string | null; status: string; notification_only: boolean }>('SELECT source_vehicle_id,assigned_vehicle_id,status,notification_only FROM response_tasks WHERE id=$1', [id]);
     if (!task.rows[0] || !await canAccessVehicle(user, task.rows[0].source_vehicle_id)) throw Object.assign(new Error('Response task not found'), { statusCode: 404 });
+    if (task.rows[0].notification_only) throw Object.assign(new Error('WxPusher notification tasks cannot be assigned to a vehicle'), { statusCode: 409 });
     if (task.rows[0].status === 'assigned' && task.rows[0].assigned_vehicle_id) return { ok: true, assignedVehicleId: task.rows[0].assigned_vehicle_id, deduplicated: true };
     if (task.rows[0].status !== 'confirmed') throw Object.assign(new Error('Response task is not awaiting assignment'), { statusCode: 409 });
     let vehicleId: string;
@@ -396,7 +431,7 @@ export function registerResponsePlatformRoutes(app: FastifyInstance, deps: Respo
 
   app.get('/device/v1/response/tasks/next', async (request) => {
     const vehicleId = await deviceVehicle(request);
-    const result = await db.query(`${RESPONSE_SELECT} WHERE rt.assigned_vehicle_id=$1 AND rt.status IN ('assigned','cancellation_requested') ORDER BY rt.assigned_at LIMIT 1`, [vehicleId]);
+    const result = await db.query(`${RESPONSE_SELECT} WHERE rt.notification_only=false AND rt.assigned_vehicle_id=$1 AND rt.status IN ('assigned','cancellation_requested') ORDER BY rt.assigned_at LIMIT 1`, [vehicleId]);
     return { task: result.rows[0] ?? null };
   });
 

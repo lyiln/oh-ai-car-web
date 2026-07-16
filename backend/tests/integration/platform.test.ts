@@ -79,7 +79,7 @@ beforeAll(async () => {
     await waitForDatabase(db);
     await Promise.all([db.migrate(), secondMigrator.migrate()]);
     const migrations = await db.query<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version');
-    expect(migrations.rows).toHaveLength(25);
+    expect(migrations.rows).toHaveLength(26);
     expect(new Set(migrations.rows.map((row) => row.version))).toEqual(new Set([
       '001',
       '002-patrol-inspection',
@@ -106,6 +106,7 @@ beforeAll(async () => {
       '021-persistent-control-sessions',
       '022-twenty-minute-control-leases',
       '023-floor-map-zones',
+      '024-wxpush-violation-flow',
     ]));
   } finally {
     await secondMigrator.close();
@@ -538,10 +539,11 @@ describe('platform API against PostGIS', () => {
     const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-OBS', name: '观测巡检车', host: '192.168.1.23', tcpPort: 6000, videoPort: 6500 } });
     const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
     await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA] } });
-    const routeId = randomUUID(); const waypointId = randomUUID();
+    const routeId = randomUUID(); const waypointId = randomUUID(); const secondNoParkingWaypointId = randomUUID();
     await db.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [routeId, vehicleId, '观测路线', 'v1', 'generated', ids.admin]);
     await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds,no_parking_roi) VALUES ($1,$2,0,$3,0,0,0,8,$4)', [waypointId, routeId, '识别点', JSON.stringify([0.1, 0.1, 0.5, 0.5])]);
-    for (const ordinal of [1, 2]) await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,$3,$4,0,0,0,8)', [randomUUID(), routeId, ordinal, `点${ordinal}`]);
+    await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds,no_parking_roi) VALUES ($1,$2,1,$3,0,0,0,8,$4)', [secondNoParkingWaypointId, routeId, '第二禁停点', JSON.stringify([0.1, 0.1, 0.5, 0.5])]);
+    await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,2,$3,0,0,0,8)', [randomUUID(), routeId, '普通点']);
     await resetGlobalWhitelist([]);
     expect((await app.inject({ method: 'POST', url: '/api/patrol/start', headers: { origin, cookie: operatorCookie }, payload: { deviceId: vehicleId, routeId, shift: 'morning' } })).statusCode).toBe(409);
     await resetGlobalWhitelist([{ plate: 'A12345', owner: '测试', building: '1号楼' }]);
@@ -556,11 +558,25 @@ describe('platform API against PostGIS', () => {
     expect(first.statusCode).toBe(200); expect(first.json()).toMatchObject({ classification: 'registered_private', noParking: true, deduplicated: false });
     const second = await app.inject({ method: 'POST', url: `/device/v1/patrol/tasks/${taskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { ...observation, occurredAt: '2026-07-11T01:05:00.000Z' } });
     expect(second.json()).toMatchObject({ deduplicated: true });
+    const otherLocation = await app.inject({
+      method: 'POST',
+      url: `/device/v1/patrol/tasks/${taskId}/events`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { ...observation, waypointId: secondNoParkingWaypointId, occurredAt: '2026-07-11T01:10:00.000Z' },
+    });
+    expect(otherLocation.statusCode).toBe(200);
+    expect(otherLocation.json()).toMatchObject({ deduplicated: false, noParking: true });
+    expect(otherLocation.json<{ violationId: string }>().violationId).not.toBe(first.json<{ violationId: string }>().violationId);
     const events = await app.inject({ method: 'GET', url: `/api/patrol/tasks/${taskId}/events`, headers: { origin, cookie: operatorCookie } });
-    expect(events.json<{ observations: Array<{ observationCount: number; classification: string; noParking: boolean }> }>().observations).toEqual([expect.objectContaining({ observationCount: 2, classification: 'registered_private', noParking: true })]);
+    expect(events.json<{ observations: Array<{ observationCount: number; classification: string; noParking: boolean }> }>().observations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ observationCount: 2, classification: 'registered_private', noParking: true }),
+        expect.objectContaining({ observationCount: 1, classification: 'registered_private', noParking: true }),
+      ]),
+    );
     await db.query("UPDATE patrol_tasks SET status='completed', finished_at=now() WHERE id=$1", [taskId]);
     const report = await app.inject({ method: 'GET', url: `/api/patrol/tasks/${taskId}/report`, headers: { origin, cookie: operatorCookie } });
-    expect(report.json<{ report: { stats: { observationCount: number; registeredPrivate: number; noParkingCount: number } } }>().report.stats).toMatchObject({ observationCount: 1, registeredPrivate: 1, noParkingCount: 1 });
+    expect(report.json<{ report: { stats: { observationCount: number; registeredPrivate: number; noParkingCount: number } } }>().report.stats).toMatchObject({ observationCount: 2, registeredPrivate: 2, noParkingCount: 2 });
   });
 
   it('accepts Chinese-province plate text from YOLO OCR observations', async () => {
@@ -639,7 +655,7 @@ describe('platform API against PostGIS', () => {
     });
   });
 
-  it('matches OCR with extra characters via whitelist⊆scan and enables doorstep on matched plate', async () => {
+  it('matches OCR with extra characters via whitelist⊆scan and enables WxPusher notification', async () => {
     const adminCookie = await login('admin', defaultPassword);
     const operatorCookie = await login('operator-a', 'password');
     const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-DOOR-PARTIAL', name: '模糊上门车', host: '192.168.1.28', tcpPort: 6000, videoPort: 6500 } });
@@ -776,7 +792,68 @@ describe('platform API against PostGIS', () => {
     );
   });
 
-  it('runs an operator-confirmed doorstep response with zero-velocity and evidence gates', async () => {
+  it('classifies, reviews and concurrently deduplicates console recognition', async () => {
+    const adminCookie = await login('admin', defaultPassword);
+    const operatorCookie = await login('operator-a', 'password');
+    const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-CONSOLE-AUTO', name: '控制台自动识别车', host: '192.168.1.29', tcpPort: 6000, videoPort: 6500 } });
+    const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
+    await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA] } });
+    const routeId = randomUUID(); const waypointId = randomUUID();
+    await db.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [routeId, vehicleId, '控制台识别路线', 'console-v1', 'generated', ids.admin]);
+    await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,0,$3,0,0,0,8)', [waypointId, routeId, '控制台识别点']);
+    await resetGlobalWhitelist([
+      { plate: 'C11111', owner: '私家车主', building: '1号楼', category: 'private' },
+      { plate: 'C22222', owner: '访客', building: '2号楼', category: 'visitor' },
+    ]);
+    await db.query('INSERT INTO pose_points (id,vehicle_id,occurred_at,x,y,yaw,map_version) VALUES ($1,$2,now(),5,5,0,$3)', [randomUUID(), vehicleId, 'console-v1']);
+    await db.query('INSERT INTO floor_map_zones (id,vehicle_id,map_version,name,ring) VALUES ($1,$2,$3,$4,$5)', [randomUUID(), vehicleId, 'console-v1', '东门禁停区', JSON.stringify([[0, 0], [10, 0], [10, 10], [0, 10]])]);
+    const jpegBase64 = Buffer.concat([Buffer.from([0xff, 0xd8]), Buffer.alloc(62)]).toString('base64');
+    const scan = (plate: string, confidence: number) => app.inject({
+      method: 'POST',
+      url: '/api/violations/from-console-scan',
+      headers: { origin, cookie: operatorCookie },
+      payload: { vehicleId, plate, confidence, jpegBase64, waypoint: '实时自动识别', mapVersion: 'console-v1' },
+    });
+
+    const privateNoParking = await scan('C11111', 0.91);
+    expect(privateNoParking.statusCode, privateNoParking.body).toBe(200);
+    expect(privateNoParking.json()).toMatchObject({
+      recorded: true,
+      deduplicated: false,
+      plateMatch: { matchedPlate: 'C11111' },
+      noParking: { inNoParking: true },
+    });
+    const responseTask = await db.query<{ notification_only: boolean; destination_id: string | null }>(
+      'SELECT notification_only,destination_id FROM response_tasks WHERE violation_id=$1',
+      [privateNoParking.json<{ violation: { id: string } }>().violation.id],
+    );
+    expect(responseTask.rows[0]).toEqual({ notification_only: true, destination_id: null });
+
+    const duplicatePrivate = await scan('C11111', 0.97);
+    expect(duplicatePrivate.json()).toMatchObject({ recorded: true, deduplicated: true });
+    const observation = await db.query<{ observation_count: number; confidence: number }>(
+      'SELECT observation_count,confidence FROM plate_observations WHERE id=(SELECT observation_id FROM violations WHERE id=$1)',
+      [privateNoParking.json<{ violation: { id: string } }>().violation.id],
+    );
+    expect(observation.rows[0]).toMatchObject({ observation_count: 2, confidence: 0.97 });
+
+    await db.query("UPDATE pose_points SET occurred_at=now()-interval '1 minute' WHERE vehicle_id=$1", [vehicleId]);
+    const visitorOutside = await scan('C22222', 0.95);
+    expect(visitorOutside.json()).toMatchObject({ recorded: false, reason: 'whitelist_normal' });
+    const lowConfidence = await scan('X33333', 0.5);
+    expect(lowConfidence.json()).toMatchObject({ recorded: false, reason: 'pending_review' });
+
+    const [concurrentA, concurrentB] = await Promise.all([scan('X44444', 0.9), scan('X44444', 0.94)]);
+    expect(concurrentA.statusCode).toBe(200);
+    expect(concurrentB.statusCode).toBe(200);
+    expect(new Set([
+      concurrentA.json<{ violation: { id: string } }>().violation.id,
+      concurrentB.json<{ violation: { id: string } }>().violation.id,
+    ]).size).toBe(1);
+    expect([concurrentA.json().deduplicated, concurrentB.json().deduplicated].sort()).toEqual([false, true]);
+  });
+
+  it('confirms a notification-only violation without dispatching a vehicle', async () => {
     const adminCookie = await login('admin', defaultPassword);
     const operatorCookie = await login('operator-a', 'password');
     const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-DOOR', name: '上门处置车', host: '192.168.1.30', tcpPort: 6000, videoPort: 6500 } });
@@ -784,8 +861,6 @@ describe('platform API against PostGIS', () => {
     await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA] } });
     await db.query('UPDATE vehicles SET last_seen_at=now() WHERE id=$1', [vehicleId]);
     await db.query('INSERT INTO telemetry_points (id,vehicle_id,occurred_at,longitude,latitude,battery_pct) VALUES ($1,$2,now(),0,0,80)', [randomUUID(), vehicleId]);
-    const destination = await app.inject({ method: 'POST', url: '/api/resident-destinations', headers: { origin, cookie: adminCookie }, payload: { vehicleId, building: '1号楼', displayName: '1号楼一层门口', mapVersion: 'v-door', x: 4, y: 5, yaw: 0 } });
-    expect(destination.statusCode).toBe(200);
     const routeId = randomUUID(); const waypointId = randomUUID();
     await db.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [routeId, vehicleId, '上门路线', 'v-door', 'generated', ids.admin]);
     await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds,no_parking_roi) VALUES ($1,$2,0,$3,0,0,0,8,$4)', [waypointId, routeId, '东门禁停点', JSON.stringify([0.1, 0.1, 0.5, 0.5])]);
@@ -807,66 +882,73 @@ describe('platform API against PostGIS', () => {
     await db.query('INSERT INTO control_leases (id,vehicle_id,user_id,expires_at) VALUES ($1,$2,$3,now()+interval \'5 minutes\')', [blockingLeaseId, vehicleId, ids.operatorA]);
     const confirmed = await app.inject({ method: 'POST', url: `/api/response-tasks/${responseTaskId}/confirm`, headers: { origin, cookie: operatorCookie }, payload: {} });
     expect(confirmed.statusCode).toBe(200);
-    expect(confirmed.json()).toMatchObject({ assignedVehicleId: null, assignmentPending: true, advice: { source: 'template' } });
+    expect(confirmed.json()).toMatchObject({ notificationCompleted: false, advice: { source: 'template' }, push: { status: 'skipped_no_uid' } });
+    const notificationTask = await db.query<{ notification_only: boolean; assigned_vehicle_id: string | null; status: string }>(
+      'SELECT notification_only,assigned_vehicle_id,status FROM response_tasks WHERE id=$1', [responseTaskId],
+    );
+    expect(notificationTask.rows[0]).toMatchObject({ notification_only: true, assigned_vehicle_id: null, status: 'confirmed' });
+    await db.query(
+      `UPDATE whitelist_entries SET wx_uid='UID_updated'
+       WHERE plate='D12345' AND whitelist_id IN (
+         SELECT id FROM whitelist_imports WHERE vehicle_id IS NULL AND is_snapshot=false
+       )`,
+    );
+    const retried = await app.inject({ method: 'POST', url: `/api/response-tasks/${responseTaskId}/retry-push`, headers: { origin, cookie: operatorCookie }, payload: {} });
+    expect(retried.statusCode).toBe(200);
+    expect(retried.json()).toMatchObject({ notificationCompleted: false, push: { status: 'skipped_not_configured' } });
+    expect((await db.query<{ owner_wx_uid: string; status: string }>('SELECT owner_wx_uid,status FROM response_tasks WHERE id=$1', [responseTaskId])).rows[0]).toEqual({
+      owner_wx_uid: 'UID_updated',
+      status: 'confirmed',
+    });
     await db.query('UPDATE control_leases SET released_at=now() WHERE id=$1', [blockingLeaseId]);
     const assigned = await app.inject({ method: 'POST', url: `/api/response-tasks/${responseTaskId}/assign`, headers: { origin, cookie: operatorCookie }, payload: {} });
-    expect(assigned.statusCode).toBe(200);
-    expect(assigned.json()).toMatchObject({ assignedVehicleId: vehicleId, deduplicated: false });
-    expect((await app.inject({ method: 'POST', url: `/api/response-tasks/${responseTaskId}/assign`, headers: { origin, cookie: operatorCookie }, payload: {} })).json()).toMatchObject({ assignedVehicleId: vehicleId, deduplicated: true });
-    const claimed = await app.inject({ method: 'GET', url: '/device/v1/response/tasks/next', headers: { authorization: `Bearer ${token}` } });
-    expect(claimed.json<{ task: { id: string; destinationName: string } }>().task).toMatchObject({ id: responseTaskId, destinationName: '1号楼一层门口' });
-    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'nav-1', type: 'navigation_started' } })).statusCode).toBe(200);
-    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'arrive-bad', type: 'arrived', zeroVelocity: false } })).statusCode).toBe(409);
-    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'arrive-1', type: 'arrived', zeroVelocity: true } })).statusCode).toBe(200);
-    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'proof-1', type: 'arrival_evidence', evidenceUrl: 'https://evidence.invalid/door.jpg' } })).statusCode).toBe(200);
-    const completed = await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'done-1', type: 'completed', zeroVelocity: true } });
-    expect(completed.statusCode).toBe(200);
-    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'done-1', type: 'completed', zeroVelocity: true } })).json()).toMatchObject({ deduplicated: true });
-    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'late-failure', type: 'failed', reason: 'late' } })).statusCode).toBe(409);
+    expect(assigned.statusCode).toBe(409);
+    const deviceTask = await app.inject({ method: 'GET', url: '/device/v1/response/tasks/next', headers: { authorization: `Bearer ${token}` } });
+    expect(deviceTask.json()).toEqual({ task: null });
+  });
 
-    const observedForCancel = await app.inject({ method: 'POST', url: `/device/v1/patrol/tasks/${patrolTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: {
-      type: 'observation', waypointId, occurredAt: '2026-07-11T05:00:00.000Z', plate: 'D12345', confidence: 0.96,
-      vehicleBox: [0.2, 0.2, 0.2, 0.2], evidenceImageUrl: 'https://evidence.invalid/no-parking-2.jpg',
-    } });
-    const cancelTaskId = observedForCancel.json<{ responseTaskId: string }>().responseTaskId;
-    expect((await app.inject({ method: 'POST', url: `/api/response-tasks/${cancelTaskId}/confirm`, headers: { origin, cookie: operatorCookie }, payload: {} })).statusCode).toBe(200);
-    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${cancelTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'cancel-nav', type: 'navigation_started' } })).statusCode).toBe(200);
-    const cancelRequested = await app.inject({ method: 'POST', url: `/api/response-tasks/${cancelTaskId}/cancel`, headers: { origin, cookie: operatorCookie }, payload: {} });
-    expect(cancelRequested.json()).toMatchObject({ cancellationRequested: true });
-    expect((await app.inject({ method: 'POST', url: `/api/response-tasks/${cancelTaskId}/cancel`, headers: { origin, cookie: operatorCookie }, payload: {} })).json()).toMatchObject({ cancellationRequested: true, deduplicated: true });
-    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${cancelTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'stop-bad', type: 'stop_confirmed', zeroVelocity: false } })).statusCode).toBe(409);
-    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${cancelTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'stop-ok', type: 'stop_confirmed', zeroVelocity: true } })).statusCode).toBe(200);
-    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${cancelTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'cancelled-failure', type: 'failed' } })).statusCode).toBe(409);
-
-    const observeForHealthGate = async (occurredAt: string) => {
-      const response = await app.inject({ method: 'POST', url: `/device/v1/patrol/tasks/${patrolTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: {
-        type: 'observation', waypointId, occurredAt, plate: 'D12345', confidence: 0.97,
-        vehicleBox: [0.2, 0.2, 0.2, 0.2], evidenceImageUrl: `https://evidence.invalid/${occurredAt}.jpg`,
-      } });
-      return response.json<{ responseTaskId: string }>().responseTaskId;
+  it('keeps historical dispatch tasks assignable and completable through the device API', async () => {
+    const adminCookie = await login('admin', defaultPassword);
+    const operatorCookie = await login('operator-a', 'password');
+    const vehicle = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-LEGACY-RESPONSE', name: '历史处置车', host: '192.168.1.32', tcpPort: 6000, videoPort: 6500 } });
+    const vehicleId = vehicle.json<{ vehicle: { id: string } }>().vehicle.id;
+    await app.inject({ method: 'PUT', url: `/api/vehicles/${vehicleId}/members`, headers: { origin, cookie: adminCookie }, payload: { userIds: [ids.operatorA] } });
+    await db.query('UPDATE vehicles SET last_seen_at=now() WHERE id=$1', [vehicleId]);
+    await db.query('INSERT INTO telemetry_points (id,vehicle_id,occurred_at,longitude,latitude,battery_pct) VALUES ($1,$2,now(),0,0,80)', [randomUUID(), vehicleId]);
+    const destination = await app.inject({ method: 'POST', url: '/api/resident-destinations', headers: { origin, cookie: adminCookie }, payload: { vehicleId, building: '8号楼', displayName: '8号楼门口', mapVersion: 'legacy-v1', x: 4, y: 5, yaw: 0 } });
+    const destinationId = destination.json<{ destination: { id: string } }>().destination.id;
+    const routeId = randomUUID(); const waypointId = randomUUID(); const whitelistId = randomUUID(); const patrolTaskId = randomUUID();
+    await db.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [routeId, vehicleId, '历史处置路线', 'legacy-v1', 'generated', ids.admin]);
+    await db.query('INSERT INTO patrol_waypoints (id,route_id,ordinal,name,x,y,yaw,dwell_seconds) VALUES ($1,$2,0,$3,0,0,0,8)', [waypointId, routeId, '历史识别点']);
+    await db.query('INSERT INTO whitelist_imports (id,vehicle_id,name,created_by_user_id,is_snapshot) VALUES ($1,$2,$3,$4,true)', [whitelistId, vehicleId, '历史快照', ids.admin]);
+    await db.query("INSERT INTO patrol_tasks (id,vehicle_id,route_id,whitelist_id,shift,status,created_by_user_id,started_at,finished_at) VALUES ($1,$2,$3,$4,'legacy','completed',$5,now(),now())", [patrolTaskId, vehicleId, routeId, whitelistId, ids.admin]);
+    const makeLegacyTask = async (suffix: string) => {
+      const observationId = randomUUID(); const violationId = randomUUID(); const responseTaskId = randomUUID();
+      await db.query("INSERT INTO plate_observations (id,task_id,waypoint_id,occurred_at,dedupe_bucket,dedupe_key,plate,confidence,classification,no_parking,evidence_image_url,last_seen_at) VALUES ($1,$2,$3,now(),date_trunc('hour',now()),$4,$5,0.96,'registered_private',true,$6,now())", [observationId, patrolTaskId, waypointId, `legacy-${suffix}`, `L${suffix}1234`, `https://evidence.invalid/${suffix}.jpg`]);
+      await db.query("INSERT INTO violations (id,observation_id,plate,violation_type,task_id,vehicle_id,waypoint,priority,disposition,evidence_url) VALUES ($1,$2,$3,'no_parking',$4,$5,'历史识别点','high','pending',$6)", [violationId, observationId, `L${suffix}1234`, patrolTaskId, vehicleId, `https://evidence.invalid/${suffix}.jpg`]);
+      await db.query("INSERT INTO response_tasks (id,observation_id,violation_id,source_patrol_task_id,source_vehicle_id,destination_id,plate,owner_name,building,status,eligibility_reason,notification_only) VALUES ($1,$2,$3,$4,$5,$6,$7,'历史住户','8号楼','confirmed','legacy_dispatch',false)", [responseTaskId, observationId, violationId, patrolTaskId, vehicleId, destinationId, `L${suffix}1234`]);
+      return responseTaskId;
     };
+    const responseTaskId = await makeLegacyTask('A');
+    const credential = await app.inject({ method: 'POST', url: `/api/vehicles/${vehicleId}/device-credentials`, headers: { origin, cookie: adminCookie } });
+    const token = credential.json<{ credential: { token: string } }>().credential.token;
 
-    await db.query('UPDATE telemetry_points SET battery_pct=10,occurred_at=now() WHERE vehicle_id=$1', [vehicleId]);
-    const lowBatteryTaskId = await observeForHealthGate('2026-07-11T06:00:00.000Z');
-    expect((await app.inject({ method: 'POST', url: `/api/response-tasks/${lowBatteryTaskId}/confirm`, headers: { origin, cookie: operatorCookie }, payload: {} })).json()).toMatchObject({ assignmentPending: true });
+    const assigned = await app.inject({ method: 'POST', url: `/api/response-tasks/${responseTaskId}/assign`, headers: { origin, cookie: operatorCookie }, payload: {} });
+    expect(assigned.statusCode).toBe(200);
+    expect(assigned.json()).toMatchObject({ assignedVehicleId: vehicleId });
+    expect((await app.inject({ method: 'GET', url: '/device/v1/response/tasks/next', headers: { authorization: `Bearer ${token}` } })).json()).toMatchObject({
+      task: { id: responseTaskId, notificationOnly: false, destinationName: '8号楼门口' },
+    });
+    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'legacy-nav', type: 'navigation_started' } })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'legacy-arrive-bad', type: 'arrived', zeroVelocity: false } })).statusCode).toBe(409);
+    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'legacy-arrive', type: 'arrived', zeroVelocity: true } })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'legacy-proof', type: 'arrival_evidence', evidenceUrl: 'https://evidence.invalid/arrival.jpg' } })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${responseTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'legacy-done', type: 'completed', zeroVelocity: true } })).statusCode).toBe(200);
 
-    await db.query('UPDATE telemetry_points SET battery_pct=80,occurred_at=now() WHERE vehicle_id=$1', [vehicleId]);
-    await db.query("UPDATE patrol_routes SET map_version='mismatch' WHERE id=$1", [routeId]);
-    const mapMismatchTaskId = await observeForHealthGate('2026-07-11T07:00:00.000Z');
-    expect((await app.inject({ method: 'POST', url: `/api/response-tasks/${mapMismatchTaskId}/confirm`, headers: { origin, cookie: operatorCookie }, payload: {} })).json()).toMatchObject({ assignmentPending: true });
-
-    await db.query("UPDATE patrol_routes SET map_version='v-door' WHERE id=$1", [routeId]);
-    await db.query("UPDATE vehicles SET last_seen_at=now()-interval '3 minutes' WHERE id=$1", [vehicleId]);
-    await db.query("UPDATE telemetry_points SET occurred_at=now()-interval '3 minutes' WHERE vehicle_id=$1", [vehicleId]);
-    const offlineTaskId = await observeForHealthGate('2026-07-11T08:00:00.000Z');
-    expect((await app.inject({ method: 'POST', url: `/api/response-tasks/${offlineTaskId}/confirm`, headers: { origin, cookie: operatorCookie }, payload: {} })).json()).toMatchObject({ assignmentPending: true });
-
-    const backup = await app.inject({ method: 'POST', url: '/api/vehicles', headers: { origin, cookie: adminCookie }, payload: { code: 'CAR-BACKUP', name: '空闲处置车', host: '192.168.1.31', tcpPort: 6000, videoPort: 6500 } });
-    const backupId = backup.json<{ vehicle: { id: string } }>().vehicle.id;
-    await db.query('INSERT INTO patrol_routes (id,vehicle_id,name,map_version,source_yaml,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)', [randomUUID(), backupId, '备车路线', 'v-door', 'generated', ids.admin]);
-    await db.query('UPDATE vehicles SET last_seen_at=now() WHERE id=$1', [backupId]);
-    await db.query('INSERT INTO telemetry_points (id,vehicle_id,occurred_at,longitude,latitude,battery_pct) VALUES ($1,$2,now(),0,0,80)', [randomUUID(), backupId]);
-    expect((await app.inject({ method: 'POST', url: `/api/response-tasks/${offlineTaskId}/assign`, headers: { origin, cookie: operatorCookie }, payload: {} })).json()).toMatchObject({ assignedVehicleId: backupId, deduplicated: false });
+    const cancelTaskId = await makeLegacyTask('B');
+    expect((await app.inject({ method: 'POST', url: `/api/response-tasks/${cancelTaskId}/assign`, headers: { origin, cookie: operatorCookie }, payload: {} })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'POST', url: `/api/response-tasks/${cancelTaskId}/cancel`, headers: { origin, cookie: operatorCookie }, payload: {} })).json()).toMatchObject({ cancellationRequested: true });
+    expect((await app.inject({ method: 'POST', url: `/device/v1/response/tasks/${cancelTaskId}/events`, headers: { authorization: `Bearer ${token}` }, payload: { eventId: 'legacy-stop', type: 'stop_confirmed', zeroVelocity: true } })).statusCode).toBe(200);
   });
 
   it('resolves violation coordinates from observation or nearest telemetry and enriches owner info', async () => {

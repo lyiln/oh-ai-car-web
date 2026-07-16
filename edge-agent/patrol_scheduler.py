@@ -88,6 +88,18 @@ class LocalState:
         self.connection.execute("DELETE FROM state WHERE key=?", (key,))
         self.connection.commit()
 
+    def clear_patrol(self) -> None:
+        self.connection.execute("DELETE FROM state WHERE key IN ('active_task_id','active_waypoint_id')")
+        self.connection.commit()
+
+    def activate_task(self, task_id: str) -> None:
+        self.connection.execute("DELETE FROM state WHERE key IN ('active_task_id','active_waypoint_id')")
+        self.connection.execute(
+            "INSERT INTO state (key, value) VALUES ('active_task_id', ?)",
+            (task_id,),
+        )
+        self.connection.commit()
+
 
 def log(message: str) -> None:
     print(message, flush=True)
@@ -103,6 +115,9 @@ class PatrolScheduler:
         self.cmd_vel_topic = os.environ.get("CMD_VEL_TOPIC", "/cmd_vel")
         self.travel_seconds = float(os.environ.get("SIM_TRAVEL_SECONDS", "2"))
         self.state = LocalState(os.environ.get("STATE_PATH", "patrol-scheduler-state.sqlite3"))
+        # A previous process may have exited while dwelling. Never expose stale task/waypoint
+        # context to the vision process after a scheduler restart.
+        self.state.clear_patrol()
         self._cancel_requested = False
         self._node = None
         self._ros_executor = None
@@ -165,14 +180,14 @@ class PatrolScheduler:
             log(f"stop_confirmed posted for {task_id}")
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as error:
             log(f"stop_confirmed failed: {error}")
-        self.state.clear("active_task_id")
+        self.state.clear_patrol()
         self._cancel_requested = False
 
     def run_task(self, task: dict) -> None:
         task_id = str(task["id"])
         waypoints = list(task.get("waypoints") or [])
         waypoints.sort(key=lambda item: int(item.get("ordinal", 0)))
-        self.state.set("active_task_id", task_id)
+        self.state.activate_task(task_id)
         self._cancel_requested = False
         log(f"claimed task {task_id} with {len(waypoints)} waypoint(s)")
 
@@ -192,6 +207,8 @@ class PatrolScheduler:
                 if not ok or self._should_cancel(task_id):
                     self._handle_cancel(task_id)
                     return
+                # Vision may post observations only while the vehicle is stopped at this waypoint.
+                self.state.set("active_waypoint_id", str(waypoint["id"]))
                 dwell = int(waypoint.get("dwellSeconds") or 8)
                 dwell = min(10, max(8, dwell))
                 deadline = time.time() + dwell
@@ -201,18 +218,19 @@ class PatrolScheduler:
                         return
                     time.sleep(0.2)
                 self.api.post_event(task_id, {"type": "waypoint", "waypointId": waypoint["id"]})
+                self.state.clear("active_waypoint_id")
                 log(f"waypoint reached: {name}")
 
             self.api.post_event(task_id, {"type": "status", "status": "completed"})
             log(f"task {task_id} completed")
-            self.state.clear("active_task_id")
+            self.state.clear_patrol()
         except Exception as error:  # noqa: BLE001 - surface as failed task for platform
             log(f"task {task_id} failed: {error}")
             try:
                 self.api.post_event(task_id, {"type": "status", "status": "failed", "reason": str(error)})
             except Exception as post_error:  # noqa: BLE001
                 log(f"failed to post failure status: {post_error}")
-            self.state.clear("active_task_id")
+            self.state.clear_patrol()
             self._cancel_requested = False
 
     def loop(self) -> None:

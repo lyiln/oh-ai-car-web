@@ -749,7 +749,53 @@ export async function createApp(services: AppServices = {}) {
         }
         return { observationId: obs.rows[0].id, observationCount: obs.rows[0].observation_count };
       });
-      const response = await createResponseCandidate(db, hub, {
+      const violationEligible = Boolean(plate && confidence >= threshold && (noParking || !plateMatch));
+      let violationId: string | null = null;
+      if (violationEligible) {
+        const violationDedupeKey = `${matchedPlate}:${noParking ? `waypoint:${waypointId}` : 'outside'}`;
+        violationId = await db.transaction(async (client) => {
+          await client.query(
+            'SELECT pg_advisory_xact_lock(hashtext($1))',
+            [`${vehicleId}:${violationDedupeKey}:${bucket}`],
+          );
+          const existing = await client.query<{ id: string }>(
+            `SELECT id FROM violations
+             WHERE observation_id=$1
+                OR (vehicle_id=$2 AND dedupe_key=$3 AND dedupe_bucket=$4)
+             ORDER BY CASE WHEN observation_id=$1 THEN 0 ELSE 1 END
+             LIMIT 1 FOR UPDATE`,
+            [observationId, vehicleId, violationDedupeKey, bucket],
+          );
+          if (existing.rows[0]) {
+            await client.query(
+              `UPDATE violations SET
+                 evidence_url=COALESCE($2,evidence_url),
+                 priority=CASE WHEN $3='high' THEN 'high' ELSE priority END
+               WHERE id=$1`,
+              [existing.rows[0].id, typeof body.evidenceImageUrl === 'string' ? body.evidenceImageUrl : null,
+                noParking ? 'high' : 'normal'],
+            );
+            return existing.rows[0].id;
+          }
+          const proposedViolationId = randomUUID();
+          const violation = await client.query<{ id: string }>(
+            `INSERT INTO violations
+               (id,observation_id,plate,violation_type,task_id,vehicle_id,waypoint,priority,disposition,evidence_url,occurred_at,source,dedupe_key,dedupe_bucket)
+             SELECT $1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,occurred_at,'device_patrol',$10,$11
+             FROM plate_observations WHERE id=$2
+             RETURNING id`,
+            [proposedViolationId, observationId, matchedPlate, noParking ? 'no_parking' : 'suspected_external', taskId, vehicleId,
+              waypoint.rows[0].name, noParking ? 'high' : 'normal', typeof body.evidenceImageUrl === 'string' ? body.evidenceImageUrl : null,
+              violationDedupeKey, bucket],
+          );
+          return violation.rows[0]?.id ?? null;
+        });
+        if (observationCount === 1 && violationId) {
+          hub.publishPatrol({ type: 'violation_alert', violationId, vehicleId, plate: matchedPlate });
+        }
+      }
+      const response = violationId && noParking && plateMatch?.category === 'private'
+        ? await createResponseCandidate(db, hub, {
           observationId,
           taskId,
           vehicleId,
@@ -759,13 +805,16 @@ export async function createApp(services: AppServices = {}) {
           confidence,
           noParking,
           evidenceUrl: typeof body.evidenceImageUrl === 'string' ? body.evidenceImageUrl : null,
-        });
+          violationId,
+        })
+        : { responseEligible: false, reason: violationEligible ? 'wxpush_not_applicable' : 'not_a_violation' };
       return {
         ok: true,
         observationId,
         classification,
         noParking,
         deduplicated: observationCount > 1,
+        violationId,
         plateMatch: plateMatchDto(plateMatch),
         ...response,
       };

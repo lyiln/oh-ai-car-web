@@ -65,4 +65,17 @@ describe('wxpusher helpers', () => {
     );
     expect(result).toMatchObject({ ok: false, code: 1001, error: 'appToken invalid' });
   });
+
+  it('returns a retryable error when the request times out', async () => {
+    const fetcher = vi.fn(async () => {
+      throw new DOMException('The operation was aborted', 'TimeoutError');
+    }) as unknown as typeof fetch;
+
+    const result = await sendWxPusherMessage(
+      { appToken: 'AT_timeout' },
+      { uid: 'UID_1', content: 'hi' },
+      fetcher,
+    );
+    expect(result).toMatchObject({ ok: false, error: 'The operation was aborted' });
+  });
 });

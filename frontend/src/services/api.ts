@@ -196,9 +196,9 @@ export interface ResponseTask {
   sourceVehicleName: string;
   assignedVehicleId?: string | null;
   assignedVehicleName?: string | null;
-  destinationId: string;
-  destinationName: string;
-  mapVersion: string;
+  destinationId?: string | null;
+  destinationName?: string | null;
+  mapVersion?: string | null;
   plate: string;
   ownerName: string;
   building: string;
@@ -206,6 +206,7 @@ export interface ResponseTask {
   smsStatus?: string;
   smsError?: string;
   smsSentAt?: string | null;
+  notificationOnly?: boolean;
   status: 'pending_review' | 'confirmed' | 'assigned' | 'navigating' | 'arrived' | 'cancellation_requested' | 'completed' | 'cancelled' | 'failed';
   eligibilityReason: string;
   aiSuggestion?: string;
@@ -215,9 +216,9 @@ export interface ResponseTask {
   failureReason?: string | null;
   waypoint: string;
   confidence: number;
-  x: number;
-  y: number;
-  yaw: number;
+  x?: number | null;
+  y?: number | null;
+  yaw?: number | null;
   createdAt: string;
 }
 

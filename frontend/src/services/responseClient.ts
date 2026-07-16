@@ -19,12 +19,19 @@ export async function tasks(): Promise<ResponseTask[]> {
 
 export async function confirm(id: string): Promise<{
   ok: true;
-  assignedVehicleId: string | null;
-  assignmentPending: boolean;
+  notificationCompleted: boolean;
   advice: { suggestion: string; notification: string; source: string };
   push?: { status: string; message: string; requestId?: string };
 }> {
   return apiRequest(`/api/response-tasks/${id}/confirm`, { method: 'POST', body: '{}' });
+}
+
+export async function retryPush(id: string): Promise<{
+  ok: true;
+  notificationCompleted: boolean;
+  push: { status: string; message: string; requestId?: string };
+}> {
+  return apiRequest(`/api/response-tasks/${id}/retry-push`, { method: 'POST', body: '{}' });
 }
 
 export async function assign(id: string): Promise<{ ok: true; assignedVehicleId: string; deduplicated: boolean }> {
